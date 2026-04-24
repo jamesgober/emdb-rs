@@ -84,6 +84,12 @@ pub enum Error {
     ///
     /// This indicates programmer error when constructing the database.
     InvalidConfig(&'static str),
+
+    /// A transaction operation was attempted outside a valid transaction context.
+    TransactionInvalid,
+
+    /// A transaction was aborted due to an internal invariant violation.
+    TransactionAborted(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -110,6 +116,8 @@ impl fmt::Display for Error {
                 write!(f, "emdb: corrupted data at offset {} ({})", offset, reason)
             }
             Self::InvalidConfig(msg) => write!(f, "emdb: invalid configuration ({msg})"),
+            Self::TransactionInvalid => f.write_str("emdb: invalid transaction context"),
+            Self::TransactionAborted(msg) => write!(f, "emdb: transaction aborted ({msg})"),
         }
     }
 }
@@ -179,6 +187,15 @@ mod tests {
     fn test_from_io_maps_to_io_variant() {
         let err: Error = std::io::Error::new(std::io::ErrorKind::NotFound, "missing").into();
         assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn test_transaction_error_displays_are_stable() {
+        let invalid = format!("{}", Error::TransactionInvalid);
+        assert!(invalid.contains("transaction"));
+
+        let aborted = format!("{}", Error::TransactionAborted("invariant"));
+        assert!(aborted.contains("invariant"));
     }
 
     #[cfg(feature = "nested")]

@@ -31,6 +31,14 @@ impl Storage for MemoryStorage {
     fn path(&self) -> Option<&Path> {
         None
     }
+
+    fn last_tx_id(&self) -> u64 {
+        0
+    }
+
+    fn set_last_tx_id(&mut self, _tx_id: u64) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

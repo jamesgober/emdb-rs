@@ -19,8 +19,8 @@
 
 ## Status
 
-**Phase 2.** This crate now provides file-backed persistence with crash
-recovery for a single append-only storage file.
+**Phase 3.** This crate now provides closure-based transactions with
+atomic batch writes on top of file-backed persistence and crash recovery.
 The API is still pre-1.0 and may change before 1.0.
 
 Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
@@ -29,7 +29,7 @@ Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
 
 ```toml
 [dependencies]
-emdb = "0.3"
+emdb = "0.4"
 ```
 
 ## Quick Start
@@ -80,12 +80,55 @@ db.flush()?;
 # Ok::<(), emdb::Error>(())
 ```
 
+## Transactions
+
+Commit path:
+
+```rust
+use emdb::Emdb;
+
+let mut db = Emdb::open_in_memory();
+db.transaction(|tx| {
+    tx.insert("user:1", "james")?;
+    tx.insert("user:2", "alex")?;
+    Ok(())
+})?;
+
+assert_eq!(db.get("user:1")?, Some(b"james".to_vec()));
+assert_eq!(db.get("user:2")?, Some(b"alex".to_vec()));
+# Ok::<(), emdb::Error>(())
+```
+
+Rollback path:
+
+```rust
+use emdb::{Emdb, Error};
+
+let mut db = Emdb::open_in_memory();
+let failed = db.transaction::<_, ()>(|tx| {
+    tx.insert("temp", "value")?;
+    Err(Error::TransactionAborted("rollback"))
+});
+
+assert!(failed.is_err());
+assert_eq!(db.get("temp")?, None);
+# Ok::<(), emdb::Error>(())
+```
+
+### Crash Safety
+
+Transactions are written as `BatchBegin ... BatchEnd` records.
+If a crash occurs before `BatchEnd`, the entire batch is discarded during
+replay. If a crash occurs after `BatchEnd`, the entire batch is applied.
+
 ## Features
 
 - `ttl` (default): per-record expiration and default TTL support.
 - `nested`: dotted-prefix group operations and `Focus` handles.
 - persistence (core): append-only file log, replay-on-open, flush policy,
   and compaction.
+- transactions (core): closure-based atomic batches with read-your-writes
+    and crash-safe replay.
 
 ### TTL Example
 

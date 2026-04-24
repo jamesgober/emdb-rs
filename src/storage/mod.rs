@@ -11,7 +11,7 @@ pub(crate) mod file;
 pub(crate) mod memory;
 
 /// Current on-disk emdb format version.
-pub(crate) const FORMAT_VERSION: u32 = 1;
+pub(crate) const FORMAT_VERSION: u32 = 2;
 
 /// Header feature bit for `ttl` support.
 #[cfg(feature = "ttl")]
@@ -70,6 +70,18 @@ pub(crate) enum Op {
         /// Number of live records represented at checkpoint time.
         record_count: u32,
     },
+    /// Begin a transactional batch.
+    BatchBegin {
+        /// Monotonic transaction id.
+        tx_id: u64,
+        /// Number of operations expected before `BatchEnd`.
+        op_count: u32,
+    },
+    /// End a transactional batch.
+    BatchEnd {
+        /// Monotonic transaction id.
+        tx_id: u64,
+    },
 }
 
 /// Flush durability policy for file-backed storage.
@@ -120,4 +132,10 @@ pub(crate) trait Storage: Send {
 
     /// File path for file-backed storage, if present.
     fn path(&self) -> Option<&Path>;
+
+    /// Return the highest committed transaction id known by this backend.
+    fn last_tx_id(&self) -> u64;
+
+    /// Persist the highest committed transaction id.
+    fn set_last_tx_id(&mut self, tx_id: u64) -> Result<()>;
 }

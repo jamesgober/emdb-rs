@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 
 use crc32fast::Hasher;
 
-use crate::storage::{Op, FORMAT_VERSION};
+use crate::storage::Op;
 use crate::{Error, Result};
 
 pub(crate) const HEADER_LEN: usize = 64;
@@ -16,6 +16,8 @@ const OP_INSERT: u8 = 0;
 const OP_REMOVE: u8 = 1;
 const OP_CLEAR: u8 = 2;
 const OP_CHECKPOINT: u8 = 3;
+const OP_BATCH_BEGIN: u8 = 4;
+const OP_BATCH_END: u8 = 5;
 
 /// Parsed file header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,15 +28,23 @@ pub(crate) struct Header {
     pub(crate) flags: u32,
     /// Creation timestamp in unix millis.
     pub(crate) created_at: u64,
+    /// Highest committed transaction id.
+    pub(crate) last_tx_id: u64,
 }
 
 /// Write a 64-byte emdb header.
-pub(crate) fn write_header(w: &mut impl Write, flags: u32) -> Result<()> {
+pub(crate) fn write_header(
+    w: &mut impl Write,
+    format_ver: u32,
+    flags: u32,
+    last_tx_id: u64,
+) -> Result<()> {
     let mut header = [0_u8; HEADER_LEN];
     header[0..8].copy_from_slice(&MAGIC);
-    header[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    header[8..12].copy_from_slice(&format_ver.to_le_bytes());
     header[12..16].copy_from_slice(&flags.to_le_bytes());
     header[16..24].copy_from_slice(&now_unix_millis().to_le_bytes());
+    header[32..40].copy_from_slice(&last_tx_id.to_le_bytes());
     w.write_all(&header)?;
     Ok(())
 }
@@ -52,10 +62,13 @@ pub(crate) fn read_header(r: &mut impl Read) -> Result<Header> {
     let flags = read_u32_le(&header[12..16]);
     let created_at = read_u64_le(&header[16..24]);
 
+    let last_tx_id = read_u64_le(&header[32..40]);
+
     Ok(Header {
         format_ver,
         flags,
         created_at,
+        last_tx_id,
     })
 }
 
@@ -94,6 +107,13 @@ pub(crate) fn encode_op(buf: &mut Vec<u8>, op: &Op) {
         Op::Clear => {}
         Op::Checkpoint { record_count } => {
             payload.extend_from_slice(&record_count.to_le_bytes());
+        }
+        Op::BatchBegin { tx_id, op_count } => {
+            payload.extend_from_slice(&tx_id.to_le_bytes());
+            payload.extend_from_slice(&op_count.to_le_bytes());
+        }
+        Op::BatchEnd { tx_id } => {
+            payload.extend_from_slice(&tx_id.to_le_bytes());
         }
     }
 
@@ -194,6 +214,15 @@ pub(crate) fn decode_op(buf: &[u8]) -> Result<(Op, usize)> {
             let record_count = read_u32_payload(payload, &mut cursor)?;
             Op::Checkpoint { record_count }
         }
+        OP_BATCH_BEGIN => {
+            let tx_id = read_u64_payload(payload, &mut cursor)?;
+            let op_count = read_u32_payload(payload, &mut cursor)?;
+            Op::BatchBegin { tx_id, op_count }
+        }
+        OP_BATCH_END => {
+            let tx_id = read_u64_payload(payload, &mut cursor)?;
+            Op::BatchEnd { tx_id }
+        }
         _ => {
             return Err(Error::Corrupted {
                 offset: 0,
@@ -218,6 +247,8 @@ fn op_type(op: &Op) -> u8 {
         Op::Remove { .. } => OP_REMOVE,
         Op::Clear => OP_CLEAR,
         Op::Checkpoint { .. } => OP_CHECKPOINT,
+        Op::BatchBegin { .. } => OP_BATCH_BEGIN,
+        Op::BatchEnd { .. } => OP_BATCH_END,
     }
 }
 
@@ -226,7 +257,6 @@ fn read_u32_payload(payload: &[u8], cursor: &mut usize) -> Result<u32> {
     Ok(read_u32_le(bytes))
 }
 
-#[cfg(feature = "ttl")]
 fn read_u64_payload(payload: &[u8], cursor: &mut usize) -> Result<u64> {
     let bytes = read_bytes_payload(payload, cursor, 8)?;
     Ok(read_u64_le(bytes))
@@ -274,12 +304,12 @@ fn now_unix_millis() -> u64 {
 mod tests {
     use super::{decode_op, read_header, write_header, HEADER_LEN};
     use crate::storage::codec::encode_op;
-    use crate::storage::Op;
+    use crate::storage::{Op, FORMAT_VERSION};
 
     #[test]
     fn round_trip_header() {
         let mut bytes = Vec::new();
-        let wrote = write_header(&mut bytes, 0x5);
+        let wrote = write_header(&mut bytes, FORMAT_VERSION, 0x5, 99);
         assert!(wrote.is_ok());
         assert_eq!(bytes.len(), HEADER_LEN);
 
@@ -291,6 +321,8 @@ mod tests {
             Err(err) => panic!("header decode should succeed: {err}"),
         };
         assert_eq!(header.flags, 0x5);
+        assert_eq!(header.last_tx_id, 99);
+        assert_eq!(header.format_ver, FORMAT_VERSION);
     }
 
     #[test]
@@ -304,6 +336,15 @@ mod tests {
             Op::Remove { key: b"k".to_vec() },
             Op::Clear,
             Op::Checkpoint { record_count: 9 },
+            Op::BatchBegin {
+                tx_id: 11,
+                op_count: 0,
+            },
+            Op::BatchBegin {
+                tx_id: 12,
+                op_count: 3,
+            },
+            Op::BatchEnd { tx_id: 12 },
         ];
 
         for op in ops {

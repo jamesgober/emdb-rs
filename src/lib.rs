@@ -45,6 +45,27 @@
 //! # Ok::<(), emdb::Error>(())
 //! ```
 //!
+//! Transaction usage:
+//!
+//! ```rust
+//! use emdb::Emdb;
+//!
+//! let mut db = Emdb::open_in_memory();
+//! db.transaction(|tx| {
+//!     tx.insert("a", "1")?;
+//!     tx.insert("b", "2")?;
+//!     Ok(())
+//! })?;
+//! assert_eq!(db.get("a")?, Some(b"1".to_vec()));
+//! # Ok::<(), emdb::Error>(())
+//! ```
+//!
+//! ## Crash Safety
+//!
+//! Transactions use atomic batch markers in the append-only log.
+//! During replay, incomplete batches are discarded and complete batches
+//! are applied in full.
+//!
 //! TTL usage:
 //!
 //! ```rust
@@ -99,6 +120,7 @@ mod error;
 #[cfg(feature = "nested")]
 mod nested;
 mod storage;
+mod transaction;
 mod ttl;
 
 pub use builder::EmdbBuilder;
@@ -107,4 +129,5 @@ pub use error::{Error, Result};
 #[cfg(feature = "nested")]
 pub use nested::Focus;
 pub use storage::FlushPolicy;
+pub use transaction::Transaction;
 pub use ttl::Ttl;

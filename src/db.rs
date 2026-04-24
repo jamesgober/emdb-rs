@@ -13,6 +13,7 @@ use crate::error::Error;
 use crate::storage::file::FileStorage;
 use crate::storage::memory::MemoryStorage;
 use crate::storage::{build_flags, Op, SnapshotEntry, SnapshotIter, Storage};
+use crate::transaction::Transaction;
 #[cfg(feature = "ttl")]
 use crate::ttl::{
     expires_from_ttl, is_expired, now_unix_millis, record_expires_at, record_set_persist,
@@ -26,10 +27,11 @@ use crate::Result;
 /// `Emdb` stores key/value records in memory and can optionally persist
 /// operations to a single append-only file.
 pub struct Emdb {
-    storage: BTreeMap<Vec<u8>, Record>,
-    backend: Box<dyn Storage>,
+    pub(crate) storage: BTreeMap<Vec<u8>, Record>,
+    pub(crate) backend: Box<dyn Storage>,
+    pub(crate) last_tx_id: u64,
     #[cfg(feature = "ttl")]
-    default_ttl: Option<Duration>,
+    pub(crate) default_ttl: Option<Duration>,
 }
 
 impl Emdb {
@@ -39,6 +41,7 @@ impl Emdb {
         Self {
             storage: BTreeMap::new(),
             backend: Box::new(MemoryStorage),
+            last_tx_id: 0,
             #[cfg(feature = "ttl")]
             default_ttl: None,
         }
@@ -60,6 +63,40 @@ impl Emdb {
         EmdbBuilder::new()
     }
 
+    /// Run a closure inside a transaction.
+    ///
+    /// The transaction commits when the closure returns `Ok(_)`, and
+    /// rolls back when the closure returns `Err(_)` or panics.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from the closure or commit path.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use emdb::Emdb;
+    ///
+    /// let mut db = Emdb::open_in_memory();
+    /// let out = db.transaction(|tx| {
+    ///     tx.insert("a", "1")?;
+    ///     tx.insert("b", "2")?;
+    ///     Ok(tx.contains_key("a")?)
+    /// })?;
+    /// assert!(out);
+    /// assert_eq!(db.get("a")?, Some(b"1".to_vec()));
+    /// # Ok::<(), emdb::Error>(())
+    /// ```
+    pub fn transaction<F, T>(&mut self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Transaction<'_>) -> Result<T>,
+    {
+        let mut tx = Transaction::new(self);
+        let out = f(&mut tx)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
     /// Build a database from builder configuration.
     pub(crate) fn from_builder(builder: EmdbBuilder) -> Result<Self> {
         if matches!(builder.flush_policy, crate::FlushPolicy::EveryN(0)) {
@@ -78,6 +115,7 @@ impl Emdb {
 
             Self {
                 storage: replayed,
+                last_tx_id: backend.last_tx_id(),
                 backend: Box::new(backend),
                 #[cfg(feature = "ttl")]
                 default_ttl: builder.default_ttl,
@@ -86,6 +124,7 @@ impl Emdb {
             Self {
                 storage: BTreeMap::new(),
                 backend: Box::new(MemoryStorage),
+                last_tx_id: 0,
                 #[cfg(feature = "ttl")]
                 default_ttl: builder.default_ttl,
             }
@@ -412,6 +451,11 @@ fn apply_replayed_op(storage: &mut BTreeMap<Vec<u8>, Record>, op: Op) {
             storage.clear();
         }
         Op::Checkpoint { record_count: _ } => {}
+        Op::BatchBegin {
+            tx_id: _,
+            op_count: _,
+        } => {}
+        Op::BatchEnd { tx_id: _ } => {}
     }
 }
 

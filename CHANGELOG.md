@@ -4,7 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/jamesgober/emdb-rs/compare/v0.3.0...HEAD)
+## [Unreleased](https://github.com/jamesgober/emdb-rs/compare/v0.4.0...HEAD)
+
+## [0.4.0](https://github.com/jamesgober/emdb-rs/compare/v0.3.0...v0.4.0) — 2026-04-24
+
+### Added
+
+- Closure-based transaction API via `Emdb::transaction(|tx| ...)`.
+- `Transaction` methods: `insert`, `get`, `remove`, `contains_key`.
+- Atomic batch log markers: `BatchBegin` and `BatchEnd` op records.
+- Crash-safe replay rules for incomplete or corrupted transactional batches.
+- Transaction id tracking persisted in file header (`last_tx_id`).
+- v0.4 integration tests for commit/rollback, read-your-writes, crash recovery, and tx id persistence.
+- Transaction benchmarks for single-op and multi-op batch throughput.
+
+### Changed
+
+- On-disk format advanced to version `2` for new files.
+- Reader accepts both v1 and v2 headers.
+- `Error` expanded with transaction variants (`TransactionInvalid`, `TransactionAborted`).
+- Crate version bumped to `0.4.0`.
+
+### Fixed
+
+- Replay now truncates and discards malformed or incomplete transactional batches at recovery boundaries.
 
 ## [0.3.0](https://github.com/jamesgober/emdb-rs/compare/v0.2.0...v0.3.0) — 2026-04-24
 
