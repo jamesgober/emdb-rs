@@ -228,10 +228,7 @@ mod tests {
         );
         assert!(busy.contains("lock busy"));
 
-        let io_msg = format!(
-            "{}",
-            Error::LockfileError(std::io::Error::other("x"))
-        );
+        let io_msg = format!("{}", Error::LockfileError(std::io::Error::other("x")));
         assert!(io_msg.contains("lockfile error"));
 
         let poisoned = format!("{}", Error::LockPoisoned);
