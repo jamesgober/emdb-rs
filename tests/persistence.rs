@@ -17,7 +17,7 @@ fn persistence_round_trip_reopen_restores_values() -> Result<()> {
     let path = tmp_path("persist-roundtrip");
 
     {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
         for i in 0_u32..64 {
             db.insert(format!("k{i}"), format!("v{i}"))?;
         }
@@ -41,7 +41,7 @@ fn ttl_persistence_retains_remaining_lifetime() -> Result<()> {
     let path = tmp_path("persist-ttl");
 
     {
-        let mut db = Emdb::builder()
+        let db = Emdb::builder()
             .path(path.clone())
             .flush_policy(FlushPolicy::OnEachWrite)
             .build()?;
@@ -77,7 +77,7 @@ fn flush_policy_variants_are_usable() -> Result<()> {
         path.set_extension(format!("{idx}.emdb"));
 
         {
-            let mut db = Emdb::builder()
+            let db = Emdb::builder()
                 .path(path.clone())
                 .flush_policy(policy)
                 .build()?;

@@ -10,6 +10,16 @@ use emdb::Emdb;
 fn main() {
     let db = Emdb::open_in_memory();
     println!("emdb instance opened");
-    println!("  len:      {}", db.len());
-    println!("  is_empty: {}", db.is_empty());
+    let len = db.len();
+    let empty = db.is_empty();
+
+    match (len, empty) {
+        (Ok(len), Ok(empty)) => {
+            println!("  len:      {len}");
+            println!("  is_empty: {empty}");
+        }
+        (Err(err), _) | (_, Err(err)) => {
+            eprintln!("failed to inspect db state: {err}");
+        }
+    }
 }

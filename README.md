@@ -19,8 +19,9 @@
 
 ## Status
 
-**Phase 3.** This crate now provides closure-based transactions with
-atomic batch writes on top of file-backed persistence and crash recovery.
+**Phase 4.** This crate now provides closure-based transactions with
+atomic batch writes, internal Send+Sync synchronization, and file lock
+exclusion on top of file-backed persistence and crash recovery.
 The API is still pre-1.0 and may change before 1.0.
 
 Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
@@ -29,7 +30,7 @@ Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
 
 ```toml
 [dependencies]
-emdb = "0.4"
+emdb = "0.5"
 ```
 
 ## Quick Start
@@ -37,7 +38,7 @@ emdb = "0.4"
 ```rust
 use emdb::Emdb;
 
-let mut db = Emdb::open_in_memory();
+let db = Emdb::open_in_memory();
 db.insert("name", "emdb")?;
 assert_eq!(db.get("name")?, Some(b"emdb".to_vec()));
 # Ok::<(), emdb::Error>(())
@@ -51,7 +52,7 @@ use emdb::{Emdb, FlushPolicy};
 let path = std::env::temp_dir().join("app.emdb");
 
 {
-    let mut db = Emdb::builder()
+    let db = Emdb::builder()
         .path(path.clone())
         .flush_policy(FlushPolicy::EveryN(64))
         .build()?;
@@ -72,7 +73,7 @@ Manual compaction:
 use emdb::Emdb;
 
 let path = std::env::temp_dir().join("compact.emdb");
-let mut db = Emdb::open(&path)?;
+let db = Emdb::open(&path)?;
 db.insert("k", "v")?;
 db.compact()?;
 db.flush()?;
@@ -87,7 +88,7 @@ Commit path:
 ```rust
 use emdb::Emdb;
 
-let mut db = Emdb::open_in_memory();
+let db = Emdb::open_in_memory();
 db.transaction(|tx| {
     tx.insert("user:1", "james")?;
     tx.insert("user:2", "alex")?;
@@ -104,7 +105,7 @@ Rollback path:
 ```rust
 use emdb::{Emdb, Error};
 
-let mut db = Emdb::open_in_memory();
+let db = Emdb::open_in_memory();
 let failed = db.transaction::<_, ()>(|tx| {
     tx.insert("temp", "value")?;
     Err(Error::TransactionAborted("rollback"))
@@ -130,6 +131,36 @@ replay. If a crash occurs after `BatchEnd`, the entire batch is applied.
 - transactions (core): closure-based atomic batches with read-your-writes
     and crash-safe replay.
 
+## Concurrency
+
+`Emdb` is `Send + Sync` and cheap to clone. Internally it uses a
+reader/writer lock for state and a mutex for serialized storage appends.
+
+```rust
+use std::sync::Arc;
+use std::thread;
+
+use emdb::Emdb;
+
+let db = Arc::new(Emdb::open_in_memory());
+db.insert("counter", "0")?;
+
+let mut workers = Vec::new();
+for i in 0_u32..4 {
+    let db = Arc::clone(&db);
+    workers.push(thread::spawn(move || {
+        let _ = db.insert(format!("k{i}"), format!("v{i}"));
+    }));
+}
+
+for worker in workers {
+    let _ = worker.join();
+}
+
+assert!(db.len()? >= 4);
+# Ok::<(), emdb::Error>(())
+```
+
 ### TTL Example
 
 ```rust
@@ -139,7 +170,7 @@ use std::time::Duration;
 
 use emdb::{Emdb, Ttl};
 
-let mut db = Emdb::builder()
+let db = Emdb::builder()
     .default_ttl(Duration::from_secs(30))
     .build()?;
 db.insert_with_ttl("session", "token", Ttl::Default)?;
@@ -155,13 +186,13 @@ assert!(db.ttl("session")?.is_some());
 # {
 use emdb::Emdb;
 
-let mut db = Emdb::open_in_memory();
-let mut product = db.focus("product");
+let db = Emdb::open_in_memory();
+let product = db.focus("product");
 product.set("name", "phone")?;
 product.set("price", "799")?;
 
 assert_eq!(product.get("name")?, Some(b"phone".to_vec()));
-assert_eq!(db.group("product").count(), 2);
+assert_eq!(db.group("product")?.count(), 2);
 # }
 # Ok::<(), emdb::Error>(())
 ```

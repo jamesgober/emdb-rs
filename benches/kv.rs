@@ -4,7 +4,7 @@ use emdb::Emdb;
 fn bench_insert(c: &mut Criterion) {
     c.bench_function("kv_insert", |b| {
         b.iter(|| {
-            let mut db = Emdb::open_in_memory();
+            let db = Emdb::open_in_memory();
             for i in 0_u32..1_000 {
                 let key = format!("k{i}");
                 let value = format!("v{i}");
@@ -17,7 +17,7 @@ fn bench_insert(c: &mut Criterion) {
 }
 
 fn bench_get(c: &mut Criterion) {
-    let mut db = Emdb::open_in_memory();
+    let db = Emdb::open_in_memory();
     for i in 0_u32..1_000 {
         let key = format!("k{i}");
         let value = format!("v{i}");
@@ -40,7 +40,7 @@ fn bench_get(c: &mut Criterion) {
 fn bench_remove(c: &mut Criterion) {
     c.bench_function("kv_remove", |b| {
         b.iter(|| {
-            let mut db = Emdb::open_in_memory();
+            let db = Emdb::open_in_memory();
             for i in 0_u32..1_000 {
                 let key = format!("k{i}");
                 let value = format!("v{i}");

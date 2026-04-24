@@ -8,6 +8,7 @@
 //! `EM-XXXXX` prefix in the wider Hive error registry.
 
 use core::fmt;
+use std::path::PathBuf;
 
 /// Convenient `Result` alias where the error type is fixed to [`Error`].
 pub type Result<T> = core::result::Result<T, Error>;
@@ -90,6 +91,18 @@ pub enum Error {
 
     /// A transaction was aborted due to an internal invariant violation.
     TransactionAborted(&'static str),
+
+    /// Another process currently holds the advisory lock for this database.
+    LockBusy {
+        /// Path to the lockfile that is currently held.
+        path: PathBuf,
+    },
+
+    /// Lockfile acquisition or lockfile I/O failed.
+    LockfileError(std::io::Error),
+
+    /// A synchronization lock was poisoned due to panic while held.
+    LockPoisoned,
 }
 
 impl fmt::Display for Error {
@@ -118,6 +131,13 @@ impl fmt::Display for Error {
             Self::InvalidConfig(msg) => write!(f, "emdb: invalid configuration ({msg})"),
             Self::TransactionInvalid => f.write_str("emdb: invalid transaction context"),
             Self::TransactionAborted(msg) => write!(f, "emdb: transaction aborted ({msg})"),
+            Self::LockBusy { path } => {
+                write!(f, "emdb: lock busy ({})", path.display())
+            }
+            Self::LockfileError(err) => {
+                write!(f, "emdb: lockfile error ({})", err.kind())
+            }
+            Self::LockPoisoned => f.write_str("emdb: lock poisoned"),
         }
     }
 }
@@ -196,6 +216,26 @@ mod tests {
 
         let aborted = format!("{}", Error::TransactionAborted("invariant"));
         assert!(aborted.contains("invariant"));
+    }
+
+    #[test]
+    fn test_lock_errors_display_are_stable() {
+        let busy = format!(
+            "{}",
+            Error::LockBusy {
+                path: std::path::PathBuf::from("/tmp/demo.lock"),
+            }
+        );
+        assert!(busy.contains("lock busy"));
+
+        let io_msg = format!(
+            "{}",
+            Error::LockfileError(std::io::Error::other("x"))
+        );
+        assert!(io_msg.contains("lockfile error"));
+
+        let poisoned = format!("{}", Error::LockPoisoned);
+        assert!(poisoned.contains("lock poisoned"));
     }
 
     #[cfg(feature = "nested")]

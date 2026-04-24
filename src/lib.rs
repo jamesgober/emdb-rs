@@ -22,7 +22,7 @@
 //! ```rust
 //! use emdb::Emdb;
 //!
-//! let mut db = Emdb::open_in_memory();
+//! let db = Emdb::open_in_memory();
 //! db.insert("name", "emdb")?;
 //! assert_eq!(db.get("name")?, Some(b"emdb".to_vec()));
 //! # Ok::<(), emdb::Error>(())
@@ -35,7 +35,7 @@
 //!
 //! let path = std::env::temp_dir().join("emdb-doc-example.emdb");
 //! {
-//!     let mut db = Emdb::open(&path)?;
+//!     let db = Emdb::open(&path)?;
 //!     db.insert("name", "emdb")?;
 //!     db.flush()?;
 //! }
@@ -50,7 +50,7 @@
 //! ```rust
 //! use emdb::Emdb;
 //!
-//! let mut db = Emdb::open_in_memory();
+//! let db = Emdb::open_in_memory();
 //! db.transaction(|tx| {
 //!     tx.insert("a", "1")?;
 //!     tx.insert("b", "2")?;
@@ -75,7 +75,7 @@
 //!
 //! use emdb::{Emdb, Ttl};
 //!
-//! let mut db = Emdb::builder()
+//! let db = Emdb::builder()
 //!     .default_ttl(Duration::from_secs(60))
 //!     .build()?;
 //! db.insert_with_ttl("session", "token", Ttl::Default)?;
@@ -91,13 +91,24 @@
 //! # {
 //! use emdb::Emdb;
 //!
-//! let mut db = Emdb::open_in_memory();
-//! let mut profile = db.focus("profile");
+//! let db = Emdb::open_in_memory();
+//! let profile = db.focus("profile");
 //! profile.set("name", "james")?;
 //! assert_eq!(profile.get("name")?, Some(b"james".to_vec()));
 //! # }
 //! # Ok::<(), emdb::Error>(())
 //! ```
+
+//! ## Concurrency Model
+//!
+//! `Emdb` is internally reference-counted and synchronized. `Clone` is cheap
+//! and can be used to share one database handle across threads.
+//!
+//! - Reads (`get`, `contains_key`, `len`, `iter`) can run concurrently.
+//! - Writes are serialized.
+//! - Transactions hold the write lock for the closure lifetime.
+//! - File-backed databases use an advisory lockfile to prevent two processes
+//!   from opening the same path concurrently.
 
 #![deny(warnings)]
 #![deny(missing_docs)]
@@ -117,6 +128,7 @@
 mod builder;
 mod db;
 mod error;
+mod lockfile;
 #[cfg(feature = "nested")]
 mod nested;
 mod storage;

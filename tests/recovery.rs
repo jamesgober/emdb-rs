@@ -44,7 +44,7 @@ fn truncation_recovery_keeps_previous_records() -> Result<()> {
     let path = tmp_path("recovery-truncate");
 
     {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
         db.insert("k1", "v1")?;
         db.insert("k2", "v2")?;
         db.flush()?;
@@ -76,7 +76,7 @@ fn crc_corruption_recovery_truncates_tail() -> Result<()> {
     let path = tmp_path("recovery-crc");
 
     {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
         db.insert("k1", "v1")?;
         db.insert("k2", "v2")?;
         db.flush()?;
@@ -111,7 +111,7 @@ fn replay_is_deterministic_across_reopens() -> Result<()> {
     let path = tmp_path("replay-deterministic");
 
     {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
         for i in 0_u32..128 {
             db.insert(format!("k{i}"), format!("v{i}"))?;
         }
@@ -119,12 +119,18 @@ fn replay_is_deterministic_across_reopens() -> Result<()> {
     }
 
     let a = Emdb::open(&path)?;
-    let b = Emdb::open(&path)?;
-
-    assert_eq!(a.len(), b.len());
+    let mut snapshot = Vec::new();
     for i in 0_u32..128 {
         let key = format!("k{i}");
-        assert_eq!(a.get(&key)?, b.get(&key)?);
+        snapshot.push((key.clone(), a.get(&key)?));
+    }
+    let len_a = a.len()?;
+    drop(a);
+
+    let b = Emdb::open(&path)?;
+    assert_eq!(len_a, b.len()?);
+    for (key, expected) in snapshot {
+        assert_eq!(expected, b.get(key)?);
     }
 
     assert!(std::fs::remove_file(path).is_ok());

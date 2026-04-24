@@ -25,7 +25,7 @@ fn magic_mismatch_is_reported() {
 fn version_mismatch_is_reported() -> Result<()> {
     let path = tmp_path("version");
     {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
         db.insert("k", "v")?;
         db.flush()?;
     }
@@ -45,7 +45,7 @@ fn version_mismatch_is_reported() -> Result<()> {
 fn feature_mismatch_is_reported() -> Result<()> {
     let path = tmp_path("feature");
     {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
         db.insert("k", "v")?;
         db.flush()?;
     }

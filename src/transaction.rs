@@ -3,8 +3,9 @@
 //! Transaction support for atomic batch writes.
 
 use std::collections::BTreeMap;
+use std::sync::RwLockWriteGuard;
 
-use crate::db::Emdb;
+use crate::db::{Emdb, State};
 use crate::storage::Op;
 #[cfg(feature = "ttl")]
 use crate::ttl::{expires_from_ttl, is_expired, now_unix_millis, record_expires_at, Ttl};
@@ -13,21 +14,28 @@ use crate::{Error, Result};
 
 /// A closure-scoped transaction over an [`Emdb`] instance.
 ///
-/// Instances are created by [`Emdb::transaction`].
+/// Instances are created by [`Emdb::transaction`]. The transaction holds the
+/// database write lock for its lifetime.
 pub struct Transaction<'db> {
-    pub(crate) db: &'db mut Emdb,
+    db: &'db Emdb,
+    state: RwLockWriteGuard<'db, State>,
     pending: Vec<Op>,
     overlay: BTreeMap<Vec<u8>, Option<Record>>,
 }
 
 impl<'db> Transaction<'db> {
     /// Create a transaction bound to the given database.
-    pub(crate) fn new(db: &'db mut Emdb) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when lock acquisition fails.
+    pub(crate) fn new(db: &'db Emdb) -> Result<Self> {
+        Ok(Self {
             db,
+            state: db.state_write()?,
             pending: Vec::new(),
             overlay: BTreeMap::new(),
-        }
+        })
     }
 
     /// Insert or replace a key/value pair in this transaction.
@@ -69,7 +77,7 @@ impl<'db> Transaction<'db> {
             return self.visible_record(entry.as_ref());
         }
 
-        let Some(record) = self.db.storage.get(key.as_ref()) else {
+        let Some(record) = self.state.storage.get(key.as_ref()) else {
             return Ok(None);
         };
 
@@ -86,7 +94,7 @@ impl<'db> Transaction<'db> {
         let previous = if let Some(entry) = self.overlay.get(key.as_ref()) {
             self.visible_record(entry.as_ref())?
         } else {
-            let base = self.db.storage.get(key.as_ref());
+            let base = self.state.storage.get(key.as_ref());
             self.visible_record(base)?
         };
 
@@ -116,7 +124,7 @@ impl<'db> Transaction<'db> {
         let value = value.into();
 
         let now = now_unix_millis();
-        let expires_at = expires_from_ttl(ttl, self.db.default_ttl, now)?;
+        let expires_at = expires_from_ttl(ttl, self.db.inner.config.default_ttl, now)?;
         let _old = self
             .overlay
             .insert(key.clone(), Some(record_new(value.clone(), expires_at)));
@@ -136,7 +144,7 @@ impl<'db> Transaction<'db> {
     /// Returns an error if batch write or transaction metadata persistence fails.
     pub(crate) fn commit(&mut self) -> Result<()> {
         let tx_id = self
-            .db
+            .state
             .last_tx_id
             .checked_add(1)
             .ok_or(Error::TransactionAborted("transaction id overflow"))?;
@@ -144,31 +152,32 @@ impl<'db> Transaction<'db> {
         let op_count = u32::try_from(self.pending.len())
             .map_err(|_overflow| Error::TransactionAborted("operation count overflow"))?;
 
-        self.db
-            .backend
-            .append(&Op::BatchBegin { tx_id, op_count })?;
+        {
+            let mut backend = self.db.lock_backend()?;
+            backend.append(&Op::BatchBegin { tx_id, op_count })?;
 
-        let writes = std::mem::take(&mut self.pending);
-        for op in writes {
-            self.db.backend.append(&op)?;
+            let writes = std::mem::take(&mut self.pending);
+            for op in writes {
+                backend.append(&op)?;
+            }
+
+            backend.append(&Op::BatchEnd { tx_id })?;
+            backend.set_last_tx_id(tx_id)?;
         }
-
-        self.db.backend.append(&Op::BatchEnd { tx_id })?;
-        self.db.backend.set_last_tx_id(tx_id)?;
 
         let updates = std::mem::take(&mut self.overlay);
         for (key, maybe_record) in updates {
             match maybe_record {
                 Some(record) => {
-                    let _old = self.db.storage.insert(key, record);
+                    let _old = self.state.storage.insert(key, record);
                 }
                 None => {
-                    let _old = self.db.storage.remove(&key);
+                    let _old = self.state.storage.remove(&key);
                 }
             }
         }
 
-        self.db.last_tx_id = tx_id;
+        self.state.last_tx_id = tx_id;
         Ok(())
     }
 
@@ -195,7 +204,7 @@ mod tests {
 
     #[test]
     fn transaction_commit_applies_overlay() {
-        let mut db = Emdb::open_in_memory();
+        let db = Emdb::open_in_memory();
         let result = db.transaction(|tx| {
             tx.insert("a", "1")?;
             tx.insert("b", "2")?;
@@ -209,7 +218,7 @@ mod tests {
 
     #[test]
     fn transaction_rollback_discards_overlay() {
-        let mut db = Emdb::open_in_memory();
+        let db = Emdb::open_in_memory();
         let result = db.transaction::<_, ()>(|tx| {
             tx.insert("a", "1")?;
             Err(crate::Error::TransactionAborted("rollback"))
@@ -221,7 +230,7 @@ mod tests {
 
     #[test]
     fn transaction_remove_reads_from_overlay() {
-        let mut db = Emdb::open_in_memory();
+        let db = Emdb::open_in_memory();
         assert!(db.insert("a", "1").is_ok());
 
         let result = db.transaction(|tx| {

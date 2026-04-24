@@ -24,7 +24,7 @@ fn bench_flush_policy(c: &mut Criterion, name: &str, policy: FlushPolicy) {
                 .flush_policy(policy)
                 .build();
             assert!(built.is_ok());
-            let mut db = match built {
+            let db = match built {
                 Ok(db) => db,
                 Err(err) => panic!("build should succeed: {err}"),
             };

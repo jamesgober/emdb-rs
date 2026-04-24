@@ -83,7 +83,7 @@ fn set_header_version(path: &std::path::Path, version: u32) -> Result<()> {
 #[test]
 fn basic_commit_inserts_all_keys() -> Result<()> {
     let path = tmp_path("basic-commit");
-    let mut db = Emdb::open(&path)?;
+    let db = Emdb::open(&path)?;
 
     db.transaction(|tx| {
         tx.insert("a", "1")?;
@@ -103,7 +103,7 @@ fn basic_commit_inserts_all_keys() -> Result<()> {
 #[test]
 fn basic_rollback_discards_all_keys() -> Result<()> {
     let path = tmp_path("basic-rollback");
-    let mut db = Emdb::open(&path)?;
+    let db = Emdb::open(&path)?;
 
     let result = db.transaction::<_, ()>(|tx| {
         tx.insert("a", "1")?;
@@ -124,7 +124,7 @@ fn basic_rollback_discards_all_keys() -> Result<()> {
 #[test]
 fn read_your_writes_inside_transaction() -> Result<()> {
     let path = tmp_path("read-your-writes");
-    let mut db = Emdb::open(&path)?;
+    let db = Emdb::open(&path)?;
 
     db.transaction(|tx| {
         tx.insert("session", "token")?;
@@ -139,7 +139,7 @@ fn read_your_writes_inside_transaction() -> Result<()> {
 #[test]
 fn remove_then_get_inside_transaction_returns_none() -> Result<()> {
     let path = tmp_path("remove-then-get");
-    let mut db = Emdb::open(&path)?;
+    let db = Emdb::open(&path)?;
     db.insert("k", "v")?;
 
     db.transaction(|tx| {
@@ -159,7 +159,7 @@ fn crash_before_batch_end_discards_batch_on_reopen() -> Result<()> {
     let path = tmp_path("crash-before-end");
 
     {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
         db.insert("stable", "ok")?;
         db.flush()?;
     }
@@ -182,7 +182,7 @@ fn crash_after_batch_end_keeps_batch_on_reopen() -> Result<()> {
     let path = tmp_path("crash-after-end");
 
     {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
         db.insert("stable", "ok")?;
         db.flush()?;
     }
@@ -204,7 +204,7 @@ fn crash_after_batch_end_keeps_batch_on_reopen() -> Result<()> {
 #[test]
 fn tx_id_monotonicity_holds_across_commits() -> Result<()> {
     let path = tmp_path("txid-monotonic");
-    let mut db = Emdb::open(&path)?;
+    let db = Emdb::open(&path)?;
 
     let mut prev = 0_u64;
     for i in 0_u32..100 {
@@ -225,10 +225,10 @@ fn tx_id_monotonicity_holds_across_commits() -> Result<()> {
 #[test]
 fn empty_transaction_commits() -> Result<()> {
     let path = tmp_path("tx-empty");
-    let mut db = Emdb::open(&path)?;
+    let db = Emdb::open(&path)?;
 
     db.transaction(|_tx| Ok(()))?;
-    assert_eq!(db.len(), 0);
+    assert_eq!(db.len()?, 0);
 
     assert!(std::fs::remove_file(path).is_ok());
     Ok(())
@@ -239,7 +239,7 @@ fn tx_id_persists_across_reopens() -> Result<()> {
     let path = tmp_path("txid-persist");
 
     let first = {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
         db.transaction(|tx| {
             tx.insert("a", "1")?;
             Ok(())
@@ -248,7 +248,7 @@ fn tx_id_persists_across_reopens() -> Result<()> {
     };
 
     let second = {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
         db.transaction(|tx| {
             tx.insert("b", "2")?;
             Ok(())
@@ -266,7 +266,7 @@ fn v1_header_files_remain_readable_with_v2_batch_records() -> Result<()> {
     let path = tmp_path("mixed-v1-v2");
 
     {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
         db.insert("base", "value")?;
         db.flush()?;
     }
@@ -274,7 +274,7 @@ fn v1_header_files_remain_readable_with_v2_batch_records() -> Result<()> {
     set_header_version(path.as_path(), 1)?;
 
     {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
         db.transaction(|tx| {
             tx.insert("tx", "value")?;
             Ok(())
@@ -292,7 +292,7 @@ fn v1_header_files_remain_readable_with_v2_batch_records() -> Result<()> {
 #[test]
 fn deterministic_operation_sequence_matches_oracle() -> Result<()> {
     let path = tmp_path("oracle");
-    let mut db = Emdb::open(&path)?;
+    let db = Emdb::open(&path)?;
     let mut oracle = BTreeMap::<Vec<u8>, Vec<u8>>::new();
 
     let mut seed = 0x1234_5678_9ABC_DEF0_u64;
@@ -329,7 +329,7 @@ fn deterministic_operation_sequence_matches_oracle() -> Result<()> {
     for (k, v) in &oracle {
         assert_eq!(db.get(k)?, Some(v.clone()));
     }
-    assert_eq!(db.len(), oracle.len());
+    assert_eq!(db.len()?, oracle.len());
 
     assert!(std::fs::remove_file(path).is_ok());
     Ok(())
@@ -340,20 +340,24 @@ fn crash_points_inside_transaction_discard_or_keep_correctly() -> Result<()> {
     let path = tmp_path("crash-points");
 
     {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
         db.flush()?;
     }
 
     // Crash at begin: batch begin only should be discarded.
     append_batch_begin(path.as_path(), 201, 1)?;
-    let reopened = Emdb::open(&path)?;
-    assert!(reopened.is_empty());
+    {
+        let reopened = Emdb::open(&path)?;
+        assert!(reopened.is_empty()?);
+    }
 
     // Crash mid-batch: begin + one op, no end should be discarded.
     append_batch_begin(path.as_path(), 202, 1)?;
     append_insert(path.as_path(), b"mid", b"value")?;
-    let reopened = Emdb::open(&path)?;
-    assert_eq!(reopened.get("mid")?, None);
+    {
+        let reopened = Emdb::open(&path)?;
+        assert_eq!(reopened.get("mid")?, None);
+    }
 
     // Just-before-end crash should still discard.
     append_batch_begin(path.as_path(), 203, 1)?;
@@ -365,8 +369,10 @@ fn crash_points_inside_transaction_discard_or_keep_correctly() -> Result<()> {
     let len = file.metadata()?.len();
     file.set_len(len - 1)?;
     drop(file);
-    let reopened = Emdb::open(&path)?;
-    assert_eq!(reopened.get("almost")?, None);
+    {
+        let reopened = Emdb::open(&path)?;
+        assert_eq!(reopened.get("almost")?, None);
+    }
 
     assert!(std::fs::remove_file(path).is_ok());
     Ok(())
@@ -375,7 +381,7 @@ fn crash_points_inside_transaction_discard_or_keep_correctly() -> Result<()> {
 #[test]
 fn transaction_file_keeps_header_length_invariant() -> Result<()> {
     let path = tmp_path("header-len");
-    let mut db = Emdb::open(&path)?;
+    let db = Emdb::open(&path)?;
 
     db.transaction(|tx| {
         tx.insert("k", "v")?;

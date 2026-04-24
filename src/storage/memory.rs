@@ -2,8 +2,6 @@
 
 //! In-memory no-op storage backend.
 
-use std::path::Path;
-
 use crate::storage::{Op, SnapshotIter, Storage};
 use crate::Result;
 
@@ -26,10 +24,6 @@ impl Storage for MemoryStorage {
 
     fn compact(&mut self, _snapshot: SnapshotIter<'_>) -> Result<()> {
         Ok(())
-    }
-
-    fn path(&self) -> Option<&Path> {
-        None
     }
 
     fn last_tx_id(&self) -> u64 {
@@ -70,6 +64,5 @@ mod tests {
         assert!(appended.is_ok());
         assert!(flushed.is_ok());
         assert!(compacted.is_ok());
-        assert!(storage.path().is_none());
     }
 }

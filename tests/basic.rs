@@ -5,13 +5,13 @@ use emdb::{Emdb, Result};
 #[test]
 fn open_in_memory_returns_empty_instance() {
     let db = Emdb::open_in_memory();
-    assert_eq!(db.len(), 0);
-    assert!(db.is_empty());
+    assert!(matches!(db.len(), Ok(0)));
+    assert!(matches!(db.is_empty(), Ok(true)));
 }
 
 #[test]
 fn insert_get_remove_round_trip() -> Result<()> {
-    let mut db = Emdb::open_in_memory();
+    let db = Emdb::open_in_memory();
     db.insert(b"key", b"value")?;
 
     assert_eq!(db.get(b"key")?, Some(b"value".to_vec()));
@@ -24,7 +24,7 @@ fn insert_get_remove_round_trip() -> Result<()> {
 
 #[test]
 fn empty_key_is_allowed() -> Result<()> {
-    let mut db = Emdb::open_in_memory();
+    let db = Emdb::open_in_memory();
     db.insert([], b"v")?;
     assert_eq!(db.get([])?, Some(b"v".to_vec()));
     Ok(())

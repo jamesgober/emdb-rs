@@ -282,10 +282,6 @@ impl Storage for FileStorage {
         self.atomic_replace_with_tmp(&tmp_path)
     }
 
-    fn path(&self) -> Option<&Path> {
-        Some(self.path.as_path())
-    }
-
     fn last_tx_id(&self) -> u64 {
         self.last_tx_id
     }

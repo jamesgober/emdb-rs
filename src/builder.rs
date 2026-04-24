@@ -73,7 +73,7 @@ mod tests {
             Ok(db) => db,
             Err(err) => panic!("build should succeed: {err}"),
         };
-        assert!(db.is_empty());
+        assert!(matches!(db.is_empty(), Ok(true)));
     }
 
     #[test]
@@ -84,7 +84,7 @@ mod tests {
             Ok(db) => db,
             Err(err) => panic!("build should succeed: {err}"),
         };
-        assert_eq!(db.len(), 0);
+        assert!(matches!(db.len(), Ok(0)));
     }
 
     #[cfg(feature = "ttl")]
@@ -100,7 +100,7 @@ mod tests {
             Ok(db) => db,
             Err(err) => panic!("build should succeed: {err}"),
         };
-        assert!(db.is_empty());
+        assert!(matches!(db.is_empty(), Ok(true)));
     }
 
     #[test]

@@ -4,7 +4,36 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/jamesgober/emdb-rs/compare/v0.4.0...HEAD)
+## [Unreleased](https://github.com/jamesgober/emdb-rs/compare/v0.5.0...HEAD)
+
+## [0.5.0](https://github.com/jamesgober/emdb-rs/compare/v0.4.0...v0.5.0) — 2026-04-24
+
+### Added
+
+- Cross-process lockfile exclusion via `fs4` for file-backed databases.
+- Cheap `Clone` support for `Emdb` handles via shared inner state.
+- Concurrency integration coverage (`tests/concurrency.rs`) for:
+	- many-reader / one-writer execution,
+	- concurrent transactions,
+	- lock contention and lock release behavior,
+	- clone-handle correctness across threads.
+- Loom-gated lock-order test target (`tests/loom_tests.rs`).
+- Concurrency benchmark suite (`benches/concurrency.rs`).
+
+### Changed
+
+- **BREAKING:** mutating `Emdb` APIs now take `&self` instead of `&mut self`.
+- `Emdb` internals refactored to `Arc<Inner>` with `RwLock`-protected state and
+	`Mutex`-serialized storage appends.
+- Transactions now acquire and hold the state write lock for closure lifetime.
+- `Error` expanded with lock-specific variants:
+	`LockBusy`, `LockfileError`, and `LockPoisoned`.
+- Crate version bumped to `0.5.0`.
+
+### Fixed
+
+- File-backed open now prevents concurrent process access to the same database
+	path via advisory lockfile.
 
 ## [0.4.0](https://github.com/jamesgober/emdb-rs/compare/v0.3.0...v0.4.0) — 2026-04-24
 

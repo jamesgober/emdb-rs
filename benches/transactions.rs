@@ -16,7 +16,7 @@ fn bench_outside_transaction(c: &mut Criterion) {
             let path = tmp_path("outside");
             let built = Emdb::open(&path);
             assert!(built.is_ok());
-            let mut db = match built {
+            let db = match built {
                 Ok(db) => db,
                 Err(err) => panic!("open should succeed: {err}"),
             };
@@ -37,7 +37,7 @@ fn bench_inside_transaction(c: &mut Criterion) {
             let path = tmp_path("inside");
             let opened = Emdb::open(&path);
             assert!(opened.is_ok());
-            let mut db = match opened {
+            let db = match opened {
                 Ok(db) => db,
                 Err(err) => panic!("open should succeed: {err}"),
             };
@@ -62,7 +62,7 @@ fn bench_batch_sizes(c: &mut Criterion) {
                 let path = tmp_path(&format!("batch-{size}"));
                 let opened = Emdb::open(&path);
                 assert!(opened.is_ok());
-                let mut db = match opened {
+                let db = match opened {
                     Ok(db) => db,
                     Err(err) => panic!("open should succeed: {err}"),
                 };

@@ -17,7 +17,7 @@ fn compact_shrinks_file_and_preserves_state() -> Result<()> {
 
     let mut expected = BTreeMap::new();
     {
-        let mut db = Emdb::open(&path)?;
+        let db = Emdb::open(&path)?;
 
         for i in 0_u32..1_000 {
             let key = format!("k{i}");
@@ -50,7 +50,7 @@ fn compact_shrinks_file_and_preserves_state() -> Result<()> {
     }
 
     let db = Emdb::open(&path)?;
-    assert_eq!(db.len(), expected.len());
+    assert_eq!(db.len()?, expected.len());
     for (k, v) in expected {
         assert_eq!(db.get(k.as_bytes())?, Some(v));
     }

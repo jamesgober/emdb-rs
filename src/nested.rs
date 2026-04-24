@@ -32,20 +32,35 @@ fn prefix_bytes(prefix: &str) -> Result<Vec<u8>> {
 
 impl Emdb {
     /// Returns an iterator over all keys starting with `prefix.`.
-    pub fn group(&self, prefix: impl AsRef<str>) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when lock acquisition fails.
+    pub fn group(
+        &self,
+        prefix: impl AsRef<str>,
+    ) -> Result<impl Iterator<Item = (Vec<u8>, Vec<u8>)>> {
         let prefix = prefix.as_ref().as_bytes().to_vec();
-        self.iter().filter(move |(key, _value)| {
-            key.starts_with(prefix.as_slice()) && key.get(prefix.len()).copied() == Some(b'.')
-        })
+        let items = self
+            .iter()?
+            .filter(move |(key, _value)| {
+                key.starts_with(prefix.as_slice()) && key.get(prefix.len()).copied() == Some(b'.')
+            })
+            .collect::<Vec<_>>();
+        Ok(items.into_iter())
     }
 
     /// Deletes every key starting with `prefix.` and returns the number removed.
-    pub fn delete_group(&mut self, prefix: impl AsRef<str>) -> Result<usize> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prefix is empty, key deletion fails, or lock
+    /// acquisition fails.
+    pub fn delete_group(&self, prefix: impl AsRef<str>) -> Result<usize> {
         let prefix = prefix_bytes(prefix.as_ref())?;
         let keys: Vec<Vec<u8>> = self
-            .keys()
+            .keys()?
             .filter(|key| key.starts_with(prefix.as_slice()))
-            .map(|key| key.to_vec())
             .collect();
 
         let mut deleted = 0_usize;
@@ -59,7 +74,8 @@ impl Emdb {
     }
 
     /// Returns a scoped handle that prefixes all keys with `prefix.`.
-    pub fn focus(&mut self, prefix: impl Into<String>) -> Focus<'_> {
+    #[must_use]
+    pub fn focus(&self, prefix: impl Into<String>) -> Focus<'_> {
         Focus {
             db: self,
             prefix: prefix.into(),
@@ -76,21 +92,21 @@ impl Emdb {
 /// # {
 /// use emdb::Emdb;
 ///
-/// let mut db = Emdb::open_in_memory();
-/// let mut user = db.focus("user");
+/// let db = Emdb::open_in_memory();
+/// let user = db.focus("user");
 /// user.set("name", "james")?;
 /// assert_eq!(user.get("name")?, Some(b"james".to_vec()));
 /// # }
 /// # Ok::<(), emdb::Error>(())
 /// ```
 pub struct Focus<'a> {
-    db: &'a mut Emdb,
+    db: &'a Emdb,
     prefix: String,
 }
 
 impl<'a> Focus<'a> {
     /// Inserts a value under the current focus prefix.
-    pub fn set(&mut self, key: &str, value: impl Into<Vec<u8>>) -> Result<()> {
+    pub fn set(&self, key: &str, value: impl Into<Vec<u8>>) -> Result<()> {
         self.db.insert(join_prefix(&self.prefix, key), value)
     }
 
@@ -100,7 +116,7 @@ impl<'a> Focus<'a> {
     }
 
     /// Removes a value under the current focus prefix.
-    pub fn remove(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
+    pub fn remove(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.db.remove(join_prefix(&self.prefix, key))
     }
 
@@ -110,7 +126,8 @@ impl<'a> Focus<'a> {
     }
 
     /// Creates a nested focus below the current one.
-    pub fn focus(&mut self, sub: &str) -> Focus<'_> {
+    #[must_use]
+    pub fn focus(&self, sub: &str) -> Focus<'a> {
         let next = if self.prefix.is_empty() {
             sub.to_owned()
         } else {
@@ -128,12 +145,17 @@ impl<'a> Focus<'a> {
     }
 
     /// Iterates all keys under the current focus prefix.
-    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
-        self.db.group(self.prefix.as_str())
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when lock acquisition fails.
+    pub fn iter(&self) -> Result<impl Iterator<Item = (Vec<u8>, Vec<u8>)>> {
+        let items = self.db.group(self.prefix.as_str())?.collect::<Vec<_>>();
+        Ok(items.into_iter())
     }
 
     /// Deletes every key under the current focus prefix.
-    pub fn delete_all(&mut self) -> Result<usize> {
+    pub fn delete_all(&self) -> Result<usize> {
         self.db.delete_group(self.prefix.as_str())
     }
 }
@@ -141,7 +163,7 @@ impl<'a> Focus<'a> {
 #[cfg(all(feature = "nested", feature = "ttl"))]
 impl<'a> Focus<'a> {
     /// Inserts a value under the current focus prefix with explicit TTL.
-    pub fn set_with_ttl(&mut self, key: &str, value: impl Into<Vec<u8>>, ttl: Ttl) -> Result<()> {
+    pub fn set_with_ttl(&self, key: &str, value: impl Into<Vec<u8>>, ttl: Ttl) -> Result<()> {
         self.db
             .insert_with_ttl(join_prefix(&self.prefix, key), value, ttl)
     }
@@ -153,47 +175,52 @@ mod tests {
 
     #[test]
     fn test_group_filters_by_prefix() {
-        let mut db = Emdb::open_in_memory();
+        let db = Emdb::open_in_memory();
         assert!(db.insert("product.name", "box").is_ok());
         assert!(db.insert("product.size", "l").is_ok());
         assert!(db.insert("products.name", "skip").is_ok());
         assert!(db.insert("product", "exact").is_ok());
 
-        let found = db.group("product").count();
-        assert_eq!(found, 2);
+        let found = db.group("product");
+        assert!(found.is_ok());
+        assert_eq!(found.map_or(0, Iterator::count), 2);
     }
 
     #[test]
     fn test_delete_group_empty_prefix_is_error() {
-        let mut db = Emdb::open_in_memory();
+        let db = Emdb::open_in_memory();
         let deleted = db.delete_group("");
         assert!(deleted.is_err());
     }
 
     #[test]
     fn test_focus_chain_and_delete_all() {
-        let mut db = Emdb::open_in_memory();
+        let db = Emdb::open_in_memory();
 
         {
-            let mut product = db.focus("product");
+            let product = db.focus("product");
             assert!(product.set("name", "phone").is_ok());
 
-            let mut details = product.focus("details");
+            let details = product.focus("details");
             assert!(details.set("weight", "100g").is_ok());
 
-            let mut specs = details.focus("specs");
+            let specs = details.focus("specs");
             assert!(specs.set("ram", "8gb").is_ok());
         }
 
-        assert_eq!(db.group("product").count(), 3);
+        let grouped = db.group("product");
+        assert!(grouped.is_ok());
+        assert_eq!(grouped.map_or(0, Iterator::count), 3);
 
         {
-            let mut details = db.focus("product.details");
+            let details = db.focus("product.details");
             let deleted = details.delete_all();
             assert!(matches!(deleted, Ok(2)));
         }
 
-        assert_eq!(db.group("product").count(), 1);
+        let grouped = db.group("product");
+        assert!(grouped.is_ok());
+        assert_eq!(grouped.map_or(0, Iterator::count), 1);
     }
 
     #[cfg(feature = "ttl")]
@@ -203,9 +230,9 @@ mod tests {
 
         use crate::Ttl;
 
-        let mut db = Emdb::open_in_memory();
+        let db = Emdb::open_in_memory();
         {
-            let mut focus = db.focus("session");
+            let focus = db.focus("session");
             assert!(focus
                 .set_with_ttl("token", "abc", Ttl::After(Duration::ZERO))
                 .is_ok());

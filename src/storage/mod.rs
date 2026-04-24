@@ -2,8 +2,6 @@
 
 //! Storage abstraction and operation log types.
 
-use std::path::Path;
-
 use crate::Result;
 
 pub(crate) mod codec;
@@ -129,9 +127,6 @@ pub(crate) trait Storage: Send {
 
     /// Rewrite storage from a fresh snapshot.
     fn compact(&mut self, snapshot: SnapshotIter<'_>) -> Result<()>;
-
-    /// File path for file-backed storage, if present.
-    fn path(&self) -> Option<&Path>;
 
     /// Return the highest committed transaction id known by this backend.
     fn last_tx_id(&self) -> u64;

@@ -10,7 +10,7 @@ fn feature_compile_smoke() {
 
     #[cfg(feature = "nested")]
     {
-        let mut db = emdb::Emdb::open_in_memory();
+        let db = emdb::Emdb::open_in_memory();
         let _focus = db.focus("scope");
     }
 }
