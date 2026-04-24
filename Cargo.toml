@@ -1,0 +1,56 @@
+[package]
+name = "emdb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+readme = "README.md"
+license = "Apache-2.0"
+
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+description = "A lightweight, high-performance embedded database for Rust."
+
+keywords = [
+    "database",
+    "embedded",
+    "storage",
+    "kv",
+    "db"
+]
+
+categories = [
+    "database",
+    "database-implementations",
+    "data-structures",
+    "caching"
+]
+
+documentation = "https://docs.rs/emdb"
+repository = "https://github.com/jamesgober/emdb-rs"
+homepage = "https://github.com/jamesgober/emdb-rs"
+
+# Configuration for docs.rs
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+
+[dev-dependencies]
+
+[features]
+default = []
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
