@@ -190,7 +190,7 @@ mod tests {
         {
             let mut details = db.focus("product.details");
             let deleted = details.delete_all();
-            assert_eq!(deleted, Ok(2));
+            assert!(matches!(deleted, Ok(2)));
         }
 
         assert_eq!(db.group("product").count(), 1);
@@ -211,6 +211,6 @@ mod tests {
                 .is_ok());
         }
 
-        assert_eq!(db.get("session.token"), Ok(None));
+        assert!(matches!(db.get("session.token"), Ok(None)));
     }
 }

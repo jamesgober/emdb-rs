@@ -28,6 +28,23 @@
 //! # Ok::<(), emdb::Error>(())
 //! ```
 //!
+//! Persistent usage:
+//!
+//! ```rust
+//! use emdb::Emdb;
+//!
+//! let path = std::env::temp_dir().join("emdb-doc-example.emdb");
+//! {
+//!     let mut db = Emdb::open(&path)?;
+//!     db.insert("name", "emdb")?;
+//!     db.flush()?;
+//! }
+//! let db = Emdb::open(&path)?;
+//! assert_eq!(db.get("name")?, Some(b"emdb".to_vec()));
+//! # let _cleanup = std::fs::remove_file(path);
+//! # Ok::<(), emdb::Error>(())
+//! ```
+//!
 //! TTL usage:
 //!
 //! ```rust
@@ -37,7 +54,9 @@
 //!
 //! use emdb::{Emdb, Ttl};
 //!
-//! let mut db = Emdb::builder().default_ttl(Duration::from_secs(60)).build();
+//! let mut db = Emdb::builder()
+//!     .default_ttl(Duration::from_secs(60))
+//!     .build()?;
 //! db.insert_with_ttl("session", "token", Ttl::Default)?;
 //! assert!(db.ttl("session")?.is_some());
 //! # }
@@ -79,6 +98,7 @@ mod db;
 mod error;
 #[cfg(feature = "nested")]
 mod nested;
+mod storage;
 mod ttl;
 
 pub use builder::EmdbBuilder;
@@ -86,4 +106,5 @@ pub use db::Emdb;
 pub use error::{Error, Result};
 #[cfg(feature = "nested")]
 pub use nested::Focus;
+pub use storage::FlushPolicy;
 pub use ttl::Ttl;

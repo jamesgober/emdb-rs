@@ -159,7 +159,7 @@ mod tests {
     fn test_ttl_default_without_global_is_never() {
         let now = 100_u64;
         let expires = expires_from_ttl(Ttl::Default, None, now);
-        assert_eq!(expires, Ok(None));
+        assert!(matches!(expires, Ok(None)));
     }
 
     #[cfg(feature = "ttl")]
@@ -167,7 +167,7 @@ mod tests {
     fn test_ttl_after_zero_is_immediate() {
         let now = 123_u64;
         let expires = expires_from_ttl(Ttl::After(Duration::ZERO), None, now);
-        assert_eq!(expires, Ok(Some(now)));
+        assert!(matches!(expires, Ok(Some(deadline)) if deadline == now));
         assert!(is_expired(Some(now), now));
     }
 
@@ -176,7 +176,7 @@ mod tests {
     fn test_ttl_after_uses_duration() {
         let now = 1_000_u64;
         let expires = expires_from_ttl(Ttl::After(Duration::from_secs(2)), None, now);
-        assert_eq!(expires, Ok(Some(3_000)));
+        assert!(matches!(expires, Ok(Some(deadline)) if deadline == 3_000));
     }
 
     #[cfg(feature = "ttl")]
@@ -184,7 +184,7 @@ mod tests {
     fn test_ttl_default_uses_global() {
         let now = 500_u64;
         let expires = expires_from_ttl(Ttl::Default, Some(Duration::from_millis(25)), now);
-        assert_eq!(expires, Ok(Some(525)));
+        assert!(matches!(expires, Ok(Some(deadline)) if deadline == 525));
     }
 
     #[cfg(feature = "ttl")]
@@ -192,7 +192,7 @@ mod tests {
     fn test_ttl_overflow_is_reported() {
         let now = u64::MAX;
         let result = expires_from_ttl(Ttl::After(Duration::from_millis(1)), None, now);
-        assert_eq!(result, Err(Error::TtlOverflow));
+        assert!(matches!(result, Err(Error::TtlOverflow)));
     }
 
     #[cfg(feature = "ttl")]

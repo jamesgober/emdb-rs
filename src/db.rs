@@ -1,13 +1,18 @@
 // Copyright 2026 James Gober. Licensed under Apache-2.0.
 
-//! Core in-memory database implementation.
+//! Core database implementation.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 #[cfg(feature = "ttl")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::builder::EmdbBuilder;
+use crate::error::Error;
+use crate::storage::file::FileStorage;
+use crate::storage::memory::MemoryStorage;
+use crate::storage::{build_flags, Op, SnapshotEntry, SnapshotIter, Storage};
 #[cfg(feature = "ttl")]
 use crate::ttl::{
     expires_from_ttl, is_expired, now_unix_millis, record_expires_at, record_set_persist,
@@ -18,78 +23,87 @@ use crate::Result;
 
 /// The primary embedded database handle.
 ///
-/// `Emdb` stores key/value records fully in memory using an ordered map.
-/// Keys and values are both opaque byte arrays.
-///
-/// # Examples
-///
-/// ```rust
-/// use emdb::Emdb;
-///
-/// let mut db = Emdb::open_in_memory();
-/// db.insert("name", "emdb")?;
-/// assert_eq!(db.get("name")?, Some(b"emdb".to_vec()));
-/// # Ok::<(), emdb::Error>(())
-/// ```
-#[derive(Debug, Default)]
+/// `Emdb` stores key/value records in memory and can optionally persist
+/// operations to a single append-only file.
 pub struct Emdb {
     storage: BTreeMap<Vec<u8>, Record>,
+    backend: Box<dyn Storage>,
     #[cfg(feature = "ttl")]
     default_ttl: Option<Duration>,
 }
 
 impl Emdb {
     /// Open a new in-memory database.
-    ///
-    /// In-memory databases are volatile; all records are dropped when the
-    /// instance is dropped.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use emdb::Emdb;
-    ///
-    /// let db = Emdb::open_in_memory();
-    /// assert!(db.is_empty());
-    /// ```
     #[must_use]
     pub fn open_in_memory() -> Self {
-        Self::default()
-    }
-
-    /// Build a database from a builder configuration.
-    #[must_use]
-    pub(crate) fn from_builder(builder: EmdbBuilder) -> Self {
-        #[cfg(not(feature = "ttl"))]
-        {
-            let _unused_builder = builder;
-        }
-
         Self {
             storage: BTreeMap::new(),
+            backend: Box::new(MemoryStorage),
             #[cfg(feature = "ttl")]
-            default_ttl: builder.default_ttl,
+            default_ttl: None,
         }
     }
 
-    /// Create a builder for configuring a new in-memory database.
+    /// Open or create a persistent database file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be opened, has an incompatible
+    /// format, or replay fails.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Emdb::builder().path(path.as_ref().to_path_buf()).build()
+    }
+
+    /// Create a builder for configuring a database.
     #[must_use]
     pub fn builder() -> EmdbBuilder {
         EmdbBuilder::new()
     }
 
+    /// Build a database from builder configuration.
+    pub(crate) fn from_builder(builder: EmdbBuilder) -> Result<Self> {
+        if matches!(builder.flush_policy, crate::FlushPolicy::EveryN(0)) {
+            return Err(Error::InvalidConfig("flush policy EveryN requires N > 0"));
+        }
+
+        #[cfg_attr(not(feature = "ttl"), allow(unused_mut))]
+        let mut db = if let Some(path) = builder.path {
+            let mut backend = FileStorage::new(path, builder.flush_policy, build_flags())?;
+            let mut replayed = BTreeMap::new();
+
+            backend.replay(&mut |op| {
+                apply_replayed_op(&mut replayed, op);
+                Ok(())
+            })?;
+
+            Self {
+                storage: replayed,
+                backend: Box::new(backend),
+                #[cfg(feature = "ttl")]
+                default_ttl: builder.default_ttl,
+            }
+        } else {
+            Self {
+                storage: BTreeMap::new(),
+                backend: Box::new(MemoryStorage),
+                #[cfg(feature = "ttl")]
+                default_ttl: builder.default_ttl,
+            }
+        };
+
+        #[cfg(feature = "ttl")]
+        {
+            let _evicted = db.sweep_expired();
+        }
+
+        Ok(db)
+    }
+
     /// Insert or replace a key/value pair.
     ///
-    /// # Examples
+    /// # Errors
     ///
-    /// ```rust
-    /// use emdb::Emdb;
-    ///
-    /// let mut db = Emdb::open_in_memory();
-    /// db.insert("k", "v")?;
-    /// assert_eq!(db.get("k")?, Some(b"v".to_vec()));
-    /// # Ok::<(), emdb::Error>(())
-    /// ```
+    /// Returns an error when persistence append fails.
     pub fn insert(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
         #[cfg(feature = "ttl")]
         {
@@ -98,28 +112,24 @@ impl Emdb {
 
         #[cfg(not(feature = "ttl"))]
         {
+            let key = key.into();
+            let value = value.into();
             let _previous = self
                 .storage
-                .insert(key.into(), record_new(value.into(), None));
-            Ok(())
+                .insert(key.clone(), record_new(value.clone(), None));
+            self.backend.append(&Op::Insert {
+                key,
+                value,
+                expires_at: None,
+            })
         }
     }
 
     /// Fetch a value by key.
     ///
-    /// When the `ttl` feature is enabled and the key is expired, this returns
-    /// `Ok(None)`.
+    /// # Errors
     ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use emdb::Emdb;
-    ///
-    /// let mut db = Emdb::open_in_memory();
-    /// db.insert("k", "v")?;
-    /// assert_eq!(db.get("k")?, Some(b"v".to_vec()));
-    /// # Ok::<(), emdb::Error>(())
-    /// ```
+    /// Returns an error when conversion to visible state fails.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let Some(record) = self.storage.get(key.as_ref()) else {
             return Ok(None);
@@ -137,8 +147,16 @@ impl Emdb {
     }
 
     /// Remove a key from the database and return its previous value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistence append fails.
     pub fn remove(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
+        let key_vec = key.as_ref().to_vec();
         let removed = self.storage.remove(key.as_ref());
+
+        self.backend.append(&Op::Remove { key: key_vec })?;
+
         let Some(record) = removed else {
             return Ok(None);
         };
@@ -200,8 +218,13 @@ impl Emdb {
     }
 
     /// Remove all records.
-    pub fn clear(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistence append fails.
+    pub fn clear(&mut self) -> Result<()> {
         self.storage.clear();
+        self.backend.append(&Op::Clear)
     }
 
     /// Iterate over all visible records as key/value byte slices.
@@ -230,6 +253,55 @@ impl Emdb {
         self.iter().map(|(key, _value)| key)
     }
 
+    /// Flush pending storage writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage flush fails.
+    pub fn flush(&mut self) -> Result<()> {
+        self.backend.flush()
+    }
+
+    /// Rewrite file storage from the current in-memory snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when compaction fails.
+    pub fn compact(&mut self) -> Result<()> {
+        #[cfg(feature = "ttl")]
+        {
+            let _evicted = self.sweep_expired();
+        }
+
+        let owned: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> = self
+            .storage
+            .iter()
+            .map(|(key, record)| {
+                #[cfg(feature = "ttl")]
+                let expires_at = record_expires_at(record);
+                #[cfg(not(feature = "ttl"))]
+                let expires_at = None;
+
+                (key.clone(), record_value(record).to_vec(), expires_at)
+            })
+            .collect();
+
+        let snapshot: SnapshotIter<'_> =
+            Box::new(owned.iter().map(|(key, value, expires_at)| SnapshotEntry {
+                key: key.as_slice(),
+                value: value.as_slice(),
+                expires_at: *expires_at,
+            }));
+
+        self.backend.compact(snapshot)
+    }
+
+    /// Return file path when this database is file-backed.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        self.backend.path()
+    }
+
     /// Insert or replace a key/value pair with explicit TTL behavior.
     #[cfg(feature = "ttl")]
     pub fn insert_with_ttl(
@@ -238,12 +310,20 @@ impl Emdb {
         value: impl Into<Vec<u8>>,
         ttl: Ttl,
     ) -> Result<()> {
+        let key = key.into();
+        let value = value.into();
+
         let now = now_unix_millis();
         let expires_at = expires_from_ttl(ttl, self.default_ttl, now)?;
         let _previous = self
             .storage
-            .insert(key.into(), record_new(value.into(), expires_at));
-        Ok(())
+            .insert(key.clone(), record_new(value.clone(), expires_at));
+
+        self.backend.append(&Op::Insert {
+            key,
+            value,
+            expires_at,
+        })
     }
 
     /// Returns the absolute expiration time for a key, if present.
@@ -287,7 +367,16 @@ impl Emdb {
             return Ok(false);
         };
 
-        Ok(record_set_persist(record))
+        let changed = record_set_persist(record);
+        if changed {
+            self.backend.append(&Op::Insert {
+                key: key.as_ref().to_vec(),
+                value: record_value(record).to_vec(),
+                expires_at: None,
+            })?;
+        }
+
+        Ok(changed)
     }
 
     /// Evicts all currently expired records and returns the number removed.
@@ -301,13 +390,48 @@ impl Emdb {
     }
 }
 
+impl Drop for Emdb {
+    fn drop(&mut self) {
+        let _ignored = self.flush();
+    }
+}
+
+fn apply_replayed_op(storage: &mut BTreeMap<Vec<u8>, Record>, op: Op) {
+    match op {
+        Op::Insert {
+            key,
+            value,
+            expires_at,
+        } => {
+            let _previous = storage.insert(key, record_new(value, expires_at));
+        }
+        Op::Remove { key } => {
+            let _removed = storage.remove(&key);
+        }
+        Op::Clear => {
+            storage.clear();
+        }
+        Op::Checkpoint { record_count: _ } => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Emdb;
+    use crate::storage::FlushPolicy;
     use crate::Result;
 
     #[cfg(feature = "ttl")]
     use crate::Ttl;
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_u128, |d| d.as_nanos());
+        p.push(format!("emdb-{name}-{nanos}.emdb"));
+        p
+    }
 
     #[test]
     fn test_open_in_memory_returns_empty() {
@@ -319,6 +443,11 @@ mod tests {
     #[test]
     fn test_builder_returns_empty_database() {
         let db = Emdb::builder().build();
+        assert!(db.is_ok());
+        let db = match db {
+            Ok(db) => db,
+            Err(err) => panic!("build should succeed: {err}"),
+        };
         assert!(db.is_empty());
     }
 
@@ -356,10 +485,34 @@ mod tests {
         assert_eq!(key_count, 2);
         assert_eq!(iter_count, 2);
 
-        db.clear();
+        db.clear()?;
         assert_eq!(db.len(), 0);
         assert!(db.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn test_open_path_round_trip() -> Result<()> {
+        let path = tmp_path("db-open");
+
+        {
+            let mut db = Emdb::open(&path)?;
+            db.insert("k", "v")?;
+            db.flush()?;
+        }
+
+        let db = Emdb::open(&path)?;
+        assert_eq!(db.get("k")?, Some(b"v".to_vec()));
+        assert_eq!(db.path(), Some(path.as_path()));
+        let removed = std::fs::remove_file(path);
+        assert!(removed.is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn test_builder_every_n_zero_is_invalid() {
+        let db = Emdb::builder().flush_policy(FlushPolicy::EveryN(0)).build();
+        assert!(db.is_err());
     }
 
     #[cfg(feature = "ttl")]

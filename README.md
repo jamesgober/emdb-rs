@@ -19,7 +19,8 @@
 
 ## Status
 
-**Phase 1.** This crate now provides a functional in-memory key/value store.
+**Phase 2.** This crate now provides file-backed persistence with crash
+recovery for a single append-only storage file.
 The API is still pre-1.0 and may change before 1.0.
 
 Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
@@ -28,7 +29,7 @@ Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
 
 ```toml
 [dependencies]
-emdb = "0.2"
+emdb = "0.3"
 ```
 
 ## Quick Start
@@ -42,10 +43,49 @@ assert_eq!(db.get("name")?, Some(b"emdb".to_vec()));
 # Ok::<(), emdb::Error>(())
 ```
 
+## Persistence
+
+```rust
+use emdb::{Emdb, FlushPolicy};
+
+let path = std::env::temp_dir().join("app.emdb");
+
+{
+    let mut db = Emdb::builder()
+        .path(path.clone())
+        .flush_policy(FlushPolicy::EveryN(64))
+        .build()?;
+
+    db.insert("user:1", "james")?;
+    db.flush()?;
+}
+
+let reopened = Emdb::open(&path)?;
+assert_eq!(reopened.get("user:1")?, Some(b"james".to_vec()));
+# let _cleanup = std::fs::remove_file(path);
+# Ok::<(), emdb::Error>(())
+```
+
+Manual compaction:
+
+```rust
+use emdb::Emdb;
+
+let path = std::env::temp_dir().join("compact.emdb");
+let mut db = Emdb::open(&path)?;
+db.insert("k", "v")?;
+db.compact()?;
+db.flush()?;
+# let _cleanup = std::fs::remove_file(path);
+# Ok::<(), emdb::Error>(())
+```
+
 ## Features
 
 - `ttl` (default): per-record expiration and default TTL support.
 - `nested`: dotted-prefix group operations and `Focus` handles.
+- persistence (core): append-only file log, replay-on-open, flush policy,
+  and compaction.
 
 ### TTL Example
 
@@ -56,7 +96,9 @@ use std::time::Duration;
 
 use emdb::{Emdb, Ttl};
 
-let mut db = Emdb::builder().default_ttl(Duration::from_secs(30)).build();
+let mut db = Emdb::builder()
+    .default_ttl(Duration::from_secs(30))
+    .build()?;
 db.insert_with_ttl("session", "token", Ttl::Default)?;
 assert!(db.ttl("session")?.is_some());
 # }
