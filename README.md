@@ -19,7 +19,8 @@
 
 ## Status
 
-**Early development.** This crate is in its initial scaffolding phase. The public API is unstable and will change before the 1.0 release. The crate name on crates.io is reserved; do not depend on any specific behavior yet.
+**Phase 1.** This crate now provides a functional in-memory key/value store.
+The API is still pre-1.0 and may change before 1.0.
 
 Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
 
@@ -27,7 +28,7 @@ Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
 
 ```toml
 [dependencies]
-emdb = "0.1"
+emdb = "0.2"
 ```
 
 ## Quick Start
@@ -35,8 +36,49 @@ emdb = "0.1"
 ```rust
 use emdb::Emdb;
 
-let db = Emdb::open_in_memory();
-assert_eq!(db.len(), 0);
+let mut db = Emdb::open_in_memory();
+db.insert("name", "emdb")?;
+assert_eq!(db.get("name")?, Some(b"emdb".to_vec()));
+# Ok::<(), emdb::Error>(())
+```
+
+## Features
+
+- `ttl` (default): per-record expiration and default TTL support.
+- `nested`: dotted-prefix group operations and `Focus` handles.
+
+### TTL Example
+
+```rust
+# #[cfg(feature = "ttl")]
+# {
+use std::time::Duration;
+
+use emdb::{Emdb, Ttl};
+
+let mut db = Emdb::builder().default_ttl(Duration::from_secs(30)).build();
+db.insert_with_ttl("session", "token", Ttl::Default)?;
+assert!(db.ttl("session")?.is_some());
+# }
+# Ok::<(), emdb::Error>(())
+```
+
+### Nested Example
+
+```rust
+# #[cfg(feature = "nested")]
+# {
+use emdb::Emdb;
+
+let mut db = Emdb::open_in_memory();
+let mut product = db.focus("product");
+product.set("name", "phone")?;
+product.set("price", "799")?;
+
+assert_eq!(product.get("name")?, Some(b"phone".to_vec()));
+assert_eq!(db.group("product").count(), 2);
+# }
+# Ok::<(), emdb::Error>(())
 ```
 
 ## Goals

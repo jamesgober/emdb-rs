@@ -1,6 +1,6 @@
 [package]
 name = "emdb"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -39,9 +39,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 
 [dev-dependencies]
+criterion = { version = "0.5", default-features = false }
 
 [features]
-default = []
+default = ["ttl"]
+ttl = []
+nested = []
 
 [profile.release]
 opt-level = 3

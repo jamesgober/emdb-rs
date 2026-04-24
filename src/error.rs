@@ -26,12 +26,30 @@ pub enum Error {
     /// internal subsystems are still being built. It will be removed
     /// before the 1.0 release.
     NotImplemented,
+
+    /// An invalid path was provided to a nested operation.
+    ///
+    /// This is returned when a nested API receives an empty prefix.
+    /// Callers should provide a non-empty prefix and retry.
+    #[cfg(feature = "nested")]
+    InvalidPath,
+
+    /// A TTL computation overflowed the representable `SystemTime` range.
+    ///
+    /// This occurs when adding a duration to the current wall clock exceeds
+    /// the maximum representable timestamp. Callers should use a smaller TTL.
+    #[cfg(feature = "ttl")]
+    TtlOverflow,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotImplemented => f.write_str("emdb: operation not yet implemented"),
+            #[cfg(feature = "nested")]
+            Self::InvalidPath => f.write_str("emdb: invalid nested path"),
+            #[cfg(feature = "ttl")]
+            Self::TtlOverflow => f.write_str("emdb: ttl overflow"),
         }
     }
 }
@@ -52,5 +70,19 @@ mod tests {
     fn test_error_implements_std_error() {
         fn assert_error<E: std::error::Error>() {}
         assert_error::<Error>();
+    }
+
+    #[cfg(feature = "nested")]
+    #[test]
+    fn test_invalid_path_display_is_stable() {
+        let msg = format!("{}", Error::InvalidPath);
+        assert_eq!(msg, "emdb: invalid nested path");
+    }
+
+    #[cfg(feature = "ttl")]
+    #[test]
+    fn test_ttl_overflow_display_is_stable() {
+        let msg = format!("{}", Error::TtlOverflow);
+        assert_eq!(msg, "emdb: ttl overflow");
     }
 }

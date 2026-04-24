@@ -8,17 +8,55 @@
 //!
 //! A lightweight, high-performance embedded database for Rust.
 //!
-//! This crate is in early development. The API is unstable and will change
-//! before the 1.0 release. See the repository for roadmap and status:
+//! This crate provides an in-memory key/value store with optional TTL handling
+//! and nested-key ergonomics.
+//!
+//! The API is still pre-1.0 and may change. See the repository for roadmap and
+//! status:
 //! <https://github.com/jamesgober/emdb-rs>
 //!
-//! ## Example
+//! ## Examples
+//!
+//! Base key/value usage:
 //!
 //! ```rust
 //! use emdb::Emdb;
 //!
-//! let db = Emdb::open_in_memory();
-//! assert_eq!(db.len(), 0);
+//! let mut db = Emdb::open_in_memory();
+//! db.insert("name", "emdb")?;
+//! assert_eq!(db.get("name")?, Some(b"emdb".to_vec()));
+//! # Ok::<(), emdb::Error>(())
+//! ```
+//!
+//! TTL usage:
+//!
+//! ```rust
+//! # #[cfg(feature = "ttl")]
+//! # {
+//! use std::time::Duration;
+//!
+//! use emdb::{Emdb, Ttl};
+//!
+//! let mut db = Emdb::builder().default_ttl(Duration::from_secs(60)).build();
+//! db.insert_with_ttl("session", "token", Ttl::Default)?;
+//! assert!(db.ttl("session")?.is_some());
+//! # }
+//! # Ok::<(), emdb::Error>(())
+//! ```
+//!
+//! Nested usage:
+//!
+//! ```rust
+//! # #[cfg(feature = "nested")]
+//! # {
+//! use emdb::Emdb;
+//!
+//! let mut db = Emdb::open_in_memory();
+//! let mut profile = db.focus("profile");
+//! profile.set("name", "james")?;
+//! assert_eq!(profile.get("name")?, Some(b"james".to_vec()));
+//! # }
+//! # Ok::<(), emdb::Error>(())
 //! ```
 
 #![deny(warnings)]
@@ -36,58 +74,16 @@
 #![deny(clippy::unreachable)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+mod builder;
+mod db;
 mod error;
+#[cfg(feature = "nested")]
+mod nested;
+mod ttl;
 
+pub use builder::EmdbBuilder;
+pub use db::Emdb;
 pub use error::{Error, Result};
-
-/// The primary embedded database handle.
-///
-/// This type is the entry point for interacting with an `emdb` instance.
-/// The current implementation is a stub — the stable API has not yet
-/// landed. See the crate root documentation for status.
-#[derive(Debug, Default)]
-pub struct Emdb {
-    len: usize,
-}
-
-impl Emdb {
-    /// Open a new in-memory database.
-    ///
-    /// In-memory databases are volatile — all data is lost when the
-    /// instance is dropped. Use this mode for tests, ephemeral caches,
-    /// or scratch storage.
-    #[must_use]
-    pub const fn open_in_memory() -> Self {
-        Self { len: 0 }
-    }
-
-    /// Return the number of records currently stored in the database.
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Return `true` if the database contains no records.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_open_in_memory_returns_empty() {
-        let db = Emdb::open_in_memory();
-        assert_eq!(db.len(), 0);
-        assert!(db.is_empty());
-    }
-
-    #[test]
-    fn test_default_is_empty() {
-        let db = Emdb::default();
-        assert!(db.is_empty());
-    }
-}
+#[cfg(feature = "nested")]
+pub use nested::Focus;
+pub use ttl::Ttl;

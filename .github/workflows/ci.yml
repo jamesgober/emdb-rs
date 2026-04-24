@@ -13,6 +13,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        features:
+          - ""
+          - "ttl"
+          - "nested"
+          - "ttl nested"
 
     steps:
       - uses: actions/checkout@v4
@@ -21,10 +26,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: cargo build --all-features --verbose
+        run: cargo build --no-default-features --features "${{ matrix.features }}" --verbose
 
       - name: Test
-        run: cargo test --all-features --verbose
+        run: cargo test --no-default-features --features "${{ matrix.features }}" --verbose
 
   lint:
     runs-on: ubuntu-latest
