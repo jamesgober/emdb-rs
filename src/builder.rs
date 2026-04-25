@@ -18,6 +18,8 @@ pub struct EmdbBuilder {
     pub(crate) default_ttl: Option<Duration>,
     pub(crate) path: Option<PathBuf>,
     pub(crate) flush_policy: FlushPolicy,
+    #[cfg(feature = "mmap")]
+    pub(crate) use_mmap: bool,
 }
 
 impl EmdbBuilder {
@@ -46,6 +48,14 @@ impl EmdbBuilder {
     #[must_use]
     pub fn flush_policy(mut self, policy: FlushPolicy) -> Self {
         self.flush_policy = policy;
+        self
+    }
+
+    /// Enable or disable mmap-backed reads for persistent databases.
+    #[cfg(feature = "mmap")]
+    #[must_use]
+    pub fn use_mmap(mut self, on: bool) -> Self {
+        self.use_mmap = on;
         self
     }
 

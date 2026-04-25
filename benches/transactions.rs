@@ -10,6 +10,16 @@ fn tmp_path(name: &str) -> std::path::PathBuf {
     p
 }
 
+fn kv_dataset(count: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+    (0..count)
+        .map(|i| {
+            let key = format!("k{i}").into_bytes();
+            let value = format!("v{i}").into_bytes();
+            (key, value)
+        })
+        .collect()
+}
+
 fn bench_outside_transaction(c: &mut Criterion) {
     c.bench_function("single_insert_outside_transaction", |b| {
         b.iter(|| {
@@ -57,6 +67,7 @@ fn bench_inside_transaction(c: &mut Criterion) {
 
 fn bench_batch_sizes(c: &mut Criterion) {
     for size in [1_u32, 10, 100, 1000] {
+        let data = kv_dataset(size);
         c.bench_function(&format!("batch_commit_size_{size}"), |b| {
             b.iter(|| {
                 let path = tmp_path(&format!("batch-{size}"));
@@ -68,8 +79,8 @@ fn bench_batch_sizes(c: &mut Criterion) {
                 };
 
                 let tx_result = db.transaction(|tx| {
-                    for i in 0_u32..size {
-                        tx.insert(format!("k{i}"), format!("v{i}"))?;
+                    for (key, value) in &data {
+                        tx.insert(key.as_slice(), value.as_slice())?;
                     }
                     Ok(())
                 });

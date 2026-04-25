@@ -16,7 +16,12 @@ fn tmp_path(name: &str) -> std::path::PathBuf {
 fn read_header_last_tx_id(path: &std::path::Path) -> Result<u64> {
     let bytes = std::fs::read(path)?;
     let mut arr = [0_u8; 8];
-    arr.copy_from_slice(&bytes[32..40]);
+    let offset = if bytes.get(0..8) == Some(b"EMDBPAGE") {
+        28
+    } else {
+        32
+    };
+    arr.copy_from_slice(&bytes[offset..offset + 8]);
     Ok(u64::from_le_bytes(arr))
 }
 

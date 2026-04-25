@@ -128,6 +128,7 @@
 mod builder;
 mod db;
 mod error;
+mod index;
 mod lockfile;
 #[cfg(feature = "nested")]
 mod nested;

@@ -1,12 +1,24 @@
 // Copyright 2026 James Gober. Licensed under Apache-2.0.
 
 //! Transaction support for atomic batch writes.
+//!
+//! A transaction stages writes in a closure-local overlay. Reads inside the
+//! transaction see the overlay first and fall back to the live database state.
+//! Writes are not visible to other handles until commit runs (commit happens
+//! automatically when the closure passed to [`Emdb::transaction`] returns
+//! `Ok(_)`); commit appends a `BatchBegin … BatchEnd` block to the WAL, then
+//! applies the overlay to the in-memory index under per-shard write locks.
+//!
+//! This deliberately gives up snapshot isolation in exchange for letting other
+//! readers and writers proceed while a transaction is open. Atomicity (all of
+//! a transaction's writes survive a crash, or none do) is preserved by the WAL
+//! batch markers and by acquiring every shard write lock before applying the
+//! overlay.
 
 use std::collections::BTreeMap;
-use std::sync::RwLockWriteGuard;
 
-use crate::db::{Emdb, State};
-use crate::storage::Op;
+use crate::db::Emdb;
+use crate::storage::{Op, OpRef, Storage};
 #[cfg(feature = "ttl")]
 use crate::ttl::{expires_from_ttl, is_expired, now_unix_millis, record_expires_at, Ttl};
 use crate::ttl::{record_new, record_value, Record};
@@ -14,11 +26,12 @@ use crate::{Error, Result};
 
 /// A closure-scoped transaction over an [`Emdb`] instance.
 ///
-/// Instances are created by [`Emdb::transaction`]. The transaction holds the
-/// database write lock for its lifetime.
+/// Instances are created by [`Emdb::transaction`]. The transaction does not
+/// hold any database lock for its lifetime; it only acquires locks at commit
+/// time, which happens automatically when the closure passed to
+/// [`Emdb::transaction`] returns `Ok(_)`.
 pub struct Transaction<'db> {
     db: &'db Emdb,
-    state: RwLockWriteGuard<'db, State>,
     pending: Vec<Op>,
     overlay: BTreeMap<Vec<u8>, Option<Record>>,
 }
@@ -28,11 +41,12 @@ impl<'db> Transaction<'db> {
     ///
     /// # Errors
     ///
-    /// Returns an error when lock acquisition fails.
+    /// Returns an error only when the embedding harness later wishes to
+    /// validate transaction state at construction; no errors are produced
+    /// today, but the signature is reserved.
     pub(crate) fn new(db: &'db Emdb) -> Result<Self> {
         Ok(Self {
             db,
-            state: db.state_write()?,
             pending: Vec::new(),
             overlay: BTreeMap::new(),
         })
@@ -71,33 +85,32 @@ impl<'db> Transaction<'db> {
     ///
     /// # Errors
     ///
-    /// Returns an error when record conversion fails.
+    /// Returns an error when shard lock acquisition fails.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
-        if let Some(entry) = self.overlay.get(key.as_ref()) {
+        let key = key.as_ref();
+        if let Some(entry) = self.overlay.get(key) {
             return self.visible_record(entry.as_ref());
         }
 
-        let Some(record) = self.state.storage.get(key.as_ref()) else {
+        let shard = self.db.shard_for(key)?;
+        let Some(record) = shard.get(key) else {
             return Ok(None);
         };
 
-        self.visible_record(Some(record))
+        // Clone out from under the lock to release the shard before returning.
+        let cloned = record.clone();
+        drop(shard);
+        self.visible_record(Some(&cloned))
     }
 
     /// Remove a key in this transaction and return previous visible value.
     ///
     /// # Errors
     ///
-    /// Returns an error when visible value extraction fails.
+    /// Returns an error when shard lock acquisition fails.
     pub fn remove(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let key_vec = key.as_ref().to_vec();
-        let previous = if let Some(entry) = self.overlay.get(key.as_ref()) {
-            self.visible_record(entry.as_ref())?
-        } else {
-            let base = self.state.storage.get(key.as_ref());
-            self.visible_record(base)?
-        };
-
+        let previous = self.get(key.as_ref())?;
         let _old = self.overlay.insert(key_vec.clone(), None);
         self.pending.push(Op::Remove { key: key_vec });
         Ok(previous)
@@ -113,6 +126,10 @@ impl<'db> Transaction<'db> {
     }
 
     /// Insert or replace with explicit TTL behavior in this transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when TTL computation overflows.
     #[cfg(feature = "ttl")]
     pub fn insert_with_ttl(
         &mut self,
@@ -139,45 +156,63 @@ impl<'db> Transaction<'db> {
 
     /// Commit this transaction.
     ///
+    /// Atomicity rules:
+    ///
+    /// - A persistent database appends `BatchBegin`, every staged op, and
+    ///   `BatchEnd` to the WAL before any in-memory mutation. A crash between
+    ///   `BatchBegin` and `BatchEnd` discards the entire batch on recovery.
+    /// - Both persistent and in-memory databases write every staged change
+    ///   under per-shard write locks acquired across all shards, so concurrent
+    ///   readers either see the full pre-commit state or the full post-commit
+    ///   state — never a partial view.
+    ///
     /// # Errors
     ///
-    /// Returns an error if batch write or transaction metadata persistence fails.
+    /// Returns an error if WAL append, lock acquisition, or transaction id
+    /// allocation fails.
     pub(crate) fn commit(&mut self) -> Result<()> {
-        let tx_id = self
-            .state
-            .last_tx_id
-            .checked_add(1)
-            .ok_or(Error::TransactionAborted("transaction id overflow"))?;
+        let writes = std::mem::take(&mut self.pending);
+        let updates = std::mem::take(&mut self.overlay);
 
-        let op_count = u32::try_from(self.pending.len())
+        if writes.is_empty() && updates.is_empty() {
+            return Ok(());
+        }
+
+        let op_count = u32::try_from(writes.len())
             .map_err(|_overflow| Error::TransactionAborted("operation count overflow"))?;
+        let tx_id = self.db.next_tx_id()?;
 
-        {
-            let mut backend = self.db.lock_backend()?;
-            backend.append(&Op::BatchBegin { tx_id, op_count })?;
-
-            let writes = std::mem::take(&mut self.pending);
-            for op in writes {
-                backend.append(&op)?;
+        let mut backend_guard = self.db.lock_backend()?;
+        if let Some(backend) = backend_guard.as_mut() {
+            backend.append(OpRef::BatchBegin { tx_id, op_count })?;
+            for op in &writes {
+                backend.append(OpRef::from(op))?;
             }
-
-            backend.append(&Op::BatchEnd { tx_id })?;
+            backend.append(OpRef::BatchEnd { tx_id })?;
             backend.set_last_tx_id(tx_id)?;
         }
 
-        let updates = std::mem::take(&mut self.overlay);
+        // Acquire every shard's write lock so the overlay applies atomically
+        // relative to readers and concurrent single-key writers.
+        let mut shards = self.db.index().write_all()?;
         for (key, maybe_record) in updates {
+            let shard_idx = crate::index::Index::shard_for_key(&key);
+            let shard = match shards.get_mut(shard_idx) {
+                Some(shard) => shard,
+                None => return Err(Error::TransactionAborted("shard index out of range")),
+            };
             match maybe_record {
                 Some(record) => {
-                    let _old = self.state.storage.insert(key, record);
+                    let _old = shard.insert(key, record);
                 }
                 None => {
-                    let _old = self.state.storage.remove(&key);
+                    let _old = shard.remove(&key);
                 }
             }
         }
+        drop(shards);
+        drop(backend_guard);
 
-        self.state.last_tx_id = tx_id;
         Ok(())
     }
 

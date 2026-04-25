@@ -19,10 +19,11 @@
 
 ## Status
 
-**Phase 4.** This crate now provides closure-based transactions with
-atomic batch writes, internal Send+Sync synchronization, and file lock
-exclusion on top of file-backed persistence and crash recovery.
-The API is still pre-1.0 and may change before 1.0.
+**v0.6.** Page-oriented storage format (4 KB pages, B-tree index, free-list,
+WAL sidecar), automatic migration from v1/v2 log formats, optional
+memory-mapped reads, closure-based transactions with atomic batch writes,
+and a sharded in-memory primary index for fully parallel reads. The API
+is still pre-1.0 and may change before 1.0.
 
 Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
 
@@ -30,7 +31,7 @@ Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
 
 ```toml
 [dependencies]
-emdb = "0.5"
+emdb = "0.6"
 ```
 
 ## Quick Start
@@ -133,8 +134,10 @@ replay. If a crash occurs after `BatchEnd`, the entire batch is applied.
 
 ## Concurrency
 
-`Emdb` is `Send + Sync` and cheap to clone. Internally it uses a
-reader/writer lock for state and a mutex for serialized storage appends.
+`Emdb` is `Send + Sync` and cheap to clone. Internally it uses a 32-shard
+lock-striped primary index so reads on different keys never block each other,
+plus a serialized backend mutex for the WAL and page file. In-memory
+databases bypass the backend mutex entirely.
 
 ```rust
 use std::sync::Arc;
@@ -204,6 +207,41 @@ assert_eq!(db.group("product")?.count(), 2);
 - **Safe** — strict `clippy` profile, no `unwrap` in library code, all `unsafe` documented.
 - **Small footprint** — minimal dependency graph, fast compile times.
 - **Portable** — Linux, macOS, Windows (x86_64 and ARM64).
+
+## Benchmarking
+
+emdb ships with Criterion benchmarks, including an optional comparative suite.
+
+- Core benches: [benches/kv.rs](benches/kv.rs), [benches/persistence.rs](benches/persistence.rs), [benches/transactions.rs](benches/transactions.rs), [benches/concurrency.rs](benches/concurrency.rs)
+- Comparative bench: [benches/comparative.rs](benches/comparative.rs)
+
+Quick start:
+
+```powershell
+cargo bench --bench comparative
+```
+
+Compare with embedded DBs (sled + redb):
+
+```powershell
+cargo bench --bench comparative --features bench-compare
+```
+
+Compare with RocksDB (optional):
+
+```powershell
+cargo bench --bench comparative --features bench-rocksdb
+```
+
+Compare with Redis (optional):
+
+```powershell
+$env:EMDB_REDIS_URL = "redis://127.0.0.1/"
+cargo bench --bench comparative --features bench-redis
+```
+
+For full benchmark workflow, tuning, and reporting format, see [docs/BENCH.md](docs/BENCH.md).
+The latest recorded baseline metrics are also tracked there.
 
 ## Non-Goals
 

@@ -4,11 +4,21 @@
 
 use crate::Result;
 
+#[allow(dead_code)]
 pub(crate) mod codec;
+#[allow(dead_code)]
 pub(crate) mod file;
-pub(crate) mod memory;
+#[allow(dead_code)]
+pub(crate) mod migrate;
+#[allow(dead_code)]
+pub(crate) mod page;
+#[allow(dead_code)]
+pub(crate) mod page_store;
+#[allow(dead_code)]
+pub(crate) mod wal;
 
-/// Current on-disk emdb format version.
+/// Current on-disk emdb log-format version retained for migration support.
+#[allow(dead_code)]
 pub(crate) const FORMAT_VERSION: u32 = 2;
 
 /// Header feature bit for `ttl` support.
@@ -44,7 +54,10 @@ const fn nested_flag() -> u32 {
     0
 }
 
-/// A single operation persisted to storage.
+/// An owned operation, produced by replay and staged inside transactions.
+///
+/// Hot-path appenders should use [`OpRef`] instead so they do not allocate
+/// just to hand bytes to the storage layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Op {
     /// Insert or replace a key/value pair.
@@ -82,6 +95,76 @@ pub(crate) enum Op {
     },
 }
 
+/// A borrowed view of an [`Op`], suitable for the write hot path.
+///
+/// `OpRef` does not own its key/value bytes. Constructing one is allocation-free,
+/// which is the point — the storage append path is hit once per `insert`/`remove`
+/// and any allocation here multiplies by every write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpRef<'a> {
+    /// Insert or replace a key/value pair.
+    Insert {
+        /// Key bytes.
+        key: &'a [u8],
+        /// Value bytes.
+        value: &'a [u8],
+        /// Unix-millis expiration timestamp, if any.
+        expires_at: Option<u64>,
+    },
+    /// Remove a key.
+    Remove {
+        /// Key bytes.
+        key: &'a [u8],
+    },
+    /// Remove all keys.
+    Clear,
+    /// Logical checkpoint marker used for replay sanity.
+    Checkpoint {
+        /// Number of live records represented at checkpoint time.
+        record_count: u32,
+    },
+    /// Begin a transactional batch.
+    BatchBegin {
+        /// Monotonic transaction id.
+        tx_id: u64,
+        /// Number of operations expected before `BatchEnd`.
+        op_count: u32,
+    },
+    /// End a transactional batch.
+    BatchEnd {
+        /// Monotonic transaction id.
+        tx_id: u64,
+    },
+}
+
+impl<'a> From<&'a Op> for OpRef<'a> {
+    fn from(op: &'a Op) -> Self {
+        match op {
+            Op::Insert {
+                key,
+                value,
+                expires_at,
+            } => OpRef::Insert {
+                key: key.as_slice(),
+                value: value.as_slice(),
+                expires_at: *expires_at,
+            },
+            Op::Remove { key } => OpRef::Remove {
+                key: key.as_slice(),
+            },
+            Op::Clear => OpRef::Clear,
+            Op::Checkpoint { record_count } => OpRef::Checkpoint {
+                record_count: *record_count,
+            },
+            Op::BatchBegin { tx_id, op_count } => OpRef::BatchBegin {
+                tx_id: *tx_id,
+                op_count: *op_count,
+            },
+            Op::BatchEnd { tx_id } => OpRef::BatchEnd { tx_id: *tx_id },
+        }
+    }
+}
+
 /// Flush durability policy for file-backed storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -116,8 +199,11 @@ pub(crate) type SnapshotIter<'a> = Box<dyn Iterator<Item = SnapshotEntry<'a>> + 
 
 /// Persistence backend abstraction.
 pub(crate) trait Storage: Send {
-    /// Append an operation to durable storage.
-    fn append(&mut self, op: &Op) -> Result<()>;
+    /// Append a borrowed operation to durable storage.
+    ///
+    /// The borrowed form means the caller does not allocate to construct the
+    /// op — the bytes are written straight from the caller's existing buffers.
+    fn append(&mut self, op: OpRef<'_>) -> Result<()>;
 
     /// Flush pending writes.
     fn flush(&mut self) -> Result<()>;

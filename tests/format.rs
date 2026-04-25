@@ -52,6 +52,8 @@ fn feature_mismatch_is_reported() -> Result<()> {
 
     let mut bytes = std::fs::read(&path)?;
     bytes[12..16].copy_from_slice(&(1_u32 << 31).to_le_bytes());
+    let crc = crc32fast::hash(&bytes[0..100]);
+    bytes[100..104].copy_from_slice(&crc.to_le_bytes());
     std::fs::write(&path, bytes)?;
 
     let opened = Emdb::open(&path);

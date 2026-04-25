@@ -1,6 +1,6 @@
 [package]
 name = "emdb"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -39,6 +39,18 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 crc32fast = "1.4"
 fs4 = "0.8"
+redb = { version = "2.1", optional = true }
+redis = { version = "0.27", optional = true }
+sled = { version = "0.34", optional = true }
+rocksdb = { version = "0.22", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# Optional mmap-backed reads for the v0.6 page pager.
+memmap2 = { version = "0.9", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Optional mmap-backed reads for the v0.6 page pager.
+memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }
@@ -47,6 +59,10 @@ criterion = { version = "0.5", default-features = false }
 default = ["ttl"]
 ttl = []
 nested = []
+mmap = ["dep:memmap2"]
+bench-compare = ["dep:redb", "dep:sled"]
+bench-redis = ["dep:redis"]
+bench-rocksdb = ["dep:rocksdb"]
 
 [profile.release]
 opt-level = 3
@@ -59,3 +75,23 @@ strip = "symbols"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+[[bench]]
+name = "kv"
+harness = false
+
+[[bench]]
+name = "persistence"
+harness = false
+
+[[bench]]
+name = "transactions"
+harness = false
+
+[[bench]]
+name = "concurrency"
+harness = false
+
+[[bench]]
+name = "comparative"
+harness = false

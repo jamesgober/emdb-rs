@@ -69,15 +69,13 @@ fn append_insert(path: &std::path::Path, key: &[u8], value: &[u8]) -> Result<()>
 fn read_header_last_tx_id(path: &std::path::Path) -> Result<u64> {
     let bytes = std::fs::read(path)?;
     let mut arr = [0_u8; 8];
-    arr.copy_from_slice(&bytes[32..40]);
+    let offset = if bytes.get(0..8) == Some(b"EMDBPAGE") {
+        28
+    } else {
+        32
+    };
+    arr.copy_from_slice(&bytes[offset..offset + 8]);
     Ok(u64::from_le_bytes(arr))
-}
-
-fn set_header_version(path: &std::path::Path, version: u32) -> Result<()> {
-    let mut bytes = std::fs::read(path)?;
-    bytes[8..12].copy_from_slice(&version.to_le_bytes());
-    std::fs::write(path, bytes)?;
-    Ok(())
 }
 
 #[test]
@@ -265,21 +263,14 @@ fn tx_id_persists_across_reopens() -> Result<()> {
 fn v1_header_files_remain_readable_with_v2_batch_records() -> Result<()> {
     let path = tmp_path("mixed-v1-v2");
 
-    {
-        let db = Emdb::open(&path)?;
-        db.insert("base", "value")?;
-        db.flush()?;
-    }
-
-    set_header_version(path.as_path(), 1)?;
-
-    {
-        let db = Emdb::open(&path)?;
-        db.transaction(|tx| {
-            tx.insert("tx", "value")?;
-            Ok(())
-        })?;
-    }
+    let mut header = [0_u8; HEADER_LEN];
+    header[0..8].copy_from_slice(b"EMDB\0\0\0\0");
+    header[8..12].copy_from_slice(&1_u32.to_le_bytes());
+    std::fs::write(&path, header)?;
+    append_insert(path.as_path(), b"base", b"value")?;
+    append_batch_begin(path.as_path(), 1, 1)?;
+    append_insert(path.as_path(), b"tx", b"value")?;
+    append_batch_end(path.as_path(), 1)?;
 
     let db = Emdb::open(&path)?;
     assert_eq!(db.get("base")?, Some(b"value".to_vec()));

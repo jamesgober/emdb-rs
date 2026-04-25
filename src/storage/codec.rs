@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 
 use crc32fast::Hasher;
 
-use crate::storage::Op;
+use crate::storage::{Op, OpRef};
 use crate::{Error, Result};
 
 pub(crate) const HEADER_LEN: usize = 64;
@@ -72,27 +72,34 @@ pub(crate) fn read_header(r: &mut impl Read) -> Result<Header> {
     })
 }
 
-/// Encode one operation record (including length prefix and CRC) into `buf`.
-pub(crate) fn encode_op(buf: &mut Vec<u8>, op: &Op) {
-    let mut payload = Vec::new();
-    let op_type = op_type(op);
-    payload.push(op_type);
-    payload.extend_from_slice(&now_unix_millis().to_le_bytes());
+/// Encode one operation record (length prefix, payload, CRC) into `buf`.
+///
+/// The payload is written directly into `buf` with no intermediate allocation:
+/// the length prefix is reserved as four placeholder bytes, the payload is
+/// appended in place, the length is patched in, the CRC is computed over the
+/// payload slice already in `buf`, then appended.
+pub(crate) fn encode_op(buf: &mut Vec<u8>, op: OpRef<'_>) {
+    let len_at = buf.len();
+    buf.extend_from_slice(&[0_u8; 4]);
+    let payload_start = buf.len();
+
+    buf.push(op_type_ref(op));
+    buf.extend_from_slice(&now_unix_millis().to_le_bytes());
 
     match op {
-        Op::Insert {
+        OpRef::Insert {
             key,
             value,
             expires_at,
         } => {
-            payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            payload.extend_from_slice(key);
-            payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            payload.extend_from_slice(value);
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buf.extend_from_slice(value);
 
             #[cfg(feature = "ttl")]
             {
-                payload.extend_from_slice(&expires_at.unwrap_or(0).to_le_bytes());
+                buf.extend_from_slice(&expires_at.unwrap_or(0).to_le_bytes());
             }
 
             #[cfg(not(feature = "ttl"))]
@@ -100,30 +107,30 @@ pub(crate) fn encode_op(buf: &mut Vec<u8>, op: &Op) {
                 let _ = expires_at;
             }
         }
-        Op::Remove { key } => {
-            payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            payload.extend_from_slice(key);
+        OpRef::Remove { key } => {
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key);
         }
-        Op::Clear => {}
-        Op::Checkpoint { record_count } => {
-            payload.extend_from_slice(&record_count.to_le_bytes());
+        OpRef::Clear => {}
+        OpRef::Checkpoint { record_count } => {
+            buf.extend_from_slice(&record_count.to_le_bytes());
         }
-        Op::BatchBegin { tx_id, op_count } => {
-            payload.extend_from_slice(&tx_id.to_le_bytes());
-            payload.extend_from_slice(&op_count.to_le_bytes());
+        OpRef::BatchBegin { tx_id, op_count } => {
+            buf.extend_from_slice(&tx_id.to_le_bytes());
+            buf.extend_from_slice(&op_count.to_le_bytes());
         }
-        Op::BatchEnd { tx_id } => {
-            payload.extend_from_slice(&tx_id.to_le_bytes());
+        OpRef::BatchEnd { tx_id } => {
+            buf.extend_from_slice(&tx_id.to_le_bytes());
         }
     }
 
-    let rec_len = payload.len() as u32;
-    let mut hasher = Hasher::new();
-    hasher.update(&payload);
-    let crc = hasher.finalize();
+    let payload_end = buf.len();
+    let rec_len = (payload_end - payload_start) as u32;
+    buf[len_at..len_at + 4].copy_from_slice(&rec_len.to_le_bytes());
 
-    buf.extend_from_slice(&rec_len.to_le_bytes());
-    buf.extend_from_slice(&payload);
+    let mut hasher = Hasher::new();
+    hasher.update(&buf[payload_start..payload_end]);
+    let crc = hasher.finalize();
     buf.extend_from_slice(&crc.to_le_bytes());
 }
 
@@ -241,14 +248,14 @@ pub(crate) fn decode_op(buf: &[u8]) -> Result<(Op, usize)> {
     Ok((op, total_len))
 }
 
-fn op_type(op: &Op) -> u8 {
+fn op_type_ref(op: OpRef<'_>) -> u8 {
     match op {
-        Op::Insert { .. } => OP_INSERT,
-        Op::Remove { .. } => OP_REMOVE,
-        Op::Clear => OP_CLEAR,
-        Op::Checkpoint { .. } => OP_CHECKPOINT,
-        Op::BatchBegin { .. } => OP_BATCH_BEGIN,
-        Op::BatchEnd { .. } => OP_BATCH_END,
+        OpRef::Insert { .. } => OP_INSERT,
+        OpRef::Remove { .. } => OP_REMOVE,
+        OpRef::Clear => OP_CLEAR,
+        OpRef::Checkpoint { .. } => OP_CHECKPOINT,
+        OpRef::BatchBegin { .. } => OP_BATCH_BEGIN,
+        OpRef::BatchEnd { .. } => OP_BATCH_END,
     }
 }
 
@@ -304,7 +311,7 @@ fn now_unix_millis() -> u64 {
 mod tests {
     use super::{decode_op, read_header, write_header, HEADER_LEN};
     use crate::storage::codec::encode_op;
-    use crate::storage::{Op, FORMAT_VERSION};
+    use crate::storage::{Op, OpRef, FORMAT_VERSION};
 
     #[test]
     fn round_trip_header() {
@@ -349,7 +356,7 @@ mod tests {
 
         for op in ops {
             let mut buf = Vec::new();
-            encode_op(&mut buf, &op);
+            encode_op(&mut buf, OpRef::from(&op));
             let decoded = decode_op(&buf);
             assert!(decoded.is_ok());
             let (decoded_op, consumed) = match decoded {
@@ -375,9 +382,9 @@ mod tests {
         let mut buf = Vec::new();
         encode_op(
             &mut buf,
-            &Op::Insert {
-                key: b"a".to_vec(),
-                value: b"b".to_vec(),
+            OpRef::Insert {
+                key: b"a",
+                value: b"b",
                 expires_at: None,
             },
         );
@@ -392,7 +399,7 @@ mod tests {
     #[test]
     fn decode_rejects_length_overrun() {
         let mut buf = Vec::new();
-        encode_op(&mut buf, &Op::Clear);
+        encode_op(&mut buf, OpRef::Clear);
         buf[0..4].copy_from_slice(&(u32::MAX).to_le_bytes());
 
         let decoded = decode_op(&buf);
@@ -402,7 +409,7 @@ mod tests {
     #[test]
     fn decode_rejects_trailing_payload_bytes() {
         let mut buf = Vec::new();
-        encode_op(&mut buf, &Op::Clear);
+        encode_op(&mut buf, OpRef::Clear);
 
         // Increase rec_len by one and patch CRC to keep crc check valid.
         let original_rec_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;

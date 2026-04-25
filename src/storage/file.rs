@@ -7,7 +7,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::storage::codec::{decode_op, encode_op, read_header, write_header, HEADER_LEN};
-use crate::storage::{build_flags, FlushPolicy, Op, SnapshotIter, Storage, FORMAT_VERSION};
+use crate::storage::{build_flags, FlushPolicy, Op, OpRef, SnapshotIter, Storage, FORMAT_VERSION};
 use crate::{Error, Result};
 
 const FORMAT_VERSION_V1: u32 = 1;
@@ -215,7 +215,7 @@ impl FileStorage {
 }
 
 impl Storage for FileStorage {
-    fn append(&mut self, op: &Op) -> Result<()> {
+    fn append(&mut self, op: OpRef<'_>) -> Result<()> {
         let mut bytes = Vec::new();
         encode_op(&mut bytes, op);
         self.file.write_all(&bytes)?;
@@ -252,14 +252,15 @@ impl Storage for FileStorage {
 
         write_header(&mut tmp, FORMAT_VERSION, self.flags, self.last_tx_id)?;
 
+        let mut record = Vec::new();
         let mut count = 0_u32;
         for entry in snapshot {
-            let mut record = Vec::new();
+            record.clear();
             encode_op(
                 &mut record,
-                &Op::Insert {
-                    key: entry.key.to_vec(),
-                    value: entry.value.to_vec(),
+                OpRef::Insert {
+                    key: entry.key,
+                    value: entry.value,
                     expires_at: entry.expires_at,
                 },
             );
@@ -267,14 +268,14 @@ impl Storage for FileStorage {
             count = count.saturating_add(1);
         }
 
-        let mut checkpoint = Vec::new();
+        record.clear();
         encode_op(
-            &mut checkpoint,
-            &Op::Checkpoint {
+            &mut record,
+            OpRef::Checkpoint {
                 record_count: count,
             },
         );
-        tmp.write_all(&checkpoint)?;
+        tmp.write_all(&record)?;
         tmp.flush()?;
         tmp.sync_data()?;
         drop(tmp);
@@ -295,7 +296,7 @@ impl Storage for FileStorage {
 #[cfg(test)]
 mod tests {
     use crate::storage::file::FileStorage;
-    use crate::storage::{FlushPolicy, Op, Storage};
+    use crate::storage::{FlushPolicy, Op, OpRef, Storage};
 
     fn test_path(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -317,13 +318,13 @@ mod tests {
         };
 
         assert!(storage
-            .append(&Op::Insert {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
+            .append(OpRef::Insert {
+                key: b"k",
+                value: b"v",
                 expires_at: None,
             })
             .is_ok());
-        assert!(storage.append(&Op::Remove { key: b"k".to_vec() }).is_ok());
+        assert!(storage.append(OpRef::Remove { key: b"k" }).is_ok());
         drop(storage);
 
         let reopen = FileStorage::new(&path, FlushPolicy::Manual, 0);
@@ -372,19 +373,19 @@ mod tests {
         };
 
         assert!(storage
-            .append(&Op::BatchBegin {
+            .append(OpRef::BatchBegin {
                 tx_id: 7,
                 op_count: 1,
             })
             .is_ok());
         assert!(storage
-            .append(&Op::Insert {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
+            .append(OpRef::Insert {
+                key: b"k",
+                value: b"v",
                 expires_at: None,
             })
             .is_ok());
-        assert!(storage.append(&Op::BatchEnd { tx_id: 7 }).is_ok());
+        assert!(storage.append(OpRef::BatchEnd { tx_id: 7 }).is_ok());
         assert!(storage.set_last_tx_id(7).is_ok());
         drop(storage);
 
@@ -405,15 +406,15 @@ mod tests {
         };
 
         assert!(storage
-            .append(&Op::BatchBegin {
+            .append(OpRef::BatchBegin {
                 tx_id: 8,
                 op_count: 1,
             })
             .is_ok());
         assert!(storage
-            .append(&Op::Insert {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
+            .append(OpRef::Insert {
+                key: b"k",
+                value: b"v",
                 expires_at: None,
             })
             .is_ok());
@@ -435,19 +436,19 @@ mod tests {
         };
 
         assert!(storage
-            .append(&Op::BatchBegin {
+            .append(OpRef::BatchBegin {
                 tx_id: 9,
                 op_count: 2,
             })
             .is_ok());
         assert!(storage
-            .append(&Op::Insert {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
+            .append(OpRef::Insert {
+                key: b"k",
+                value: b"v",
                 expires_at: None,
             })
             .is_ok());
-        assert!(storage.append(&Op::BatchEnd { tx_id: 9 }).is_ok());
+        assert!(storage.append(OpRef::BatchEnd { tx_id: 9 }).is_ok());
         drop(storage);
 
         let seen = replay_ops(path.as_path());
@@ -466,19 +467,19 @@ mod tests {
         };
 
         assert!(storage
-            .append(&Op::BatchBegin {
+            .append(OpRef::BatchBegin {
                 tx_id: 10,
                 op_count: 1,
             })
             .is_ok());
         assert!(storage
-            .append(&Op::Insert {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
+            .append(OpRef::Insert {
+                key: b"k",
+                value: b"v",
                 expires_at: None,
             })
             .is_ok());
-        assert!(storage.append(&Op::BatchEnd { tx_id: 11 }).is_ok());
+        assert!(storage.append(OpRef::BatchEnd { tx_id: 11 }).is_ok());
         drop(storage);
 
         let seen = replay_ops(path.as_path());
@@ -497,13 +498,13 @@ mod tests {
         };
 
         assert!(storage
-            .append(&Op::BatchBegin {
+            .append(OpRef::BatchBegin {
                 tx_id: 12,
                 op_count: 1,
             })
             .is_ok());
         assert!(storage
-            .append(&Op::BatchBegin {
+            .append(OpRef::BatchBegin {
                 tx_id: 13,
                 op_count: 1,
             })
@@ -526,15 +527,15 @@ mod tests {
         };
 
         assert!(storage
-            .append(&Op::BatchBegin {
+            .append(OpRef::BatchBegin {
                 tx_id: 14,
                 op_count: 1,
             })
             .is_ok());
         assert!(storage
-            .append(&Op::Insert {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
+            .append(OpRef::Insert {
+                key: b"k",
+                value: b"v",
                 expires_at: None,
             })
             .is_ok());

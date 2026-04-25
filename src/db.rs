@@ -2,19 +2,20 @@
 
 //! Core database implementation.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[cfg(feature = "ttl")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::builder::EmdbBuilder;
+use crate::index::{Index, Shard};
 use crate::lockfile::LockFile;
-use crate::storage::file::FileStorage;
-use crate::storage::memory::MemoryStorage;
-use crate::storage::{build_flags, Op, SnapshotEntry, SnapshotIter, Storage};
-use crate::transaction::Transaction;
+use crate::storage::migrate::migrate_if_needed;
+use crate::storage::page_store::PageStorage;
+use crate::storage::{build_flags, Op, OpRef, SnapshotEntry, SnapshotIter, Storage};
 #[cfg(feature = "ttl")]
 use crate::ttl::{
     expires_from_ttl, is_expired, now_unix_millis, record_expires_at, record_set_persist,
@@ -33,8 +34,18 @@ pub struct Emdb {
 
 /// Shared inner state behind [`Emdb`].
 pub(crate) struct Inner {
-    pub(crate) state: RwLock<State>,
-    pub(crate) backend: Mutex<Box<dyn Storage>>,
+    /// Sharded primary index. Reads on different shards are fully parallel;
+    /// writes contend only on the target shard plus, for persistent databases,
+    /// the backend mutex.
+    pub(crate) index: Index,
+
+    /// Highest committed transaction id, shared between handles and threads.
+    pub(crate) last_tx_id: AtomicU64,
+
+    /// Persistent storage. `None` means in-memory mode — every write skips
+    /// both the mutex and the WAL append.
+    pub(crate) backend: Option<Mutex<PageStorage>>,
+
     pub(crate) config: Config,
     _lock_file: Option<LockFile>,
 }
@@ -44,12 +55,6 @@ pub(crate) struct Config {
     pub(crate) path: Option<PathBuf>,
     #[cfg(feature = "ttl")]
     pub(crate) default_ttl: Option<Duration>,
-}
-
-/// Mutable in-memory state protected by a read/write lock.
-pub(crate) struct State {
-    pub(crate) storage: BTreeMap<Vec<u8>, Record>,
-    pub(crate) last_tx_id: u64,
 }
 
 impl Clone for Emdb {
@@ -64,11 +69,9 @@ impl Emdb {
     pub fn open_in_memory() -> Self {
         Self {
             inner: Arc::new(Inner {
-                state: RwLock::new(State {
-                    storage: BTreeMap::new(),
-                    last_tx_id: 0,
-                }),
-                backend: Mutex::new(Box::new(MemoryStorage)),
+                index: Index::new(),
+                last_tx_id: AtomicU64::new(0),
+                backend: None,
                 config: Config {
                     path: None,
                     #[cfg(feature = "ttl")]
@@ -113,9 +116,9 @@ impl Emdb {
     /// Returns any error from the closure or commit path.
     pub fn transaction<F, T>(&self, f: F) -> Result<T>
     where
-        F: FnOnce(&mut Transaction<'_>) -> Result<T>,
+        F: FnOnce(&mut crate::transaction::Transaction<'_>) -> Result<T>,
     {
-        let mut tx = Transaction::new(self)?;
+        let mut tx = crate::transaction::Transaction::new(self)?;
         let out = f(&mut tx)?;
         tx.commit()?;
         Ok(out)
@@ -127,40 +130,40 @@ impl Emdb {
             return Err(Error::InvalidConfig("flush policy EveryN requires N > 0"));
         }
 
-        let (backend, lock_file, path, last_tx_id, storage) = if let Some(path) = builder.path {
+        let (backend, lock_file, path, last_tx_id, index) = if let Some(path) = builder.path {
             let lock_file = Some(LockFile::acquire(path.as_path())?);
-            let mut backend = FileStorage::new(path.clone(), builder.flush_policy, build_flags())?;
-            let mut replayed = BTreeMap::new();
+            migrate_if_needed(path.as_path(), build_flags())?;
+            let mut backend = PageStorage::new(
+                path.clone(),
+                builder.flush_policy,
+                build_flags(),
+                #[cfg(feature = "mmap")]
+                builder.use_mmap,
+            )?;
+            let mut staged: HashMap<Vec<u8>, Record> = HashMap::new();
             backend.replay(&mut |op| {
-                apply_replayed_op(&mut replayed, op);
+                apply_replayed_op(&mut staged, op);
                 Ok(())
             })?;
             let last_tx_id = backend.last_tx_id();
+            let index = Index::from_records(staged);
 
             (
-                Box::new(backend) as Box<dyn Storage>,
+                Some(Mutex::new(backend)),
                 lock_file,
                 Some(path),
                 last_tx_id,
-                replayed,
+                index,
             )
         } else {
-            (
-                Box::new(MemoryStorage) as Box<dyn Storage>,
-                None,
-                None,
-                0,
-                BTreeMap::new(),
-            )
+            (None, None, None, 0, Index::new())
         };
 
         let db = Self {
             inner: Arc::new(Inner {
-                state: RwLock::new(State {
-                    storage,
-                    last_tx_id,
-                }),
-                backend: Mutex::new(backend),
+                index,
+                last_tx_id: AtomicU64::new(last_tx_id),
+                backend,
                 config: Config {
                     path,
                     #[cfg(feature = "ttl")]
@@ -193,20 +196,42 @@ impl Emdb {
         {
             let key = key.into();
             let value = value.into();
-
-            {
-                let mut backend = self.lock_backend()?;
-                backend.append(&Op::Insert {
-                    key: key.clone(),
-                    value: value.clone(),
-                    expires_at: None,
-                })?;
-            }
-
-            let mut state = self.state_write()?;
-            let _previous = state.storage.insert(key, record_new(value, None));
-            Ok(())
+            self.write_record(key, value, None)
         }
+    }
+
+    /// Internal write path: append to WAL (if persistent), then update the
+    /// target shard. The backend mutex is held across the shard write so the
+    /// in-memory state never reorders relative to the durability log.
+    pub(crate) fn write_record(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expires_at: Option<u64>,
+    ) -> Result<()> {
+        let shard_idx = Index::shard_for_key(&key);
+
+        match self.inner.backend.as_ref() {
+            Some(backend_mtx) => {
+                let mut backend = backend_mtx
+                    .lock()
+                    .map_err(|_poisoned| Error::LockPoisoned)?;
+                backend.append(OpRef::Insert {
+                    key: &key,
+                    value: &value,
+                    expires_at,
+                })?;
+                let mut shard = self.inner.index.write(shard_idx)?;
+                let _previous = shard.insert(key, record_new(value, expires_at));
+                drop(shard);
+                drop(backend);
+            }
+            None => {
+                let mut shard = self.inner.index.write(shard_idx)?;
+                let _previous = shard.insert(key, record_new(value, expires_at));
+            }
+        }
+        Ok(())
     }
 
     /// Fetch a value by key.
@@ -215,8 +240,10 @@ impl Emdb {
     ///
     /// Returns an error when lock acquisition fails.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
-        let state = self.state_read()?;
-        let Some(record) = state.storage.get(key.as_ref()) else {
+        let key = key.as_ref();
+        let shard_idx = Index::shard_for_key(key);
+        let shard = self.inner.index.read(shard_idx)?;
+        let Some(record) = shard.get(key) else {
             return Ok(None);
         };
 
@@ -237,17 +264,26 @@ impl Emdb {
     ///
     /// Returns an error when persistence append fails or lock acquisition fails.
     pub fn remove(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
-        let key_vec = key.as_ref().to_vec();
+        let key = key.as_ref();
+        let shard_idx = Index::shard_for_key(key);
 
-        {
-            let mut backend = self.lock_backend()?;
-            backend.append(&Op::Remove {
-                key: key_vec.clone(),
-            })?;
-        }
-
-        let mut state = self.state_write()?;
-        let removed = state.storage.remove(key.as_ref());
+        let removed = match self.inner.backend.as_ref() {
+            Some(backend_mtx) => {
+                let mut backend = backend_mtx
+                    .lock()
+                    .map_err(|_poisoned| Error::LockPoisoned)?;
+                backend.append(OpRef::Remove { key })?;
+                let mut shard = self.inner.index.write(shard_idx)?;
+                let removed = shard.remove(key);
+                drop(shard);
+                drop(backend);
+                removed
+            }
+            None => {
+                let mut shard = self.inner.index.write(shard_idx)?;
+                shard.remove(key)
+            }
+        };
 
         let Some(record) = removed else {
             return Ok(None);
@@ -270,25 +306,22 @@ impl Emdb {
     ///
     /// Returns an error when lock acquisition fails.
     pub fn contains_key(&self, key: impl AsRef<[u8]>) -> Result<bool> {
+        let key = key.as_ref();
+        let shard_idx = Index::shard_for_key(key);
+        let shard = self.inner.index.read(shard_idx)?;
+        let Some(_record) = shard.get(key) else {
+            return Ok(false);
+        };
+
         #[cfg(feature = "ttl")]
         {
-            let state = self.state_read()?;
-            let Some(record) = state.storage.get(key.as_ref()) else {
-                return Ok(false);
-            };
             let now = now_unix_millis();
-            if is_expired(record_expires_at(record), now) {
+            if is_expired(record_expires_at(_record), now) {
                 return Ok(false);
             }
-
-            Ok(true)
         }
 
-        #[cfg(not(feature = "ttl"))]
-        {
-            let state = self.state_read()?;
-            Ok(state.storage.contains_key(key.as_ref()))
-        }
+        Ok(true)
     }
 
     /// Return the number of currently-visible records.
@@ -297,22 +330,9 @@ impl Emdb {
     ///
     /// Returns an error when lock acquisition fails.
     pub fn len(&self) -> Result<usize> {
-        #[cfg(feature = "ttl")]
-        {
-            let state = self.state_read()?;
-            let now = now_unix_millis();
-            Ok(state
-                .storage
-                .values()
-                .filter(|record| !is_expired(record_expires_at(record), now))
-                .count())
-        }
-
-        #[cfg(not(feature = "ttl"))]
-        {
-            let state = self.state_read()?;
-            Ok(state.storage.len())
-        }
+        let guards = self.inner.index.read_all()?;
+        let total = self.count_visible(&guards);
+        Ok(total)
     }
 
     /// Return `true` if no visible records are stored.
@@ -330,58 +350,93 @@ impl Emdb {
     ///
     /// Returns an error when persistence append fails or lock acquisition fails.
     pub fn clear(&self) -> Result<()> {
-        {
-            let mut backend = self.lock_backend()?;
-            backend.append(&Op::Clear)?;
+        match self.inner.backend.as_ref() {
+            Some(backend_mtx) => {
+                let mut backend = backend_mtx
+                    .lock()
+                    .map_err(|_poisoned| Error::LockPoisoned)?;
+                backend.append(OpRef::Clear)?;
+                let mut guards = self.inner.index.write_all()?;
+                for shard in guards.iter_mut() {
+                    shard.clear();
+                }
+                drop(guards);
+                drop(backend);
+            }
+            None => {
+                let mut guards = self.inner.index.write_all()?;
+                for shard in guards.iter_mut() {
+                    shard.clear();
+                }
+            }
         }
-
-        let mut state = self.state_write()?;
-        state.storage.clear();
         Ok(())
     }
 
     /// Snapshot all visible records as owned `(key, value)` pairs.
     ///
+    /// Iteration order is unspecified; the in-memory index is sharded for
+    /// concurrent access and does not guarantee a stable ordering.
+    ///
     /// # Errors
     ///
     /// Returns an error when lock acquisition fails.
     pub fn iter(&self) -> Result<std::vec::IntoIter<(Vec<u8>, Vec<u8>)>> {
-        #[cfg(feature = "ttl")]
-        {
-            let state = self.state_read()?;
-            let now = now_unix_millis();
-            let items = state
-                .storage
-                .iter()
-                .filter_map(|(key, record)| {
-                    if is_expired(record_expires_at(record), now) {
-                        return None;
-                    }
-                    Some((key.clone(), record_value(record).to_vec()))
-                })
-                .collect::<Vec<_>>();
-            Ok(items.into_iter())
+        let guards = self.inner.index.read_all()?;
+        let mut total = 0_usize;
+        for shard in guards.iter() {
+            total = total.saturating_add(shard.len());
         }
+        let mut items = Vec::with_capacity(total);
 
-        #[cfg(not(feature = "ttl"))]
-        {
-            let state = self.state_read()?;
-            let items = state
-                .storage
-                .iter()
-                .map(|(key, record)| (key.clone(), record_value(record).to_vec()))
-                .collect::<Vec<_>>();
-            Ok(items.into_iter())
+        #[cfg(feature = "ttl")]
+        let now = now_unix_millis();
+
+        for shard in guards.iter() {
+            for (key, record) in shard.iter() {
+                #[cfg(feature = "ttl")]
+                {
+                    if is_expired(record_expires_at(record), now) {
+                        continue;
+                    }
+                }
+                items.push((key.clone(), record_value(record).to_vec()));
+            }
         }
+        drop(guards);
+        Ok(items.into_iter())
     }
 
     /// Snapshot all visible keys as owned bytes.
+    ///
+    /// Iteration order is unspecified.
     ///
     /// # Errors
     ///
     /// Returns an error when lock acquisition fails.
     pub fn keys(&self) -> Result<std::vec::IntoIter<Vec<u8>>> {
-        let items = self.iter()?.map(|(key, _value)| key).collect::<Vec<_>>();
+        let guards = self.inner.index.read_all()?;
+        let mut total = 0_usize;
+        for shard in guards.iter() {
+            total = total.saturating_add(shard.len());
+        }
+        let mut items = Vec::with_capacity(total);
+
+        #[cfg(feature = "ttl")]
+        let now = now_unix_millis();
+
+        for shard in guards.iter() {
+            for (key, _record) in shard.iter() {
+                #[cfg(feature = "ttl")]
+                {
+                    if is_expired(record_expires_at(_record), now) {
+                        continue;
+                    }
+                }
+                items.push(key.clone());
+            }
+        }
+        drop(guards);
         Ok(items.into_iter())
     }
 
@@ -391,7 +446,12 @@ impl Emdb {
     ///
     /// Returns an error when storage flush fails.
     pub fn flush(&self) -> Result<()> {
-        let mut backend = self.lock_backend()?;
+        let Some(backend_mtx) = self.inner.backend.as_ref() else {
+            return Ok(());
+        };
+        let mut backend = backend_mtx
+            .lock()
+            .map_err(|_poisoned| Error::LockPoisoned)?;
         backend.flush()
     }
 
@@ -406,20 +466,35 @@ impl Emdb {
             let _evicted = self.sweep_expired();
         }
 
-        let state = self.state_read()?;
-        let owned: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> = state
-            .storage
-            .iter()
-            .map(|(key, record)| {
+        let Some(backend_mtx) = self.inner.backend.as_ref() else {
+            return Ok(());
+        };
+
+        // Snapshot under read locks first so we minimise the amount of work
+        // done under the backend mutex.
+        let guards = self.inner.index.read_all()?;
+
+        #[cfg(feature = "ttl")]
+        let now = now_unix_millis();
+
+        let mut owned: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> = Vec::new();
+        for shard in guards.iter() {
+            for (key, record) in shard.iter() {
                 #[cfg(feature = "ttl")]
                 let expires_at = record_expires_at(record);
                 #[cfg(not(feature = "ttl"))]
-                let expires_at = None;
+                let expires_at: Option<u64> = None;
 
-                (key.clone(), record_value(record).to_vec(), expires_at)
-            })
-            .collect();
-        drop(state);
+                #[cfg(feature = "ttl")]
+                {
+                    if is_expired(expires_at, now) {
+                        continue;
+                    }
+                }
+                owned.push((key.clone(), record_value(record).to_vec(), expires_at));
+            }
+        }
+        drop(guards);
 
         let snapshot: SnapshotIter<'_> =
             Box::new(owned.iter().map(|(key, value, expires_at)| SnapshotEntry {
@@ -428,8 +503,27 @@ impl Emdb {
                 expires_at: *expires_at,
             }));
 
-        let mut backend = self.lock_backend()?;
+        let mut backend = backend_mtx
+            .lock()
+            .map_err(|_poisoned| Error::LockPoisoned)?;
         backend.compact(snapshot)
+    }
+
+    /// Force migration of an older-format file to the current page format.
+    ///
+    /// File-backed databases are auto-migrated during open, so calling this on
+    /// an already-open handle is a no-op when the file is current. In-memory
+    /// databases always return success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when migration detection or the migration rewrite fails.
+    pub fn migrate(&self) -> Result<()> {
+        let Some(path) = self.path() else {
+            return Ok(());
+        };
+
+        migrate_if_needed(path, build_flags())
     }
 
     /// Return file path when this database is file-backed.
@@ -439,6 +533,11 @@ impl Emdb {
     }
 
     /// Insert or replace a key/value pair with explicit TTL behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when TTL computation overflows, persistence fails, or
+    /// lock acquisition fails.
     #[cfg(feature = "ttl")]
     pub fn insert_with_ttl(
         &self,
@@ -451,26 +550,20 @@ impl Emdb {
 
         let now = now_unix_millis();
         let expires_at = expires_from_ttl(ttl, self.inner.config.default_ttl, now)?;
-
-        {
-            let mut backend = self.lock_backend()?;
-            backend.append(&Op::Insert {
-                key: key.clone(),
-                value: value.clone(),
-                expires_at,
-            })?;
-        }
-
-        let mut state = self.state_write()?;
-        let _previous = state.storage.insert(key, record_new(value, expires_at));
-        Ok(())
+        self.write_record(key, value, expires_at)
     }
 
     /// Returns the absolute expiration time for a key, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when lock acquisition fails.
     #[cfg(feature = "ttl")]
     pub fn expires_at(&self, key: impl AsRef<[u8]>) -> Result<Option<SystemTime>> {
-        let state = self.state_read()?;
-        let Some(record) = state.storage.get(key.as_ref()) else {
+        let key = key.as_ref();
+        let shard_idx = Index::shard_for_key(key);
+        let shard = self.inner.index.read(shard_idx)?;
+        let Some(record) = shard.get(key) else {
             return Ok(None);
         };
 
@@ -487,10 +580,16 @@ impl Emdb {
     }
 
     /// Returns remaining TTL for a key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when lock acquisition fails.
     #[cfg(feature = "ttl")]
     pub fn ttl(&self, key: impl AsRef<[u8]>) -> Result<Option<Duration>> {
-        let state = self.state_read()?;
-        let Some(record) = state.storage.get(key.as_ref()) else {
+        let key = key.as_ref();
+        let shard_idx = Index::shard_for_key(key);
+        let shard = self.inner.index.read(shard_idx)?;
+        let Some(record) = shard.get(key) else {
             return Ok(None);
         };
 
@@ -503,74 +602,136 @@ impl Emdb {
     }
 
     /// Removes TTL from a key, making it permanent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistence append fails or lock acquisition fails.
     #[cfg(feature = "ttl")]
     pub fn persist(&self, key: impl AsRef<[u8]>) -> Result<bool> {
-        let key_slice = key.as_ref();
-        let key_vec = key_slice.to_vec();
+        let key = key.as_ref();
+        let shard_idx = Index::shard_for_key(key);
 
-        let mut state = self.state_write()?;
-        let Some(record) = state.storage.get_mut(key_slice) else {
-            return Ok(false);
-        };
-
-        let changed = record_set_persist(record);
-        if changed {
-            let value = record_value(record).to_vec();
-            drop(state);
-            let mut backend = self.lock_backend()?;
-            backend.append(&Op::Insert {
-                key: key_vec,
-                value,
-                expires_at: None,
-            })?;
+        match self.inner.backend.as_ref() {
+            Some(backend_mtx) => {
+                let mut backend = backend_mtx
+                    .lock()
+                    .map_err(|_poisoned| Error::LockPoisoned)?;
+                let mut shard = self.inner.index.write(shard_idx)?;
+                let Some(record) = shard.get_mut(key) else {
+                    return Ok(false);
+                };
+                let changed = record_set_persist(record);
+                if !changed {
+                    return Ok(false);
+                }
+                let value = record_value(record).to_vec();
+                let key_vec = key.to_vec();
+                drop(shard);
+                backend.append(OpRef::Insert {
+                    key: &key_vec,
+                    value: &value,
+                    expires_at: None,
+                })?;
+                drop(backend);
+                Ok(true)
+            }
+            None => {
+                let mut shard = self.inner.index.write(shard_idx)?;
+                let Some(record) = shard.get_mut(key) else {
+                    return Ok(false);
+                };
+                Ok(record_set_persist(record))
+            }
         }
-
-        Ok(changed)
     }
 
     /// Evicts all currently expired records and returns the number removed.
     #[cfg(feature = "ttl")]
+    #[must_use]
     pub fn sweep_expired(&self) -> usize {
         let now = now_unix_millis();
-        let Ok(mut state) = self.state_write() else {
+        let Ok(mut guards) = self.inner.index.write_all() else {
             return 0;
         };
-        let before = state.storage.len();
-        state
-            .storage
-            .retain(|_key, record| !is_expired(record_expires_at(record), now));
-        before - state.storage.len()
+
+        let mut removed = 0_usize;
+        for shard in guards.iter_mut() {
+            let before = shard.len();
+            shard.retain(|_key, record| !is_expired(record_expires_at(record), now));
+            removed = removed.saturating_add(before - shard.len());
+        }
+        removed
     }
 
-    pub(crate) fn lock_backend(&self) -> Result<MutexGuard<'_, Box<dyn Storage>>> {
-        self.inner
-            .backend
-            .lock()
-            .map_err(|_poisoned| Error::LockPoisoned)
+    /// Acquire the persistent backend if one exists. Crate-internal helper for
+    /// the transaction commit path.
+    pub(crate) fn lock_backend(&self) -> Result<Option<MutexGuard<'_, PageStorage>>> {
+        match self.inner.backend.as_ref() {
+            Some(mtx) => mtx
+                .lock()
+                .map(Some)
+                .map_err(|_poisoned| Error::LockPoisoned),
+            None => Ok(None),
+        }
     }
 
-    pub(crate) fn state_write(&self) -> Result<RwLockWriteGuard<'_, State>> {
-        self.inner
-            .state
-            .write()
-            .map_err(|_poisoned| Error::LockPoisoned)
+    /// Crate-internal helper used by transactions to peek at a record without
+    /// allocating, without expiring it, and without releasing the shard lock.
+    pub(crate) fn shard_for(&self, key: &[u8]) -> Result<std::sync::RwLockReadGuard<'_, Shard>> {
+        let shard_idx = Index::shard_for_key(key);
+        self.inner.index.read(shard_idx)
     }
 
-    fn state_read(&self) -> Result<RwLockReadGuard<'_, State>> {
-        self.inner
-            .state
-            .read()
-            .map_err(|_poisoned| Error::LockPoisoned)
+    /// Crate-internal helper exposing the index to the transaction commit path.
+    pub(crate) fn index(&self) -> &Index {
+        &self.inner.index
+    }
+
+    /// Crate-internal helper for the transaction commit path: bump and return
+    /// the next transaction id.
+    pub(crate) fn next_tx_id(&self) -> Result<u64> {
+        let prev = self.inner.last_tx_id.fetch_add(1, Ordering::AcqRel);
+        prev.checked_add(1)
+            .ok_or(Error::TransactionAborted("transaction id overflow"))
+    }
+
+    fn count_visible(&self, guards: &[std::sync::RwLockReadGuard<'_, Shard>]) -> usize {
+        #[cfg(feature = "ttl")]
+        {
+            let now = now_unix_millis();
+            let mut total = 0_usize;
+            for shard in guards.iter() {
+                for record in shard.values() {
+                    if !is_expired(record_expires_at(record), now) {
+                        total = total.saturating_add(1);
+                    }
+                }
+            }
+            total
+        }
+
+        #[cfg(not(feature = "ttl"))]
+        {
+            let mut total = 0_usize;
+            for shard in guards.iter() {
+                total = total.saturating_add(shard.len());
+            }
+            total
+        }
     }
 }
 
 impl Drop for Emdb {
     fn drop(&mut self) {
+        // Best-effort flush. We cannot return an error from Drop, and surfacing
+        // it via panic would be worse: a clean handle drop must never poison
+        // unrelated locks. Persistent users wanting guaranteed durability call
+        // `flush()` before drop; in-memory drops are no-ops.
         let _ignored = self.flush();
     }
 }
 
-fn apply_replayed_op(storage: &mut BTreeMap<Vec<u8>, Record>, op: Op) {
+fn apply_replayed_op(storage: &mut HashMap<Vec<u8>, Record>, op: Op) {
     match op {
         Op::Insert {
             key,
@@ -628,6 +789,12 @@ mod tests {
             Err(err) => panic!("build should succeed: {err}"),
         };
         assert!(matches!(db.is_empty(), Ok(true)));
+    }
+
+    #[test]
+    fn test_migrate_is_noop_for_in_memory_database() {
+        let db = Emdb::open_in_memory();
+        assert!(db.migrate().is_ok());
     }
 
     #[test]

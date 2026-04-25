@@ -15,7 +15,18 @@ fn tmp_path(name: &str) -> std::path::PathBuf {
     p
 }
 
+fn kv_dataset(count: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+    (0..count)
+        .map(|i| {
+            let key = format!("k{i}").into_bytes();
+            let value = format!("v{i}").into_bytes();
+            (key, value)
+        })
+        .collect()
+}
+
 fn bench_flush_policy(c: &mut Criterion, name: &str, policy: FlushPolicy) {
+    let data = kv_dataset(256);
     c.bench_function(name, |b| {
         b.iter(|| {
             let path = tmp_path(name);
@@ -29,8 +40,8 @@ fn bench_flush_policy(c: &mut Criterion, name: &str, policy: FlushPolicy) {
                 Err(err) => panic!("build should succeed: {err}"),
             };
 
-            for i in 0_u32..256 {
-                let inserted = db.insert(format!("k{i}"), format!("v{i}"));
+            for (key, value) in &data {
+                let inserted = db.insert(key.as_slice(), value.as_slice());
                 assert!(inserted.is_ok());
             }
             let flushed = db.flush();
