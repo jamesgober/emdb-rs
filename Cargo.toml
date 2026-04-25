@@ -39,6 +39,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 crc32fast = "1.4"
 fs4 = "0.8"
+# Optional WAL-record compression. lz4_flex is pure Rust, ~30% size of zstd's
+# binary, and tuned for the small-record sizes typical of a KV WAL.
+lz4_flex = { version = "0.11", default-features = false, optional = true }
 redb = { version = "2.1", optional = true }
 redis = { version = "0.27", optional = true }
 sled = { version = "0.34", optional = true }
@@ -60,6 +63,12 @@ default = ["ttl"]
 ttl = []
 nested = []
 mmap = ["dep:memmap2"]
+# WAL-record compression via lz4_flex. Records below COMPRESS_MIN_BYTES bypass
+# compression to avoid the per-record overhead on already-small payloads.
+compress = ["dep:lz4_flex"]
+# Reserved for future AES-GCM at-rest encryption of the page file. Currently
+# enables the feature gate without changing on-disk behaviour.
+encrypt = []
 bench-compare = ["dep:redb", "dep:sled"]
 bench-redis = ["dep:redis"]
 bench-rocksdb = ["dep:rocksdb"]

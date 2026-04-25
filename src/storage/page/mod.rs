@@ -16,6 +16,10 @@ pub(crate) mod mmap;
 #[allow(dead_code)]
 pub(crate) mod pager;
 #[allow(dead_code)]
+pub(crate) mod rid;
+#[allow(dead_code)]
+pub(crate) mod slotted;
+#[allow(dead_code)]
 pub(crate) mod value;
 
 /// Fixed page size used by the v0.6 page file format.
@@ -50,12 +54,14 @@ pub(crate) enum PageType {
     Header = 0,
     /// B-tree index node page.
     BTreeNode = 1,
-    /// Value leaf page.
+    /// Value leaf page (v0.6 one-page-per-value format).
     ValueLeaf = 2,
     /// Free-list bookkeeping page.
     FreeList = 3,
     /// Overflow page for large values.
     Overflow = 4,
+    /// Slotted leaf page (v0.7 packed-leaf format).
+    LeafSlotted = 5,
 }
 
 impl PageType {
@@ -67,6 +73,7 @@ impl PageType {
             2 => Ok(Self::ValueLeaf),
             3 => Ok(Self::FreeList),
             4 => Ok(Self::Overflow),
+            5 => Ok(Self::LeafSlotted),
             _ => Err(Error::Corrupted {
                 offset: 0,
                 reason: "invalid page type",

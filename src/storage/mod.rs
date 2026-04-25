@@ -9,11 +9,15 @@ pub(crate) mod codec;
 #[allow(dead_code)]
 pub(crate) mod file;
 #[allow(dead_code)]
+pub(crate) mod fxhash;
+#[allow(dead_code)]
 pub(crate) mod migrate;
 #[allow(dead_code)]
 pub(crate) mod page;
 #[allow(dead_code)]
 pub(crate) mod page_store;
+#[allow(dead_code)]
+pub(crate) mod v4;
 #[allow(dead_code)]
 pub(crate) mod wal;
 

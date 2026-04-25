@@ -125,16 +125,26 @@
 #![deny(clippy::unreachable)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[allow(dead_code)]
+mod bloom;
 mod builder;
+#[allow(dead_code)]
+mod compress;
 mod db;
 mod error;
 mod index;
+#[allow(dead_code)]
+mod keymap;
 mod lockfile;
 #[cfg(feature = "nested")]
 mod nested;
+#[allow(dead_code)]
+mod page_cache;
 mod storage;
 mod transaction;
 mod ttl;
+#[allow(dead_code)]
+mod value_cache;
 
 pub use builder::EmdbBuilder;
 pub use db::Emdb;
