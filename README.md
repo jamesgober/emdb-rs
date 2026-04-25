@@ -19,11 +19,15 @@
 
 ## Status
 
-**v0.6.** Page-oriented storage format (4 KB pages, B-tree index, free-list,
-WAL sidecar), automatic migration from v1/v2 log formats, optional
-memory-mapped reads, closure-based transactions with atomic batch writes,
-and a sharded in-memory primary index for fully parallel reads. The API
-is still pre-1.0 and may change before 1.0.
+**v0.7.** New v0.7 storage engine (opt-in via `EmdbBuilder::prefer_v4(true)`):
+packed slotted leaves with sharded `(hash → Rid)` keymap, layered page +
+value caches, group-commit WAL with crash-atomic batch markers, lock-free
+bloom filters, named namespaces with isolated keymaps + leaf chains, a
+foreground compactor backed by a real free list, and cross-platform
+Direct I/O. v0.6 remains the default backend; in-place v3 → v4 migration
+on first open. ~7× faster than v0.6 on bulk inserts; ahead of sled on
+both axes in the comparative bench. The API is still pre-1.0 and may
+change before 1.0.
 
 Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
 
@@ -31,7 +35,7 @@ Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
 
 ```toml
 [dependencies]
-emdb = "0.6"
+emdb = "0.7"
 ```
 
 ## Quick Start
