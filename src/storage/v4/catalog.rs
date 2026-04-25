@@ -361,6 +361,34 @@ impl Catalog {
             }
         }
     }
+
+    /// Iterate every tombstoned entry. Used by the compactor to enumerate
+    /// dropped namespaces whose leaf chains still need their pages freed.
+    pub(crate) fn tombstoned_entries(&self) -> impl Iterator<Item = &CatalogEntry> {
+        self.entries.iter().filter(|e| e.is_tombstoned())
+    }
+
+    /// Remove an already-tombstoned entry from the catalog. Used by the
+    /// compactor after it has freed every page in the entry's leaf chain.
+    /// Returns `true` when an entry was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] when the targeted entry is still
+    /// live (caller forgot to tombstone first).
+    pub(crate) fn remove_tombstoned(&mut self, id: u32) -> Result<bool> {
+        let position = self.entries.iter().position(|e| e.id == id);
+        let Some(idx) = position else {
+            return Ok(false);
+        };
+        if !self.entries[idx].is_tombstoned() {
+            return Err(Error::InvalidConfig(
+                "remove_tombstoned called on a live entry",
+            ));
+        }
+        let _removed = self.entries.remove(idx);
+        Ok(true)
+    }
 }
 
 fn encode_entry(out: &mut [u8], cursor: &mut usize, entry: &CatalogEntry) {

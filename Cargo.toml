@@ -66,8 +66,11 @@ mmap = ["dep:memmap2"]
 # WAL-record compression via lz4_flex. Records below COMPRESS_MIN_BYTES bypass
 # compression to avoid the per-record overhead on already-small payloads.
 compress = ["dep:lz4_flex"]
-# Reserved for future AES-GCM at-rest encryption of the page file. Currently
-# enables the feature gate without changing on-disk behaviour.
+# Reserved feature gate for AES-GCM at-rest encryption. The on-disk format
+# decisions, key-management story, and WAL-vs-page-body trade-offs need a
+# focused session before this can ship; the feature flag exists today so
+# downstream Cargo.toml entries can opt in early without breaking when the
+# implementation lands.
 encrypt = []
 bench-compare = ["dep:redb", "dep:sled"]
 bench-redis = ["dep:redis"]

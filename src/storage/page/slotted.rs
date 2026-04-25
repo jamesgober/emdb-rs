@@ -276,6 +276,23 @@ pub(crate) fn free_space_of(page: &Page) -> u32 {
     record_floor.saturating_sub(slot_array_end) as u32
 }
 
+/// Return the number of live (non-tombstoned) slots on an immutable leaf
+/// page. Mirror of [`LeafPage::live_count`] for use sites that only have
+/// `&Page` (the compactor walks chains without mutating).
+#[must_use]
+pub(crate) fn live_count_of(page: &Page) -> u32 {
+    let total = slot_count_of(page);
+    let mut live = 0_u32;
+    for slot_id in 0..total {
+        if let Ok(slot) = read_slot_at(page, slot_id as u16) {
+            if slot.is_live() {
+                live = live.saturating_add(1);
+            }
+        }
+    }
+    live
+}
+
 /// Read-write view over a slotted leaf page held in a [`Page`] buffer.
 ///
 /// `LeafPage` does not own its bytes; it borrows from a [`Page`] and writes

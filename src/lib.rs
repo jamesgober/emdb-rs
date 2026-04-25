@@ -136,6 +136,7 @@ mod index;
 #[allow(dead_code)]
 mod keymap;
 mod lockfile;
+mod namespace;
 #[cfg(feature = "nested")]
 mod nested;
 #[allow(dead_code)]
@@ -149,8 +150,10 @@ mod value_cache;
 pub use builder::EmdbBuilder;
 pub use db::Emdb;
 pub use error::{Error, Result};
+pub use namespace::{Namespace, NamespaceIter, NamespaceKeyIter};
 #[cfg(feature = "nested")]
 pub use nested::Focus;
+pub use storage::v4::io::IoMode;
 pub use storage::FlushPolicy;
 pub use transaction::Transaction;
 pub use ttl::Ttl;

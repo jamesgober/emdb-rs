@@ -15,6 +15,7 @@ use crate::index::{Index, Shard};
 use crate::lockfile::LockFile;
 use crate::storage::migrate::migrate_if_needed;
 use crate::storage::page_store::PageStorage;
+use crate::storage::v4::engine::{Engine, EngineConfig, DEFAULT_NAMESPACE_ID};
 use crate::storage::{build_flags, Op, OpRef, SnapshotEntry, SnapshotIter, Storage};
 #[cfg(feature = "ttl")]
 use crate::ttl::{
@@ -30,6 +31,22 @@ use crate::{Error, FlushPolicy};
 /// `Emdb` is cheap to clone. Clones refer to the same underlying state.
 pub struct Emdb {
     pub(crate) inner: Arc<Inner>,
+    /// When `Some`, the v0.7 engine is the active backend for path-backed
+    /// operations. Selected via [`EmdbBuilder::prefer_v4`]. The legacy
+    /// `inner` remains in place but its persistent backend is `None`
+    /// (in-memory only) so the two paths never write to the same file.
+    pub(crate) v7: Option<Arc<V07Inner>>,
+}
+
+/// v0.7 backend wrapping the [`Engine`] plus the lockfile that guards the
+/// page file path against concurrent processes. The lockfile is held for
+/// the lifetime of the `Emdb` handle.
+pub(crate) struct V07Inner {
+    pub(crate) engine: Engine,
+    pub(crate) path: PathBuf,
+    _lock_file: LockFile,
+    #[cfg(feature = "ttl")]
+    pub(crate) default_ttl: Option<Duration>,
 }
 
 /// Shared inner state behind [`Emdb`].
@@ -79,6 +96,7 @@ impl Emdb {
                 },
                 _lock_file: None,
             }),
+            v7: None,
         }
     }
 
@@ -103,6 +121,7 @@ impl Emdb {
     pub fn clone_handle(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            v7: self.v7.as_ref().map(Arc::clone),
         }
     }
 
@@ -124,10 +143,81 @@ impl Emdb {
         Ok(out)
     }
 
+    /// Open or create a named namespace and return a scoped handle.
+    ///
+    /// Each named namespace has its own keymap, leaf chain, and bloom
+    /// filter — the data is isolated from the default namespace and from
+    /// other named namespaces. The handle is cheap to clone and may be
+    /// shared between threads.
+    ///
+    /// Named namespaces are a v0.7-only feature. On v0.6 handles this
+    /// returns [`Error::InvalidConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] when called on a v0.6 handle, or
+    /// when `name` is empty (the default namespace is implicit and
+    /// reached through the standard `Emdb::insert/get/...` methods).
+    /// Returns I/O errors from the catalog page-store path.
+    pub fn namespace(&self, name: impl AsRef<str>) -> Result<crate::namespace::Namespace> {
+        let name_ref = name.as_ref();
+        let v7 = self.v7.as_ref().ok_or(Error::InvalidConfig(
+            "named namespaces require the v0.7 engine; build with EmdbBuilder::prefer_v4(true)",
+        ))?;
+        let (ns_id, _was_created) = v7.engine.create_or_open_namespace(name_ref)?;
+        Ok(crate::namespace::Namespace::new(
+            Arc::clone(v7),
+            ns_id,
+            name_ref.to_string().into_boxed_str(),
+        ))
+    }
+
+    /// Tombstone a named namespace. Returns `true` when a live namespace
+    /// was dropped, `false` when the name was unknown. The default
+    /// namespace cannot be dropped.
+    ///
+    /// On-disk pages for the namespace's leaf chain remain allocated until
+    /// a future compactor reclaims them; until then, the tombstoned entry
+    /// stays in the catalog so a re-create with the same name uses a
+    /// fresh namespace id rather than recovering the dropped one's data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] when called on a v0.6 handle, or
+    /// when `name` is empty (default namespace cannot be dropped).
+    pub fn drop_namespace(&self, name: impl AsRef<str>) -> Result<bool> {
+        let v7 = self.v7.as_ref().ok_or(Error::InvalidConfig(
+            "named namespaces require the v0.7 engine",
+        ))?;
+        v7.engine.drop_namespace(name.as_ref())
+    }
+
+    /// List every live namespace by name. The default namespace is
+    /// reported as `""`. Stable order by namespace id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] when called on a v0.6 handle.
+    pub fn list_namespaces(&self) -> Result<Vec<String>> {
+        let v7 = self.v7.as_ref().ok_or(Error::InvalidConfig(
+            "named namespaces require the v0.7 engine",
+        ))?;
+        let entries = v7.engine.list_namespaces()?;
+        Ok(entries.into_iter().map(|(_, name)| name).collect())
+    }
+
     /// Build a database from builder configuration.
     pub(crate) fn from_builder(builder: EmdbBuilder) -> Result<Self> {
         if matches!(builder.flush_policy, FlushPolicy::EveryN(0)) {
             return Err(Error::InvalidConfig("flush policy EveryN requires N > 0"));
+        }
+
+        // v0.7 path: when `prefer_v4` is set and a path is provided, build
+        // the v4 engine and route every operation through it. The legacy
+        // `inner` is constructed in in-memory mode so no v0.6 page file
+        // is opened against the same path.
+        if builder.prefer_v4 && builder.path.is_some() {
+            return Self::from_builder_v4(builder);
         }
 
         let (backend, lock_file, path, last_tx_id, index) = if let Some(path) = builder.path {
@@ -171,6 +261,7 @@ impl Emdb {
                 },
                 _lock_file: lock_file,
             }),
+            v7: None,
         };
 
         #[cfg(feature = "ttl")]
@@ -181,12 +272,88 @@ impl Emdb {
         Ok(db)
     }
 
+    /// v0.7 build path. Acquires a lockfile, optionally migrates a v3 page
+    /// file in place, and constructs an [`Engine`] that owns the v4 file
+    /// and WAL.
+    fn from_builder_v4(builder: EmdbBuilder) -> Result<Self> {
+        let path = match builder.path.clone() {
+            Some(p) => p,
+            None => {
+                return Err(Error::InvalidConfig(
+                    "prefer_v4 requires a file path; in-memory v0.7 is not supported",
+                ));
+            }
+        };
+        let lock_file = LockFile::acquire(path.as_path())?;
+
+        // If the file exists in v3 page format, migrate it to v4 in place
+        // before opening the engine. New files and already-v4 files are
+        // left alone.
+        crate::storage::v4::migrate::migrate_v3_to_v4_if_needed(path.as_path(), build_flags())?;
+
+        let engine_config = EngineConfig {
+            path: path.clone(),
+            flags: build_flags(),
+            page_io_mode: builder.page_io_mode,
+            wal_io_mode: builder.wal_io_mode,
+            flush_policy: builder.v4_flush_policy(),
+            page_cache_pages: builder.page_cache_pages,
+            value_cache_bytes: builder.value_cache_bytes,
+            bloom_initial_capacity: builder.bloom_initial_capacity,
+        };
+        let engine = Engine::open(engine_config)?;
+
+        // The legacy `inner` stays in place as an in-memory shell so the
+        // few helpers that read its config (e.g., `default_ttl` for the
+        // TTL helpers) keep working. Persistent operations route through
+        // `v7` instead.
+        let in_memory_inner = Arc::new(Inner {
+            index: Index::new(),
+            last_tx_id: AtomicU64::new(0),
+            backend: None,
+            config: Config {
+                path: Some(path.clone()),
+                #[cfg(feature = "ttl")]
+                default_ttl: builder.default_ttl,
+            },
+            _lock_file: None,
+        });
+
+        let v7 = Arc::new(V07Inner {
+            engine,
+            path,
+            _lock_file: lock_file,
+            #[cfg(feature = "ttl")]
+            default_ttl: builder.default_ttl,
+        });
+
+        Ok(Self {
+            inner: in_memory_inner,
+            v7: Some(v7),
+        })
+    }
+
     /// Insert or replace a key/value pair.
     ///
     /// # Errors
     ///
     /// Returns an error when persistence append fails or lock acquisition fails.
     pub fn insert(&self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
+        if let Some(v7) = self.v7.as_ref() {
+            let key = key.into();
+            let value = value.into();
+            #[cfg(feature = "ttl")]
+            let expires_at = {
+                let now = now_unix_millis();
+                expires_from_ttl(Ttl::Default, v7.default_ttl, now)?.unwrap_or(0)
+            };
+            #[cfg(not(feature = "ttl"))]
+            let expires_at: u64 = 0;
+            return v7
+                .engine
+                .insert(DEFAULT_NAMESPACE_ID, &key, &value, expires_at);
+        }
+
         #[cfg(feature = "ttl")]
         {
             self.insert_with_ttl(key, value, Ttl::Default)
@@ -241,6 +408,29 @@ impl Emdb {
     /// Returns an error when lock acquisition fails.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
+        if let Some(v7) = self.v7.as_ref() {
+            let cached = v7.engine.get(DEFAULT_NAMESPACE_ID, key)?;
+            return Ok(match cached {
+                None => None,
+                #[cfg(feature = "ttl")]
+                Some(cv) => {
+                    let now = now_unix_millis();
+                    let expires_at = if cv.expires_at == 0 {
+                        None
+                    } else {
+                        Some(cv.expires_at)
+                    };
+                    if is_expired(expires_at, now) {
+                        None
+                    } else {
+                        Some(cv.value.as_ref().to_vec())
+                    }
+                }
+                #[cfg(not(feature = "ttl"))]
+                Some(cv) => Some(cv.value.as_ref().to_vec()),
+            });
+        }
+
         let shard_idx = Index::shard_for_key(key);
         let shard = self.inner.index.read(shard_idx)?;
         let Some(record) = shard.get(key) else {
@@ -265,6 +455,34 @@ impl Emdb {
     /// Returns an error when persistence append fails or lock acquisition fails.
     pub fn remove(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
+        if let Some(v7) = self.v7.as_ref() {
+            // Engine.remove returns a bool; fetch the previous value first
+            // so we can return it. The engine's get is safe to call before
+            // the remove because the keymap update happens atomically inside
+            // engine.remove.
+            let previous = v7.engine.get(DEFAULT_NAMESPACE_ID, key)?;
+            let _was_present = v7.engine.remove(DEFAULT_NAMESPACE_ID, key)?;
+            return Ok(match previous {
+                None => None,
+                #[cfg(feature = "ttl")]
+                Some(cv) => {
+                    let now = now_unix_millis();
+                    let expires_at = if cv.expires_at == 0 {
+                        None
+                    } else {
+                        Some(cv.expires_at)
+                    };
+                    if is_expired(expires_at, now) {
+                        None
+                    } else {
+                        Some(cv.value.as_ref().to_vec())
+                    }
+                }
+                #[cfg(not(feature = "ttl"))]
+                Some(cv) => Some(cv.value.as_ref().to_vec()),
+            });
+        }
+
         let shard_idx = Index::shard_for_key(key);
 
         let removed = match self.inner.backend.as_ref() {
@@ -307,6 +525,10 @@ impl Emdb {
     /// Returns an error when lock acquisition fails.
     pub fn contains_key(&self, key: impl AsRef<[u8]>) -> Result<bool> {
         let key = key.as_ref();
+        if self.v7.is_some() {
+            return Ok(self.get(key)?.is_some());
+        }
+
         let shard_idx = Index::shard_for_key(key);
         let shard = self.inner.index.read(shard_idx)?;
         let Some(_record) = shard.get(key) else {
@@ -330,6 +552,10 @@ impl Emdb {
     ///
     /// Returns an error when lock acquisition fails.
     pub fn len(&self) -> Result<usize> {
+        if let Some(v7) = self.v7.as_ref() {
+            let count = v7.engine.record_count(DEFAULT_NAMESPACE_ID)?;
+            return Ok(count as usize);
+        }
         let guards = self.inner.index.read_all()?;
         let total = self.count_visible(&guards);
         Ok(total)
@@ -350,6 +576,9 @@ impl Emdb {
     ///
     /// Returns an error when persistence append fails or lock acquisition fails.
     pub fn clear(&self) -> Result<()> {
+        if let Some(v7) = self.v7.as_ref() {
+            return v7.engine.clear_namespace(DEFAULT_NAMESPACE_ID);
+        }
         match self.inner.backend.as_ref() {
             Some(backend_mtx) => {
                 let mut backend = backend_mtx
@@ -382,6 +611,30 @@ impl Emdb {
     ///
     /// Returns an error when lock acquisition fails.
     pub fn iter(&self) -> Result<std::vec::IntoIter<(Vec<u8>, Vec<u8>)>> {
+        if let Some(v7) = self.v7.as_ref() {
+            let snapshot = v7.engine.collect_records(DEFAULT_NAMESPACE_ID)?;
+            #[cfg(feature = "ttl")]
+            let now = now_unix_millis();
+            let mut items: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(snapshot.len());
+            for (key, value, expires_at) in snapshot {
+                #[cfg(feature = "ttl")]
+                {
+                    let exp = if expires_at == 0 {
+                        None
+                    } else {
+                        Some(expires_at)
+                    };
+                    if is_expired(exp, now) {
+                        continue;
+                    }
+                }
+                #[cfg(not(feature = "ttl"))]
+                let _ = expires_at;
+                items.push((key, value));
+            }
+            return Ok(items.into_iter());
+        }
+
         let guards = self.inner.index.read_all()?;
         let mut total = 0_usize;
         for shard in guards.iter() {
@@ -415,6 +668,30 @@ impl Emdb {
     ///
     /// Returns an error when lock acquisition fails.
     pub fn keys(&self) -> Result<std::vec::IntoIter<Vec<u8>>> {
+        if let Some(v7) = self.v7.as_ref() {
+            let snapshot = v7.engine.collect_records(DEFAULT_NAMESPACE_ID)?;
+            #[cfg(feature = "ttl")]
+            let now = now_unix_millis();
+            let mut items: Vec<Vec<u8>> = Vec::with_capacity(snapshot.len());
+            for (key, _value, expires_at) in snapshot {
+                #[cfg(feature = "ttl")]
+                {
+                    let exp = if expires_at == 0 {
+                        None
+                    } else {
+                        Some(expires_at)
+                    };
+                    if is_expired(exp, now) {
+                        continue;
+                    }
+                }
+                #[cfg(not(feature = "ttl"))]
+                let _ = expires_at;
+                items.push(key);
+            }
+            return Ok(items.into_iter());
+        }
+
         let guards = self.inner.index.read_all()?;
         let mut total = 0_usize;
         for shard in guards.iter() {
@@ -446,6 +723,9 @@ impl Emdb {
     ///
     /// Returns an error when storage flush fails.
     pub fn flush(&self) -> Result<()> {
+        if let Some(v7) = self.v7.as_ref() {
+            return v7.engine.flush();
+        }
         let Some(backend_mtx) = self.inner.backend.as_ref() else {
             return Ok(());
         };
@@ -461,6 +741,15 @@ impl Emdb {
     ///
     /// Returns an error when compaction fails.
     pub fn compact(&self) -> Result<()> {
+        if let Some(v7) = self.v7.as_ref() {
+            // v0.7 path: walk every namespace's leaf chain, rebuild any
+            // leaf carrying tombstones, free empty leaves, and reclaim
+            // every page belonging to a dropped namespace. The engine
+            // flushes the page-store header + dirty pages before
+            // returning, so the recovered space survives a crash.
+            let _stats = v7.engine.compact()?;
+            return Ok(());
+        }
         #[cfg(feature = "ttl")]
         {
             let _evicted = self.sweep_expired();
@@ -529,6 +818,9 @@ impl Emdb {
     /// Return file path when this database is file-backed.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
+        if let Some(v7) = self.v7.as_ref() {
+            return Some(v7.path.as_path());
+        }
         self.inner.config.path.as_deref()
     }
 
@@ -548,6 +840,14 @@ impl Emdb {
         let key = key.into();
         let value = value.into();
 
+        if let Some(v7) = self.v7.as_ref() {
+            let now = now_unix_millis();
+            let expires_at = expires_from_ttl(ttl, v7.default_ttl, now)?.unwrap_or(0);
+            return v7
+                .engine
+                .insert(DEFAULT_NAMESPACE_ID, &key, &value, expires_at);
+        }
+
         let now = now_unix_millis();
         let expires_at = expires_from_ttl(ttl, self.inner.config.default_ttl, now)?;
         self.write_record(key, value, expires_at)
@@ -561,6 +861,19 @@ impl Emdb {
     #[cfg(feature = "ttl")]
     pub fn expires_at(&self, key: impl AsRef<[u8]>) -> Result<Option<SystemTime>> {
         let key = key.as_ref();
+        if let Some(v7) = self.v7.as_ref() {
+            let cached = v7.engine.get(DEFAULT_NAMESPACE_ID, key)?;
+            let Some(cv) = cached else { return Ok(None) };
+            if cv.expires_at == 0 {
+                return Ok(None);
+            }
+            let now = now_unix_millis();
+            if is_expired(Some(cv.expires_at), now) {
+                return Ok(None);
+            }
+            return Ok(Some(UNIX_EPOCH + Duration::from_millis(cv.expires_at)));
+        }
+
         let shard_idx = Index::shard_for_key(key);
         let shard = self.inner.index.read(shard_idx)?;
         let Some(record) = shard.get(key) else {
@@ -587,6 +900,16 @@ impl Emdb {
     #[cfg(feature = "ttl")]
     pub fn ttl(&self, key: impl AsRef<[u8]>) -> Result<Option<Duration>> {
         let key = key.as_ref();
+        if let Some(v7) = self.v7.as_ref() {
+            let cached = v7.engine.get(DEFAULT_NAMESPACE_ID, key)?;
+            let Some(cv) = cached else { return Ok(None) };
+            if cv.expires_at == 0 {
+                return Ok(None);
+            }
+            let now = now_unix_millis();
+            return Ok(remaining_ttl(cv.expires_at, now));
+        }
+
         let shard_idx = Index::shard_for_key(key);
         let shard = self.inner.index.read(shard_idx)?;
         let Some(record) = shard.get(key) else {
@@ -609,6 +932,20 @@ impl Emdb {
     #[cfg(feature = "ttl")]
     pub fn persist(&self, key: impl AsRef<[u8]>) -> Result<bool> {
         let key = key.as_ref();
+
+        if let Some(v7) = self.v7.as_ref() {
+            // v4 path: read the existing record, re-insert with expires_at=0.
+            let Some(cv) = v7.engine.get(DEFAULT_NAMESPACE_ID, key)? else {
+                return Ok(false);
+            };
+            if cv.expires_at == 0 {
+                return Ok(false);
+            }
+            v7.engine
+                .insert(DEFAULT_NAMESPACE_ID, key, cv.value.as_ref(), 0)?;
+            return Ok(true);
+        }
+
         let shard_idx = Index::shard_for_key(key);
 
         match self.inner.backend.as_ref() {
@@ -649,6 +986,30 @@ impl Emdb {
     #[cfg(feature = "ttl")]
     #[must_use]
     pub fn sweep_expired(&self) -> usize {
+        if let Some(v7) = self.v7.as_ref() {
+            let Ok(snapshot) = v7.engine.collect_records(DEFAULT_NAMESPACE_ID) else {
+                return 0;
+            };
+            let now = now_unix_millis();
+            let mut removed = 0_usize;
+            for (key, _value, expires_at) in snapshot {
+                if expires_at == 0 {
+                    continue;
+                }
+                if !is_expired(Some(expires_at), now) {
+                    continue;
+                }
+                if v7
+                    .engine
+                    .remove(DEFAULT_NAMESPACE_ID, key.as_slice())
+                    .unwrap_or(false)
+                {
+                    removed = removed.saturating_add(1);
+                }
+            }
+            return removed;
+        }
+
         let now = now_unix_millis();
         let Ok(mut guards) = self.inner.index.write_all() else {
             return 0;

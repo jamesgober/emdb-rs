@@ -38,7 +38,8 @@ use crate::{Error, Result};
 
 /// Selects how the v0.7 page file is opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum IoMode {
+#[non_exhaustive]
+pub enum IoMode {
     /// Use the OS page cache. The default; works on every platform and
     /// every filesystem.
     #[default]

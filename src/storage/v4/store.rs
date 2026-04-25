@@ -382,11 +382,52 @@ impl PageStore {
     /// [`Error::Corrupted`] when the page count would exceed
     /// [`MAX_PAGE_ID`].
     pub(crate) fn allocate_page(&self) -> Result<PageId> {
-        // Hold the file mutex for the whole allocation: extending the file
-        // and incrementing `page_count` must happen together, otherwise a
-        // concurrent reader could observe a page id whose backing bytes are
-        // not yet allocated on disk. `File::set_len` only needs `&self`, so
-        // the guard does not need `mut`.
+        // First, try to reuse a previously freed page from the free list.
+        // The free-list head is an atomic; a successful CAS pops the head
+        // by replacing it with the freed page's stored next pointer.
+        let head = self.header.free_list_head.load(Ordering::Acquire);
+        if head != 0 {
+            // Read the freed page to fetch its `next` pointer.
+            let freed_page = self.read_page(PageId::new(head))?;
+            let header = freed_page.header()?;
+            if header.page_type == crate::storage::page::PageType::FreeList {
+                let next = read_free_next_pointer(&freed_page);
+                // Publish the new head atomically. Multiple concurrent
+                // allocators contending on the same head all see the same
+                // `next`; whoever wins the CAS reuses `head`, the others
+                // retry by re-loading. We use a simple compare-exchange
+                // loop in lieu of CAS-out-of-`AtomicU64` — the path is
+                // cold relative to insert, so plain locking is fine.
+                match self.header.free_list_head.compare_exchange(
+                    head,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        self.header.dirty.store(true, Ordering::Release);
+                        // The reused page id is `head`; the caller will
+                        // overwrite its contents with whatever they need.
+                        // We invalidate the cache entry so the freed-page
+                        // bytes are not served on a subsequent read.
+                        let _was_present = self.cache.invalidate(PageId::new(head))?;
+                        return Ok(PageId::new(head));
+                    }
+                    Err(_observed) => {
+                        // Lost the race; fall through and try extending
+                        // the file. The next allocation may pick up the
+                        // free-list winner.
+                    }
+                }
+            }
+        }
+
+        // Fall through: extend the file. Hold the file mutex for the whole
+        // allocation: extending the file and incrementing `page_count`
+        // must happen together, otherwise a concurrent reader could
+        // observe a page id whose backing bytes are not yet allocated on
+        // disk. `File::set_len` only needs `&self`, so the guard does not
+        // need `mut`.
         let file = self.file.lock().map_err(|_poisoned| Error::LockPoisoned)?;
 
         let current = self.header.page_count.load(Ordering::Acquire);
@@ -412,6 +453,54 @@ impl PageStore {
         self.header.page_count.store(next_count, Ordering::Release);
         self.header.dirty.store(true, Ordering::Release);
         Ok(PageId::new(current))
+    }
+
+    /// Mark `page_id` as free and push it onto the free list.
+    ///
+    /// The page's bytes are rewritten with a `FreeList` header carrying a
+    /// pointer to the previous free-list head, then the head atomic is
+    /// updated. Concurrent allocators may reuse the freed page on the
+    /// next call to [`Self::allocate_page`]. The caller is responsible
+    /// for ensuring no live `Rid` still references the page.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from the page write.
+    pub(crate) fn free_page(&self, page_id: PageId) -> Result<()> {
+        if page_id.get() == 0 {
+            return Err(Error::InvalidConfig(
+                "cannot free the page-store header page (id 0)",
+            ));
+        }
+        let page_count = self.header.page_count.load(Ordering::Acquire);
+        if page_id.get() >= page_count {
+            return Err(Error::Corrupted {
+                offset: page_id.get() * PAGE_SIZE as u64,
+                reason: "free_page on id past end of file",
+            });
+        }
+
+        // Encode "FreeList header + next pointer" into a fresh page image.
+        let mut page = Page::new(crate::storage::page::PageHeader::new(
+            crate::storage::page::PageType::FreeList,
+        ));
+        let prev_head = self.header.free_list_head.load(Ordering::Acquire);
+        write_free_next_pointer(&mut page, prev_head);
+        let _crc = page.refresh_crc()?;
+
+        // Publish the new image to the cache, mark dirty, then update the
+        // free-list head atomically. A concurrent allocator that reads the
+        // new head will find the freshly-written bytes in the cache.
+        self.cache.insert(page_id, std::sync::Arc::new(page))?;
+        {
+            let mut dirty = self.dirty.lock().map_err(|_poisoned| Error::LockPoisoned)?;
+            let _inserted = dirty.insert(page_id.get());
+        }
+        self.header
+            .free_list_head
+            .store(page_id.get(), Ordering::Release);
+        self.header.dirty.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Read a page by id, consulting the cache first.
@@ -638,6 +727,27 @@ fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0_u64, |d| d.as_millis().min(u64::MAX as u128) as u64)
+}
+
+/// Offset inside a free-list page where the next-pointer (u64 little-endian)
+/// is stored. Sits immediately after the 16-byte page header.
+const FREE_NEXT_POINTER_OFFSET: usize = crate::storage::page::PAGE_HEADER_LEN;
+
+/// Read the "next freed page" pointer out of a free-list page.
+fn read_free_next_pointer(page: &Page) -> u64 {
+    let bytes = page.as_bytes();
+    let mut buf = [0_u8; 8];
+    buf.copy_from_slice(&bytes[FREE_NEXT_POINTER_OFFSET..FREE_NEXT_POINTER_OFFSET + 8]);
+    u64::from_le_bytes(buf)
+}
+
+/// Write the "next freed page" pointer into a free-list page. The CRC is
+/// **not** refreshed by this helper — the caller is expected to call
+/// [`Page::refresh_crc`] before publishing.
+fn write_free_next_pointer(page: &mut Page, next: u64) {
+    let bytes = page.as_mut_bytes();
+    bytes[FREE_NEXT_POINTER_OFFSET..FREE_NEXT_POINTER_OFFSET + 8]
+        .copy_from_slice(&next.to_le_bytes());
 }
 
 #[cfg(test)]

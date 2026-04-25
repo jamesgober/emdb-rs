@@ -92,6 +92,28 @@ impl<'db> Transaction<'db> {
             return self.visible_record(entry.as_ref());
         }
 
+        // v0.7 path: fall through to the v4 engine and respect TTL via
+        // `visible_record` for consistency with v0.6 semantics.
+        if let Some(v7) = self.db.v7.as_ref() {
+            let cached = v7
+                .engine
+                .get(crate::storage::v4::engine::DEFAULT_NAMESPACE_ID, key)?;
+            return match cached {
+                None => Ok(None),
+                Some(c) => {
+                    let record = record_new(
+                        c.value.to_vec(),
+                        if c.expires_at == 0 {
+                            None
+                        } else {
+                            Some(c.expires_at)
+                        },
+                    );
+                    self.visible_record(Some(&record))
+                }
+            };
+        }
+
         let shard = self.db.shard_for(key)?;
         let Some(record) = shard.get(key) else {
             return Ok(None);
@@ -178,6 +200,13 @@ impl<'db> Transaction<'db> {
             return Ok(());
         }
 
+        // v0.7 path: translate the staged ops to `BatchedOp` and let the v4
+        // engine's `commit_batch` handle WAL framing, fsync, and atomic
+        // apply under its own commit lock.
+        if let Some(v7) = self.db.v7.as_ref() {
+            return self.commit_v7(&v7.engine, writes);
+        }
+
         let op_count = u32::try_from(writes.len())
             .map_err(|_overflow| Error::TransactionAborted("operation count overflow"))?;
         let tx_id = self.db.next_tx_id()?;
@@ -214,6 +243,47 @@ impl<'db> Transaction<'db> {
         drop(backend_guard);
 
         Ok(())
+    }
+
+    /// v0.7 commit: translate every staged `Op` into a `BatchedOp` for the
+    /// default namespace and hand the batch to the engine.
+    fn commit_v7(
+        &self,
+        engine: &crate::storage::v4::engine::Engine,
+        writes: Vec<Op>,
+    ) -> Result<()> {
+        use crate::storage::v4::engine::{BatchedOp, DEFAULT_NAMESPACE_ID};
+
+        let mut ops: Vec<BatchedOp> = Vec::with_capacity(writes.len());
+        for op in writes {
+            match op {
+                Op::Insert {
+                    key,
+                    value,
+                    expires_at,
+                } => {
+                    ops.push(BatchedOp::Insert {
+                        ns_id: DEFAULT_NAMESPACE_ID,
+                        key,
+                        value,
+                        expires_at: expires_at.unwrap_or(0),
+                    });
+                }
+                Op::Remove { key } => {
+                    ops.push(BatchedOp::Remove {
+                        ns_id: DEFAULT_NAMESPACE_ID,
+                        key,
+                    });
+                }
+                Op::Clear | Op::Checkpoint { .. } | Op::BatchBegin { .. } | Op::BatchEnd { .. } => {
+                    return Err(Error::TransactionAborted(
+                        "unsupported op type in v0.7 transaction batch",
+                    ));
+                }
+            }
+        }
+
+        engine.commit_batch(&ops)
     }
 
     fn visible_record(&self, maybe_record: Option<&Record>) -> Result<Option<Vec<u8>>> {
