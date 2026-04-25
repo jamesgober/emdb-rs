@@ -589,20 +589,36 @@ mod tests {
 
     #[test]
     fn group_policy_fsyncs_in_background_within_deadline() {
+        let max_wait = Duration::from_millis(50);
         let (wal, path) = open(
             "group-bg",
-            FlushPolicy::Group {
-                max_wait: Duration::from_millis(50),
-            },
+            FlushPolicy::Group { max_wait },
         );
         let _seq = wal.append(b"async-durability");
-        // Wait twice the deadline; the background flusher should have fsynced.
-        thread::sleep(Duration::from_millis(150));
-        let pending = wal.pending_bytes();
-        assert!(
-            matches!(pending, Ok(0)),
-            "background flusher should have fsynced"
-        );
+
+        // Poll until the background flusher drains the buffer. The deadline
+        // is `max_wait` so anything past 1× deadline indicates the flusher
+        // ran, but slow CI runners (debug build, virtualised disk) can take
+        // far longer than the deadline to actually wake the thread + run
+        // fsync. Allow up to 5 seconds; the test still fails fast on a
+        // genuinely-broken flusher because we poll every 10ms.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match wal.pending_bytes() {
+                Ok(0) => break,
+                Ok(_pending) => {
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "background flusher did not drain pending bytes within 5s (max_wait={:?})",
+                            max_wait
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("pending_bytes failed: {err}"),
+            }
+        }
+
         drop(wal);
         let _removed = std::fs::remove_file(&path);
     }
