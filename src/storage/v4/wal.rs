@@ -590,10 +590,7 @@ mod tests {
     #[test]
     fn group_policy_fsyncs_in_background_within_deadline() {
         let max_wait = Duration::from_millis(50);
-        let (wal, path) = open(
-            "group-bg",
-            FlushPolicy::Group { max_wait },
-        );
+        let (wal, path) = open("group-bg", FlushPolicy::Group { max_wait });
         let _seq = wal.append(b"async-durability");
 
         // Poll until the background flusher drains the buffer. The deadline
