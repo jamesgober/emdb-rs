@@ -103,6 +103,27 @@ pub enum Error {
 
     /// A synchronization lock was poisoned due to panic while held.
     LockPoisoned,
+
+    /// At-rest encryption configuration is invalid or AEAD failed
+    /// internally.
+    ///
+    /// Distinct from [`Self::EncryptionKeyMismatch`]: this variant
+    /// signals a problem the user cannot fix by supplying a
+    /// different key (truncated buffer, malformed verification
+    /// block, AEAD machinery failure). The database should be
+    /// considered corrupt or the build mis-configured.
+    #[cfg(feature = "encrypt")]
+    Encryption(&'static str),
+
+    /// The encryption key supplied to
+    /// [`crate::EmdbBuilder::encryption_key`] does not match the key
+    /// the database was created with.
+    ///
+    /// AEAD authentication failed on the verification block (or on a
+    /// subsequent record). The database is fine; the caller supplied
+    /// the wrong key.
+    #[cfg(feature = "encrypt")]
+    EncryptionKeyMismatch,
 }
 
 impl fmt::Display for Error {
@@ -138,6 +159,12 @@ impl fmt::Display for Error {
                 write!(f, "emdb: lockfile error ({})", err.kind())
             }
             Self::LockPoisoned => f.write_str("emdb: lock poisoned"),
+            #[cfg(feature = "encrypt")]
+            Self::Encryption(msg) => write!(f, "emdb: encryption error ({msg})"),
+            #[cfg(feature = "encrypt")]
+            Self::EncryptionKeyMismatch => f.write_str(
+                "emdb: encryption key mismatch (file was created with a different key)",
+            ),
         }
     }
 }

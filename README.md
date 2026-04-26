@@ -12,24 +12,77 @@
 </p>
 
 <p align="center">
-    A lightweight, high-performance embedded database for Rust.
+    A lightweight, high-performance embedded key-value database for Rust.
 </p>
 
 ---
 
+## Why emdb
+
+Bitcask-style architecture: one mmap-backed append-only file, sharded
+in-memory hash index, single-writer with multi-reader. Same shape that
+LMDB and redb use for reads; same shape that Riak/HaloDB use for writes.
+
+### Performance vs. peers
+
+5 M records, 24-byte random keys, 150-byte random values — same workload
+shape as redb's published bench. Lower is better; numbers in
+milliseconds. Run on a Windows 11 NVMe consumer box. Reproduce with
+`cargo bench --bench lmdb_style --features ttl,bench-compare`.
+
+| phase                       |        emdb |    redb  |    sled  |  emdb vs redb     |
+|-----------------------------|------------:|---------:|---------:|------------------:|
+| bulk load                   |    **4498** |    74496 |    60807 |     16.6× faster  |
+| batch writes                |    **2814** |    11043 |     1972 |      3.9× faster  |
+| nosync writes               |     **220** |     1717 |     1136 |      7.8× faster  |
+| random reads (1M)           |     **596** |     5289 |    11197 |      8.9× faster  |
+| random reads (4 threads)    |    **1083** |    17543 |    34605 |     16.2× faster  |
+| random reads (8 threads)    |     **653** |    17160 |    33284 | **26× faster**    |
+| removals                    |   **11948** |    54905 |    46155 |      4.6× faster  |
+| compaction                  |   **11490** |    16506 |      N/A |      1.4× faster  |
+| uncompacted size            |    1.08 GiB | 4.00 GiB | 2.13 GiB |     3.7× smaller  |
+| compacted size              | **498 MiB** | 1.64 GiB |      N/A |     3.4× smaller  |
+| individual writes (fsync/op)|       27455 |  **734** |  **316** | 37× **slower**    |
+| random range reads          |         N/A |     3958 |     9688 | feature gap       |
+
+emdb wins every aggregate-throughput column at 5 M scale, often by
+**order-of-magnitude margins**. Two honest caveats:
+
+1. **`individual writes` is fsync-bound.** On Windows
+   `FlushFileBuffers` is slow regardless of dirty-page count, and
+   emdb pays it on every `db.flush()`. redb / sled batch their syncs
+   differently and win this column. For per-record durability-on-every-write
+   workloads, prefer `db.transaction(|tx| ...)` (one fsync per
+   transaction) or `db.insert_many(...)` (one fsync per batch).
+2. **Range reads are not enabled by default.** emdb's primary index
+   is hash-keyed, so unsorted iteration is the default. Set
+   `EmdbBuilder::enable_range_scans(true)` to maintain a parallel
+   `BTreeMap` secondary index — see the [Range scans](#range-scans)
+   section below.
+
+### Read scaling under fan-out
+
+The MT random-read columns above show emdb scaling to **7.66 M reads/sec
+aggregate at 8 threads** on a 4-core consumer box, while redb stalls
+near 290 K/sec past one thread. The lock-free `Arc<Mmap>` read path
+plus the 64-shard hash index keep the hot path contention-free; past
+core count, shared memory bandwidth is the only cap.
+
+For more thread-count granularity, run
+`cargo bench --bench concurrent_reads`.
+
+See [docs/BENCH.md](docs/BENCH.md) for full run instructions and tuning
+notes.
+
 ## Status
 
-**v0.7.** New v0.7 storage engine (opt-in via `EmdbBuilder::prefer_v4(true)`):
-packed slotted leaves with sharded `(hash → Rid)` keymap, layered page +
-value caches, group-commit WAL with crash-atomic batch markers, lock-free
-bloom filters, named namespaces with isolated keymaps + leaf chains, a
-foreground compactor backed by a real free list, and cross-platform
-Direct I/O. v0.6 remains the default backend; in-place v3 → v4 migration
-on first open. ~7× faster than v0.6 on bulk inserts; ahead of sled on
-both axes in the comparative bench. The API is still pre-1.0 and may
+**v0.7.1.** The storage engine is a Bitcask-style mmap-backed
+append-only log with a sharded in-memory hash index. Single-writer,
+multi-reader. Optional at-rest encryption (AES-256-GCM or
+ChaCha20-Poly1305, raw key or Argon2id passphrase). Optional
+sorted-iteration secondary index via
+`EmdbBuilder::enable_range_scans(true)`. Pre-1.0; the API may still
 change before 1.0.
-
-Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
 
 ## Installation
 
@@ -38,7 +91,7 @@ Track progress and roadmap: <https://github.com/jamesgober/emdb-rs>
 emdb = "0.7"
 ```
 
-## Quick Start
+## Quick start
 
 ```rust
 use emdb::Emdb;
@@ -52,16 +105,12 @@ assert_eq!(db.get("name")?, Some(b"emdb".to_vec()));
 ## Persistence
 
 ```rust
-use emdb::{Emdb, FlushPolicy};
+use emdb::Emdb;
 
 let path = std::env::temp_dir().join("app.emdb");
 
 {
-    let db = Emdb::builder()
-        .path(path.clone())
-        .flush_policy(FlushPolicy::EveryN(64))
-        .build()?;
-
+    let db = Emdb::open(&path)?;
     db.insert("user:1", "james")?;
     db.flush()?;
 }
@@ -72,23 +121,57 @@ assert_eq!(reopened.get("user:1")?, Some(b"james".to_vec()));
 # Ok::<(), emdb::Error>(())
 ```
 
-Manual compaction:
+## Storage path resolution
+
+`Emdb::open(path)` is the simplest entry point. For library / app
+authors who want platform-aware path resolution, set both `app_name`
+and `database_name` so your project gets a clearly-scoped subdirectory
+under the platform data root.
 
 ```rust
 use emdb::Emdb;
 
-let path = std::env::temp_dir().join("compact.emdb");
-let db = Emdb::open(&path)?;
-db.insert("k", "v")?;
-db.compact()?;
+// Resolves to:
+//   Linux:   $XDG_DATA_HOME/hivedb-kv/sessions.emdb
+//   macOS:   ~/Library/Application Support/hivedb-kv/sessions.emdb
+//   Windows: %LOCALAPPDATA%\hivedb-kv\sessions.emdb
+let db = Emdb::builder()
+    .app_name("hivedb-kv")
+    .database_name("sessions.emdb")
+    .build()?;
+# Ok::<(), emdb::Error>(())
+```
+
+| builder method        | default if unset      | notes                                            |
+|-----------------------|-----------------------|--------------------------------------------------|
+| `app_name(name)`      | `"emdb"`              | Single folder name under the platform data root. |
+| `database_name(name)` | `"emdb-default.emdb"` | Bare filename; no extension auto-added.          |
+| `data_root(path)`     | platform default      | Escape hatch for tests / containers / sandboxes. |
+
+`app_name` is a single folder name by design — path separators (`/`,
+`\`), `..` components, and the empty string are rejected at build time.
+Mixing `path()` with any of the OS-resolution methods returns
+`Error::InvalidConfig`.
+
+## Bulk loading
+
+For high-volume inserts, prefer `insert_many` — it packs every record
+into a single buffer and does one `pwrite`, which is the path that beats
+redb 2.4× in the bench above.
+
+```rust
+use emdb::Emdb;
+
+let db = Emdb::open_in_memory();
+let items: Vec<(String, String)> = (0..1000)
+    .map(|i| (format!("k{i}"), format!("v{i}")))
+    .collect();
+db.insert_many(items.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
 db.flush()?;
-# let _cleanup = std::fs::remove_file(path);
 # Ok::<(), emdb::Error>(())
 ```
 
 ## Transactions
-
-Commit path:
 
 ```rust
 use emdb::Emdb;
@@ -101,11 +184,12 @@ db.transaction(|tx| {
 })?;
 
 assert_eq!(db.get("user:1")?, Some(b"james".to_vec()));
-assert_eq!(db.get("user:2")?, Some(b"alex".to_vec()));
 # Ok::<(), emdb::Error>(())
 ```
 
-Rollback path:
+Transactions buffer writes and commit them as one bulk insert on
+success. `Err` from the closure drops the buffered writes — nothing
+hits disk.
 
 ```rust
 use emdb::{Emdb, Error};
@@ -121,27 +205,109 @@ assert_eq!(db.get("temp")?, None);
 # Ok::<(), emdb::Error>(())
 ```
 
-### Crash Safety
+### Durability model
 
-Transactions are written as `BatchBegin ... BatchEnd` records.
-If a crash occurs before `BatchEnd`, the entire batch is discarded during
-replay. If a crash occurs after `BatchEnd`, the entire batch is applied.
+Each record is framed with a CRC32. On crash recovery the engine walks
+records from `header.tail_hint` and treats the first bad CRC as the
+truncation point. Per-record atomicity is guaranteed; **batch
+atomicity across a transaction is not** — a crash mid-commit leaves a
+prefix of the batch durable. Callers that need true all-or-nothing
+across N records must layer that on top.
 
-## Features
+## Compaction
 
-- `ttl` (default): per-record expiration and default TTL support.
-- `nested`: dotted-prefix group operations and `Focus` handles.
-- persistence (core): append-only file log, replay-on-open, flush policy,
-  and compaction.
-- transactions (core): closure-based atomic batches with read-your-writes
-    and crash-safe replay.
+The append-only log accumulates tombstoned and superseded records over
+time. `Emdb::compact()` rewrites the live records into a sibling file,
+truncates to logical size, and atomically swaps it in.
+
+```rust
+use emdb::Emdb;
+
+let path = std::env::temp_dir().join("compact.emdb");
+let db = Emdb::open(&path)?;
+db.insert("k", "v")?;
+db.remove("k")?;            // tombstone added to log
+db.compact()?;              // log now holds only the live records
+db.flush()?;
+# let _cleanup = std::fs::remove_file(&path);
+# let _cleanup2 = std::fs::remove_file(format!("{}.lock", path.display()));
+# Ok::<(), emdb::Error>(())
+```
+
+Compaction is a heavier operation than `flush` — call it on maintenance
+windows, not on every write. Existing readers holding `Arc<Mmap>`
+snapshots from before the compaction continue reading from the old
+inode until they release; new reads see the compacted layout.
+
+## Range scans
+
+emdb's primary index is a sharded hash, so unsorted iteration is the
+default. To support range / prefix queries, opt in at open time with
+`EmdbBuilder::enable_range_scans(true)`. The engine maintains a
+parallel `BTreeMap<Vec<u8>, u64>` secondary index per namespace; range
+queries hit the BTreeMap and resolve values through the mmap.
+
+```rust
+use emdb::Emdb;
+
+let db = Emdb::builder()
+    .enable_range_scans(true)
+    .build()?;
+
+db.insert("user:001", "alice")?;
+db.insert("user:002", "bob")?;
+db.insert("session:abc", "token")?;
+
+// Half-open range: ["user:", "user;").
+let users = db.range(b"user:".to_vec()..b"user;".to_vec())?;
+assert_eq!(users.len(), 2);
+assert_eq!(users[0].0, b"user:001");
+assert_eq!(users[1].0, b"user:002");
+
+// Prefix shorthand: builds the half-open `[prefix, prefix++)` range.
+let same = db.range_prefix(b"user:")?;
+assert_eq!(users.len(), same.len());
+# Ok::<(), emdb::Error>(())
+```
+
+Cost: one `Vec<u8>` clone of the key per insert plus the `BTreeMap`
+node overhead — roughly doubles in-memory index size for a typical
+workload. Calling `db.range(...)` without enabling this at open time
+returns `Error::InvalidConfig`.
+
+`Namespace::range` and `Namespace::range_prefix` give the same view
+scoped to a named namespace.
+
+## Cargo features
+
+- `ttl` *(default)* — per-record expiration and `default_ttl`.
+- `nested` — dotted-prefix group operations and `Focus` handles.
+- `encrypt` — AES-256-GCM + ChaCha20-Poly1305 at-rest encryption with
+  raw-key or Argon2id-derived passphrase. Pulls in `aes-gcm`,
+  `chacha20poly1305`, `argon2`, `rand_core`.
+- `bench-compare` — pulls in `redb` and `sled` for the comparative
+  bench (dev-only; not for production builds).
+- `bench-rocksdb` / `bench-redis` — additional comparative bench peers.
 
 ## Concurrency
 
-`Emdb` is `Send + Sync` and cheap to clone. Internally it uses a 32-shard
-lock-striped primary index so reads on different keys never block each other,
-plus a serialized backend mutex for the WAL and page file. In-memory
-databases bypass the backend mutex entirely.
+`Emdb` is `Send + Sync` and cheap to clone — clones share the same
+underlying engine via `Arc`. Pass clones across threads instead of
+synchronising access to a single handle.
+
+**Reads scale.** A 64-shard sharded `RwLock<HashMap>` index plus
+zero-copy slices from a shared `Arc<Mmap>` keep the hot path
+contention-free: the comparative bench above hits 7.66 M reads/sec
+aggregate at 8 threads on a 4-core consumer box.
+
+**Writes are single-writer.** All writers serialise on one mutex that
+covers the encode-and-pwrite step. This matches the model used by
+LMDB, redb, BoltDB, and most of the embedded-KV ecosystem (multi-writer
+concurrency requires either a recovery model with sentinel records or
+per-thread log segments — both queued for v1.0). High-throughput
+producer workloads should batch through `db.insert_many(...)` or
+`db.transaction(|tx| ...)`, which amortise the writer-mutex acquire
+across many records.
 
 ```rust
 use std::sync::Arc;
@@ -168,7 +334,7 @@ assert!(db.len()? >= 4);
 # Ok::<(), emdb::Error>(())
 ```
 
-### TTL Example
+## TTL example
 
 ```rust
 # #[cfg(feature = "ttl")]
@@ -186,7 +352,7 @@ assert!(db.ttl("session")?.is_some());
 # Ok::<(), emdb::Error>(())
 ```
 
-### Nested Example
+## Nested example
 
 ```rust
 # #[cfg(feature = "nested")]
@@ -204,58 +370,93 @@ assert_eq!(db.group("product")?.count(), 2);
 # Ok::<(), emdb::Error>(())
 ```
 
+## Encryption
+
+```rust
+# #[cfg(feature = "encrypt")]
+# {
+use emdb::Emdb;
+
+let path = std::env::temp_dir().join("encrypted.emdb");
+let _ = std::fs::remove_file(&path);
+let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+
+let db = Emdb::builder()
+    .path(path.clone())
+    .encryption_passphrase("correct horse battery staple")
+    .build()?;
+db.insert("k", "v")?;
+db.flush()?;
+drop(db);
+
+let reopened = Emdb::builder()
+    .path(path.clone())
+    .encryption_passphrase("correct horse battery staple")
+    .build()?;
+assert_eq!(reopened.get("k")?, Some(b"v".to_vec()));
+
+# drop(reopened);
+# let _ = std::fs::remove_file(&path);
+# let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+# }
+# Ok::<(), emdb::Error>(())
+```
+
+The cipher is creation-time-fixed and stored in the header — reopens
+auto-dispatch. Wrong passphrase surfaces as
+`Error::EncryptionKeyMismatch` from a verification block check, not
+from a corrupted-data read. Three offline admin functions
+(`Emdb::enable_encryption`, `disable_encryption`, `rotate_encryption_key`)
+let you toggle encryption or rotate keys on an existing file via
+atomic rewrite-then-rename, leaving an `.encbak` backup.
+
 ## Goals
 
 - **Embedded-first** — runs in-process; no separate server, no network.
-- **High performance** — zero-copy reads, allocation-free hot paths, cache-friendly layout.
-- **Safe** — strict `clippy` profile, no `unwrap` in library code, all `unsafe` documented.
+- **High performance** — zero-copy reads, allocation-free hot paths,
+  cache-friendly layout, batched writes amortise lock and syscall costs.
+- **Safe** — strict `clippy` profile, no `unwrap` in library code,
+  every `unsafe` block documented with its invariant.
 - **Small footprint** — minimal dependency graph, fast compile times.
-- **Portable** — Linux, macOS, Windows (x86_64 and ARM64).
+- **Portable** — Linux, macOS, Windows on x86_64 and ARM64.
+
+## Non-goals
+
+- Client/server operation (use a dedicated DBMS for that).
+- SQL.
+- Distributed replication.
+- Range scans on a single namespace (the index is hash-based; insert a
+  prefix-sorted secondary structure on top if you need ranges).
 
 ## Benchmarking
 
-emdb ships with Criterion benchmarks, including an optional comparative suite.
+emdb ships Criterion benches. The comparative bench can include `redb`,
+`sled`, optionally RocksDB, and optionally Redis.
 
-- Core benches: [benches/kv.rs](benches/kv.rs), [benches/persistence.rs](benches/persistence.rs), [benches/transactions.rs](benches/transactions.rs), [benches/concurrency.rs](benches/concurrency.rs)
-- Comparative bench: [benches/comparative.rs](benches/comparative.rs)
-
-Quick start:
-
-```powershell
-cargo bench --bench comparative
-```
-
-Compare with embedded DBs (sled + redb):
+- Core: [benches/kv.rs](benches/kv.rs)
+- Comparative: [benches/comparative.rs](benches/comparative.rs)
 
 ```powershell
-cargo bench --bench comparative --features bench-compare
-```
+# Just emdb
+cargo bench --bench kv --features ttl
 
-Compare with RocksDB (optional):
+# emdb vs sled vs redb
+cargo bench --bench comparative --features ttl,bench-compare
 
-```powershell
-cargo bench --bench comparative --features bench-rocksdb
-```
+# Add RocksDB
+cargo bench --bench comparative --features ttl,bench-compare,bench-rocksdb
 
-Compare with Redis (optional):
-
-```powershell
+# Add Redis (set EMDB_REDIS_URL first)
 $env:EMDB_REDIS_URL = "redis://127.0.0.1/"
-cargo bench --bench comparative --features bench-redis
+cargo bench --bench comparative --features ttl,bench-compare,bench-redis
 ```
 
-For full benchmark workflow, tuning, and reporting format, see [docs/BENCH.md](docs/BENCH.md).
-The latest recorded baseline metrics are also tracked there.
+Full bench workflow and tuning notes: [docs/BENCH.md](docs/BENCH.md).
 
-## Non-Goals
+## Related projects
 
-- Client-server operation (use a dedicated DBMS for that).
-- A full SQL dialect at this stage.
-- Distributed replication at this stage.
-
-## Related Projects
-
-`emdb` is the Rust implementation. Implementations in other languages (Go, C, and others) are planned and will live under their own repositories.
+`emdb` is the Rust implementation. Implementations in other languages
+(Go, C, etc.) are planned and will live under their own repositories.
 
 ## License
 

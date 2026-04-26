@@ -7,51 +7,25 @@ use std::path::PathBuf;
 #[cfg(feature = "ttl")]
 use std::time::Duration;
 
-use crate::storage::v4::io::IoMode;
-use crate::storage::v4::wal::FlushPolicy as V4FlushPolicy;
-use crate::storage::FlushPolicy;
 use crate::Emdb;
 use crate::Result;
 
-/// Builder for constructing an in-memory [`Emdb`] instance.
-#[derive(Debug, Clone)]
+/// Builder for constructing an [`Emdb`].
+#[derive(Debug, Clone, Default)]
 pub struct EmdbBuilder {
+    pub(crate) path: Option<PathBuf>,
     #[cfg(feature = "ttl")]
     pub(crate) default_ttl: Option<Duration>,
-    pub(crate) path: Option<PathBuf>,
-    pub(crate) flush_policy: FlushPolicy,
-    #[cfg(feature = "mmap")]
-    pub(crate) use_mmap: bool,
-
-    // v0.7 engine opt-in (path-backed only).
-    pub(crate) prefer_v4: bool,
-    pub(crate) page_io_mode: IoMode,
-    pub(crate) wal_io_mode: IoMode,
-    pub(crate) page_cache_pages: usize,
-    pub(crate) value_cache_bytes: usize,
-    pub(crate) bloom_initial_capacity: u64,
-}
-
-impl Default for EmdbBuilder {
-    fn default() -> Self {
-        Self {
-            #[cfg(feature = "ttl")]
-            default_ttl: None,
-            path: None,
-            flush_policy: FlushPolicy::default(),
-            #[cfg(feature = "mmap")]
-            use_mmap: false,
-            prefer_v4: false,
-            page_io_mode: IoMode::Buffered,
-            wal_io_mode: IoMode::Buffered,
-            // 0 = use the cache's own default (8 MB at 4 KB pages).
-            page_cache_pages: 0,
-            // 64 MB default value cache.
-            value_cache_bytes: 64 * 1024 * 1024,
-            // 1 K-key initial bloom; grows lazily as record_count climbs.
-            bloom_initial_capacity: 1_024,
-        }
-    }
+    pub(crate) data_root: Option<PathBuf>,
+    pub(crate) app_name: Option<String>,
+    pub(crate) database_name: Option<String>,
+    pub(crate) enable_range_scans: bool,
+    #[cfg(feature = "encrypt")]
+    pub(crate) encryption_key: Option<[u8; 32]>,
+    #[cfg(feature = "encrypt")]
+    pub(crate) encryption_passphrase: Option<String>,
+    #[cfg(feature = "encrypt")]
+    pub(crate) cipher: Option<crate::encryption::Cipher>,
 }
 
 impl EmdbBuilder {
@@ -61,7 +35,38 @@ impl EmdbBuilder {
         Self::default()
     }
 
-    /// Set the global default TTL for inserted records.
+    /// Set the explicit on-disk path. Mutually exclusive with the
+    /// OS-resolution methods ([`Self::app_name`] / [`Self::database_name`]
+    /// / [`Self::data_root`]).
+    #[must_use]
+    pub fn path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Subfolder name under the OS data root. Default `"emdb"`.
+    #[must_use]
+    pub fn app_name(mut self, name: impl Into<String>) -> Self {
+        self.app_name = Some(name.into());
+        self
+    }
+
+    /// Database filename. Default `"emdb-default.emdb"`.
+    #[must_use]
+    pub fn database_name(mut self, name: impl Into<String>) -> Self {
+        self.database_name = Some(name.into());
+        self
+    }
+
+    /// Override the OS data root. Mostly for tests / containers.
+    #[must_use]
+    pub fn data_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.data_root = Some(root.into());
+        self
+    }
+
+    /// Set a global default TTL applied to inserts using
+    /// [`crate::Ttl::Default`].
     #[cfg(feature = "ttl")]
     #[must_use]
     pub fn default_ttl(mut self, ttl: Duration) -> Self {
@@ -69,107 +74,48 @@ impl EmdbBuilder {
         self
     }
 
-    /// Set a file path for persistent storage.
-    #[must_use]
-    pub fn path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.path = Some(path.into());
-        self
-    }
-
-    /// Set flush durability policy.
-    #[must_use]
-    pub fn flush_policy(mut self, policy: FlushPolicy) -> Self {
-        self.flush_policy = policy;
-        self
-    }
-
-    /// Enable or disable mmap-backed reads for persistent databases.
-    #[cfg(feature = "mmap")]
-    #[must_use]
-    pub fn use_mmap(mut self, on: bool) -> Self {
-        self.use_mmap = on;
-        self
-    }
-
-    /// Opt into the v0.7 engine for path-backed databases.
+    /// Maintain a sorted secondary index alongside the hash index so
+    /// `Emdb::range(...)` and `Namespace::range(...)` can iterate keys
+    /// in lexicographic order. Off by default.
     ///
-    /// When set, [`EmdbBuilder::build`] uses the new packed-leaf storage
-    /// engine for the configured path. New files start in v4 format;
-    /// existing v3 files are migrated in place during open. In-memory
-    /// databases are unaffected — they always use the v0.6 path.
-    ///
-    /// Default: `false` (v0.6 backend) for backward compatibility.
-    /// Operations not yet ported to v0.7 (transactions, named
-    /// namespaces) return [`crate::Error::InvalidConfig`] when this flag
-    /// is set; revert to `prefer_v4(false)` if you need them.
+    /// Cost: one `Vec<u8>` clone of the key per insert plus the
+    /// `BTreeMap` node overhead. Roughly doubles in-memory index size
+    /// for a typical workload. Calling `range()` without enabling this
+    /// at open time returns [`crate::Error::InvalidConfig`].
     #[must_use]
-    pub fn prefer_v4(mut self, on: bool) -> Self {
-        self.prefer_v4 = on;
+    pub fn enable_range_scans(mut self, enabled: bool) -> Self {
+        self.enable_range_scans = enabled;
         self
     }
 
-    /// Set the I/O mode for the page file when [`Self::prefer_v4`] is on.
-    /// See [`IoMode`] for the trade-offs. Buffered is the default.
+    /// Enable AES-256-GCM at-rest encryption with a raw 32-byte key.
+    /// Mutually exclusive with [`Self::encryption_passphrase`].
+    #[cfg(feature = "encrypt")]
     #[must_use]
-    pub fn page_io_mode(mut self, mode: IoMode) -> Self {
-        self.page_io_mode = mode;
+    pub fn encryption_key(mut self, key: [u8; 32]) -> Self {
+        self.encryption_key = Some(key);
         self
     }
 
-    /// Set the I/O mode for the WAL when [`Self::prefer_v4`] is on. On
-    /// Windows, [`IoMode::Direct`] gives single-syscall durability via
-    /// `WRITE_THROUGH`. On Linux/macOS, buffered is usually correct.
+    /// Enable encryption with a key derived from a UTF-8 passphrase
+    /// via Argon2id. Mutually exclusive with [`Self::encryption_key`].
+    #[cfg(feature = "encrypt")]
     #[must_use]
-    pub fn wal_io_mode(mut self, mode: IoMode) -> Self {
-        self.wal_io_mode = mode;
+    pub fn encryption_passphrase(mut self, passphrase: impl Into<String>) -> Self {
+        self.encryption_passphrase = Some(passphrase.into());
         self
     }
 
-    /// Set the v0.7 page-cache size in pages. `0` (default) selects the
-    /// cache's own default (~8 MB at 4 KB pages).
+    /// Override the AEAD cipher. Default is AES-256-GCM; reopens
+    /// inherit the cipher recorded in the file header.
+    #[cfg(feature = "encrypt")]
     #[must_use]
-    pub fn page_cache_pages(mut self, pages: usize) -> Self {
-        self.page_cache_pages = pages;
+    pub fn cipher(mut self, cipher: crate::encryption::Cipher) -> Self {
+        self.cipher = Some(cipher);
         self
     }
 
-    /// Set the v0.7 value-cache size in bytes. `0` disables the cache.
-    /// Default: 64 MB.
-    #[must_use]
-    pub fn value_cache_bytes(mut self, bytes: usize) -> Self {
-        self.value_cache_bytes = bytes;
-        self
-    }
-
-    /// Set the v0.7 bloom-filter initial capacity (in keys). The bloom
-    /// auto-resizes as record_count grows. `0` disables the bloom.
-    /// Default: 1 024.
-    #[must_use]
-    pub fn bloom_initial_capacity(mut self, capacity: u64) -> Self {
-        self.bloom_initial_capacity = capacity;
-        self
-    }
-
-    /// Translate the legacy [`FlushPolicy`] into the v0.7 WAL flush policy.
-    /// `OnEachWrite` and `Manual` map directly; `EveryN(n)` maps to a
-    /// group-commit `max_wait` proportional to `n` (a small heuristic
-    /// that keeps the v0.7 default reasonable without a separate API).
-    pub(crate) fn v4_flush_policy(&self) -> V4FlushPolicy {
-        match self.flush_policy {
-            FlushPolicy::OnEachWrite => V4FlushPolicy::OnEachWrite,
-            FlushPolicy::Manual => V4FlushPolicy::Manual,
-            FlushPolicy::EveryN(_) => V4FlushPolicy::Group {
-                max_wait: std::time::Duration::from_micros(500),
-            },
-        }
-    }
-
-    /// Build an [`Emdb`] instance from the configured options.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when configuration is invalid (for example
-    /// `FlushPolicy::EveryN(0)`) or storage initialization fails.
+    /// Construct the [`Emdb`].
     pub fn build(self) -> Result<Emdb> {
         Emdb::from_builder(self)
     }
@@ -178,51 +124,32 @@ impl EmdbBuilder {
 #[cfg(test)]
 mod tests {
     use super::EmdbBuilder;
-    use crate::FlushPolicy;
 
-    #[test]
-    fn test_build_returns_empty_database() {
-        let db = EmdbBuilder::new().build();
-        assert!(db.is_ok());
-        let db = match db {
-            Ok(db) => db,
-            Err(err) => panic!("build should succeed: {err}"),
-        };
-        assert!(matches!(db.is_empty(), Ok(true)));
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_u128, |d| d.as_nanos());
+        p.push(format!("emdb-builder-{name}-{nanos}.emdb"));
+        p
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        if let Some(parent) = path.parent() {
+            if let Some(stem) = path.file_name().and_then(|n| n.to_str()) {
+                let _ = std::fs::remove_file(parent.join(format!("{stem}.lock")));
+            }
+        }
     }
 
     #[test]
-    fn test_default_builder_builds_database() {
-        let db = EmdbBuilder::default().build();
-        assert!(db.is_ok());
-        let db = match db {
-            Ok(db) => db,
-            Err(err) => panic!("build should succeed: {err}"),
-        };
-        assert!(matches!(db.len(), Ok(0)));
-    }
-
-    #[cfg(feature = "ttl")]
-    #[test]
-    fn test_default_ttl_builder_method_is_usable() {
-        use std::time::Duration;
-
-        let db = EmdbBuilder::new()
-            .default_ttl(Duration::from_secs(1))
-            .build();
-        assert!(db.is_ok());
-        let db = match db {
-            Ok(db) => db,
-            Err(err) => panic!("build should succeed: {err}"),
-        };
-        assert!(matches!(db.is_empty(), Ok(true)));
-    }
-
-    #[test]
-    fn test_flush_policy_every_n_zero_errors() {
-        let db = EmdbBuilder::new()
-            .flush_policy(FlushPolicy::EveryN(0))
-            .build();
-        assert!(db.is_err());
+    fn build_persists_at_explicit_path() {
+        let path = tmp_path("explicit");
+        let result = EmdbBuilder::new().path(path.clone()).build();
+        assert!(result.is_ok(), "build failed: {result:?}");
+        let _db = result.unwrap_or_else(|err| panic!("{err}"));
+        drop(_db);
+        cleanup(&path);
     }
 }

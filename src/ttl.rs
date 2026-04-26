@@ -1,6 +1,7 @@
 // Copyright 2026 James Gober. Licensed under Apache-2.0.
 
 //! TTL types and helpers.
+#![allow(dead_code)]
 
 use std::time::Duration;
 

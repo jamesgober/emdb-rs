@@ -1,46 +1,24 @@
 // Copyright 2026 James Gober. Licensed under Apache-2.0.
 
-//! Named-namespace handle for the v0.7 engine.
-//!
-//! A [`Namespace`] is a cheap clone-able handle scoped to one named
-//! namespace inside a single [`crate::Emdb`] file. Each named namespace has
-//! its own keymap, leaf chain, bloom filter, and record count — they are
-//! fully isolated from each other and from the default namespace, so a
-//! [`Namespace`] insert does not collide with an `Emdb::insert` of the same
-//! key bytes.
-//!
-//! ## Lifetime
-//!
-//! Handles are produced by [`crate::Emdb::namespace`]. They are valid for the
-//! lifetime of the `Emdb` handle they were derived from (cloning the
-//! underlying file lock through the inner `Arc`). Dropping a `Namespace`
-//! does not drop the namespace's data; use
-//! [`crate::Emdb::drop_namespace`] for that.
-//!
-//! ## v0.6 path
-//!
-//! Named namespaces are a v0.7-only feature: the v0.6 page format has no
-//! namespace catalog, so calling [`crate::Emdb::namespace`] on a v0.6
-//! handle returns [`crate::Error::InvalidConfig`].
+//! Named-namespace handle.
 
 use std::sync::Arc;
 
-use crate::db::V07Inner;
-use crate::storage::v4::engine::Engine;
+use crate::db::Inner;
+use crate::storage::Engine;
 use crate::Result;
 
-/// A handle scoped to one named namespace inside a [`crate::Emdb`] file.
-///
-/// Cheap to clone (two `Arc` bumps). Send + Sync — share between threads.
+/// Cheap-clone handle scoped to one named namespace inside a single
+/// [`crate::Emdb`].
 #[derive(Clone)]
 pub struct Namespace {
-    inner: Arc<V07Inner>,
+    inner: Arc<Inner>,
     ns_id: u32,
     name: Box<str>,
 }
 
 impl Namespace {
-    pub(crate) fn new(inner: Arc<V07Inner>, ns_id: u32, name: Box<str>) -> Self {
+    pub(crate) fn new(inner: Arc<Inner>, ns_id: u32, name: Box<str>) -> Self {
         Self { inner, ns_id, name }
     }
 
@@ -48,60 +26,53 @@ impl Namespace {
         &self.inner.engine
     }
 
-    /// The name this handle was created for.
+    /// Name this handle was created for.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Insert or replace a key/value pair in this namespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns I/O errors from the WAL or page store.
-    pub fn insert(&self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
+    /// Insert or replace a key/value pair.
+    pub fn insert(
+        &self,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Result<()> {
         let key = key.into();
         let value = value.into();
         self.engine().insert(self.ns_id, &key, &value, 0)
     }
 
-    /// Fetch a value by key.
-    ///
-    /// # Errors
-    ///
-    /// Returns I/O errors from the page store.
-    pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
-        let key = key.as_ref();
-        let cached = self.engine().get(self.ns_id, key)?;
-        Ok(cached.map(|c| c.value.to_vec()))
+    /// Insert many key/value pairs in one writer-locked pass.
+    pub fn insert_many<I, K, V>(&self, items: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let owned: Vec<(Vec<u8>, Vec<u8>, u64)> = items
+            .into_iter()
+            .map(|(k, v)| (k.as_ref().to_vec(), v.as_ref().to_vec(), 0))
+            .collect();
+        self.engine().insert_many(self.ns_id, owned)
     }
 
-    /// Remove a key. Returns the previous value, if any.
-    ///
-    /// # Errors
-    ///
-    /// Returns I/O errors from the WAL or page store.
+    /// Fetch a value by key.
+    pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
+        self.engine().get(self.ns_id, key.as_ref())
+    }
+
+    /// Remove a key, returning the previous value if any.
     pub fn remove(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
-        let key = key.as_ref();
-        let previous = self.engine().get(self.ns_id, key)?;
-        let _did = self.engine().remove(self.ns_id, key)?;
-        Ok(previous.map(|c| c.value.to_vec()))
+        self.engine().remove(self.ns_id, key.as_ref())
     }
 
     /// Returns whether the key has a live record.
-    ///
-    /// # Errors
-    ///
-    /// Returns I/O errors from the page store.
     pub fn contains_key(&self, key: impl AsRef<[u8]>) -> Result<bool> {
         Ok(self.engine().get(self.ns_id, key.as_ref())?.is_some())
     }
 
-    /// Number of live records in this namespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::LockPoisoned`] on a poisoned lock.
+    /// Live record count.
     pub fn len(&self) -> Result<usize> {
         let count = self.engine().record_count(self.ns_id)?;
         usize::try_from(count).map_err(|_| {
@@ -109,33 +80,17 @@ impl Namespace {
         })
     }
 
-    /// Returns whether the namespace has zero live records.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::len`].
+    /// True iff the namespace has zero live records.
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
     }
 
-    /// Drop every record in this namespace. The namespace itself remains
-    /// registered in the catalog; subsequent inserts allocate fresh leaf
-    /// pages.
-    ///
-    /// # Errors
-    ///
-    /// Returns I/O errors from the WAL or page store.
+    /// Drop every record in this namespace.
     pub fn clear(&self) -> Result<()> {
         self.engine().clear_namespace(self.ns_id)
     }
 
-    /// Materialise every live record as `(key, value)` pairs. Walks the
-    /// namespace's leaf chain so the result reflects what is on disk plus
-    /// the latest in-memory updates.
-    ///
-    /// # Errors
-    ///
-    /// Returns I/O errors from the page store.
+    /// Materialise every live record as `(key, value)` pairs.
     pub fn iter(&self) -> Result<NamespaceIter> {
         let snapshot = self.engine().collect_records(self.ns_id)?;
         Ok(NamespaceIter {
@@ -143,16 +98,41 @@ impl Namespace {
         })
     }
 
-    /// Materialise every live key. Convenience wrapper over [`Self::iter`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::iter`].
+    /// Iterate every live key.
     pub fn keys(&self) -> Result<NamespaceKeyIter> {
         let snapshot = self.engine().collect_records(self.ns_id)?;
         Ok(NamespaceKeyIter {
             inner: snapshot.into_iter(),
         })
+    }
+
+    /// Range-scan keys in this namespace, returning `(key, value)`
+    /// pairs in lexicographic order. Requires the database to have
+    /// been opened with [`crate::EmdbBuilder::enable_range_scans`]`(true)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidConfig`] if range scans were not
+    /// enabled at open time.
+    pub fn range<R>(&self, range: R) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
+    where
+        R: std::ops::RangeBounds<Vec<u8>>,
+    {
+        self.engine().range_scan(self.ns_id, range)
+    }
+
+    /// Range-scan all keys with a given prefix in this namespace.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::range`].
+    pub fn range_prefix(&self, prefix: impl AsRef<[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let prefix = prefix.as_ref();
+        let start = prefix.to_vec();
+        match crate::db::next_prefix(prefix) {
+            Some(end) => self.range(start..end),
+            None => self.range(start..),
+        }
     }
 }
 
