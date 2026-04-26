@@ -28,10 +28,10 @@ use std::sync::{Arc, RwLock};
 use memmap2::Mmap;
 
 #[cfg(feature = "encrypt")]
-use crate::storage::format::{OwnedRecord, NONCE_LEN};
+use crate::storage::format::FLAG_CIPHER_CHACHA20;
 use crate::storage::format::{self, RecordView, FLAG_ENCRYPTED};
 #[cfg(feature = "encrypt")]
-use crate::storage::format::FLAG_CIPHER_CHACHA20;
+use crate::storage::format::{OwnedRecord, NONCE_LEN};
 use crate::storage::index::Index;
 use crate::storage::store::{Header, Store};
 use crate::{Error, Result};
@@ -179,8 +179,7 @@ impl Engine {
         // before opening the store with the right key. This branch is
         // entirely cfg-gated.
         #[cfg(feature = "encrypt")]
-        let (resolved_key, fresh_salt, resolved_cipher) =
-            Self::resolve_encryption(&config)?;
+        let (resolved_key, fresh_salt, resolved_cipher) = Self::resolve_encryption(&config)?;
 
         #[cfg(feature = "encrypt")]
         let flags = {
@@ -240,10 +239,7 @@ impl Engine {
 
         // Always create the default namespace runtime.
         {
-            let mut guard = engine
-                .namespaces
-                .write()
-                .map_err(|_| Error::LockPoisoned)?;
+            let mut guard = engine.namespaces.write().map_err(|_| Error::LockPoisoned)?;
             let _existing = guard.insert(
                 DEFAULT_NAMESPACE_ID,
                 Arc::new(NamespaceRuntime::new(range_scans_enabled)),
@@ -274,8 +270,7 @@ impl Engine {
         // Peek the header (if the file exists) so we can read the salt
         // for passphrase mode and the cipher bit for both modes.
         let peeked = peek_header(&config.path)?;
-        let on_disk_cipher =
-            peeked.map(|h| Self::cipher_from_flags(h.flags));
+        let on_disk_cipher = peeked.map(|h| Self::cipher_from_flags(h.flags));
 
         // Cipher: explicit override OR on-disk cipher OR default. If
         // the user supplied an explicit choice that disagrees with the
@@ -417,11 +412,7 @@ impl Engine {
 
     /// Decode a plaintext record at `bytes[cursor..]`. Returns the
     /// decoded action plus the next cursor to resume from.
-    fn decode_plaintext_at(
-        &self,
-        bytes: &[u8],
-        cursor: u64,
-    ) -> Result<Option<RecoveryDecoded>> {
+    fn decode_plaintext_at(&self, bytes: &[u8], cursor: u64) -> Result<Option<RecoveryDecoded>> {
         let start = cursor as usize;
         let decoded = format::try_decode_record(bytes, start, cursor)?;
         match decoded {
@@ -449,11 +440,7 @@ impl Engine {
     /// Decode an encrypted record at `bytes[cursor..]` via the engine's
     /// AEAD context.
     #[cfg(feature = "encrypt")]
-    fn decode_encrypted_at(
-        &self,
-        bytes: &[u8],
-        cursor: u64,
-    ) -> Result<Option<RecoveryDecoded>> {
+    fn decode_encrypted_at(&self, bytes: &[u8], cursor: u64) -> Result<Option<RecoveryDecoded>> {
         let ctx = match self.encryption.as_ref() {
             Some(c) => Arc::clone(c),
             None => {
@@ -485,11 +472,7 @@ impl Engine {
     }
 
     #[cfg(not(feature = "encrypt"))]
-    fn decode_encrypted_at(
-        &self,
-        bytes: &[u8],
-        cursor: u64,
-    ) -> Result<Option<RecoveryDecoded>> {
+    fn decode_encrypted_at(&self, bytes: &[u8], cursor: u64) -> Result<Option<RecoveryDecoded>> {
         // No encryption support compiled in; this path should be
         // unreachable, but stay defensive.
         self.decode_plaintext_at(bytes, cursor)
@@ -741,13 +724,7 @@ impl Engine {
         Ok(())
     }
 
-    fn append_insert(
-        &self,
-        ns_id: u32,
-        key: &[u8],
-        value: &[u8],
-        expires_at: u64,
-    ) -> Result<u64> {
+    fn append_insert(&self, ns_id: u32, key: &[u8], value: &[u8], expires_at: u64) -> Result<u64> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
             // Build the plaintext payload.
@@ -797,11 +774,7 @@ impl Engine {
 
     /// Fetch value + expires_at for a key in one pass. Used by the TTL
     /// path in `Emdb::get` so it doesn't have to make two record reads.
-    pub(crate) fn get_with_meta(
-        &self,
-        ns_id: u32,
-        key: &[u8],
-    ) -> Result<Option<(Vec<u8>, u64)>> {
+    pub(crate) fn get_with_meta(&self, ns_id: u32, key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
         let ns = self.namespace(ns_id)?;
         let key_hash = Index::hash_key(key);
         let offset = match ns.index.get(key_hash, key)? {
@@ -830,7 +803,15 @@ impl Engine {
                 },
             )?;
             return match result {
-                Some((OwnedRecord::Insert { key, value, expires_at, .. }, _)) => {
+                Some((
+                    OwnedRecord::Insert {
+                        key,
+                        value,
+                        expires_at,
+                        ..
+                    },
+                    _,
+                )) => {
                     if key.as_slice() == expected_key {
                         Ok(Some((value, expires_at)))
                     } else {
@@ -844,7 +825,12 @@ impl Engine {
         let decoded = format::try_decode_record(bytes, offset as usize, offset)?;
         match decoded {
             Some(d) => match d.view {
-                RecordView::Insert { key, value, expires_at, .. } => {
+                RecordView::Insert {
+                    key,
+                    value,
+                    expires_at,
+                    ..
+                } => {
                     if key == expected_key {
                         Ok(Some((value.to_vec(), expires_at)))
                     } else {
@@ -1178,9 +1164,15 @@ impl Engine {
                         ctx.decrypt(&input)
                     },
                 )? {
-                    Some((OwnedRecord::Insert { key, value, expires_at, .. }, _)) => {
-                        Some((key, value, expires_at))
-                    }
+                    Some((
+                        OwnedRecord::Insert {
+                            key,
+                            value,
+                            expires_at,
+                            ..
+                        },
+                        _,
+                    )) => Some((key, value, expires_at)),
                     _ => None,
                 }
             } else {
@@ -1196,16 +1188,16 @@ impl Engine {
         Ok(out)
     }
 
-    fn decode_plaintext_into_triple(
-        bytes: &[u8],
-        offset: u64,
-    ) -> Result<Option<RecordSnapshot>> {
+    fn decode_plaintext_into_triple(bytes: &[u8], offset: u64) -> Result<Option<RecordSnapshot>> {
         let decoded = format::try_decode_record(bytes, offset as usize, offset)?;
         Ok(match decoded {
             Some(d) => match d.view {
-                RecordView::Insert { key, value, expires_at, .. } => {
-                    Some((key.to_vec(), value.to_vec(), expires_at))
-                }
+                RecordView::Insert {
+                    key,
+                    value,
+                    expires_at,
+                    ..
+                } => Some((key.to_vec(), value.to_vec(), expires_at)),
                 _ => None,
             },
             None => None,
@@ -1221,7 +1213,10 @@ impl Engine {
         }
         // Lookup first.
         {
-            let guard = self.namespace_names.read().map_err(|_| Error::LockPoisoned)?;
+            let guard = self
+                .namespace_names
+                .read()
+                .map_err(|_| Error::LockPoisoned)?;
             if let Some(id) = guard.get(name) {
                 return Ok(*id);
             }
@@ -1230,7 +1225,10 @@ impl Engine {
         // We persist BEFORE inserting into the in-memory map so that a
         // crash between the two leaves no in-memory entry without a
         // corresponding on-disk record.
-        let mut name_guard = self.namespace_names.write().map_err(|_| Error::LockPoisoned)?;
+        let mut name_guard = self
+            .namespace_names
+            .write()
+            .map_err(|_| Error::LockPoisoned)?;
         if let Some(id) = name_guard.get(name) {
             return Ok(*id);
         }
@@ -1241,7 +1239,10 @@ impl Engine {
         let _record_offset = self.append_namespace_name(id, name)?;
         let _ = name_guard.insert(name.to_string(), id);
         let mut runtimes = self.namespaces.write().map_err(|_| Error::LockPoisoned)?;
-        let _ = runtimes.insert(id, Arc::new(NamespaceRuntime::new(self.range_scans_enabled)));
+        let _ = runtimes.insert(
+            id,
+            Arc::new(NamespaceRuntime::new(self.range_scans_enabled)),
+        );
         Ok(id)
     }
 
@@ -1274,7 +1275,10 @@ impl Engine {
         if name.is_empty() {
             return Err(Error::InvalidConfig("default namespace cannot be dropped"));
         }
-        let mut name_guard = self.namespace_names.write().map_err(|_| Error::LockPoisoned)?;
+        let mut name_guard = self
+            .namespace_names
+            .write()
+            .map_err(|_| Error::LockPoisoned)?;
         let id = match name_guard.remove(name) {
             Some(id) => id,
             None => return Ok(false),
@@ -1287,7 +1291,10 @@ impl Engine {
     /// Enumerate every live namespace as `(id, name)`. The default
     /// namespace is reported with name `""`.
     pub(crate) fn list_namespaces(&self) -> Result<Vec<(u32, String)>> {
-        let guard = self.namespace_names.read().map_err(|_| Error::LockPoisoned)?;
+        let guard = self
+            .namespace_names
+            .read()
+            .map_err(|_| Error::LockPoisoned)?;
         let mut out: Vec<(u32, String)> = vec![(DEFAULT_NAMESPACE_ID, String::new())];
         for (name, id) in guard.iter() {
             out.push((*id, name.clone()));

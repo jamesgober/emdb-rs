@@ -33,11 +33,7 @@ impl Namespace {
     }
 
     /// Insert or replace a key/value pair.
-    pub fn insert(
-        &self,
-        key: impl Into<Vec<u8>>,
-        value: impl Into<Vec<u8>>,
-    ) -> Result<()> {
+    pub fn insert(&self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
         let key = key.into();
         let value = value.into();
         self.engine().insert(self.ns_id, &key, &value, 0)
