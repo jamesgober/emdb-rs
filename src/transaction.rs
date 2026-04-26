@@ -24,10 +24,7 @@ use crate::ttl::{expires_from_ttl, now_unix_millis, Ttl};
 
 /// Staged write inside a transaction.
 enum Staged {
-    Insert {
-        value: Vec<u8>,
-        expires_at: u64,
-    },
+    Insert { value: Vec<u8>, expires_at: u64 },
     Remove,
 }
 
@@ -46,11 +43,7 @@ impl<'db> Transaction<'db> {
     }
 
     /// Stage an insert.
-    pub fn insert(
-        &mut self,
-        key: impl Into<Vec<u8>>,
-        value: impl Into<Vec<u8>>,
-    ) -> Result<()> {
+    pub fn insert(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
         let key = key.into();
         let value = value.into();
         #[cfg(feature = "ttl")]

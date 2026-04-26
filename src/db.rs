@@ -192,11 +192,7 @@ impl Emdb {
     // ---- core key/value operations ----
 
     /// Insert or replace a key/value pair.
-    pub fn insert(
-        &self,
-        key: impl Into<Vec<u8>>,
-        value: impl Into<Vec<u8>>,
-    ) -> Result<()> {
+    pub fn insert(&self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
         let key = key.into();
         let value = value.into();
         #[cfg(feature = "ttl")]
@@ -261,9 +257,8 @@ impl Emdb {
     /// Number of live records in the default namespace.
     pub fn len(&self) -> Result<usize> {
         let count = self.inner.engine.record_count(DEFAULT_NAMESPACE_ID)?;
-        usize::try_from(count).map_err(|_| {
-            crate::Error::InvalidConfig("record count exceeds usize on this target")
-        })
+        usize::try_from(count)
+            .map_err(|_| crate::Error::InvalidConfig("record count exceeds usize on this target"))
     }
 
     /// Returns whether the database has zero live records.
@@ -459,10 +454,7 @@ impl Emdb {
     #[cfg(feature = "ttl")]
     fn compute_default_expires_at(&self) -> Result<u64> {
         let now = now_unix_millis();
-        Ok(
-            expires_from_ttl(Ttl::Default, self.inner.default_ttl, now)?
-                .unwrap_or(0),
-        )
+        Ok(expires_from_ttl(Ttl::Default, self.inner.default_ttl, now)?.unwrap_or(0))
     }
 
     // ---- namespace operations ----
@@ -514,19 +506,13 @@ impl Emdb {
 
     /// Convert an unencrypted database file to encrypted in place.
     #[cfg(feature = "encrypt")]
-    pub fn enable_encryption(
-        path: impl AsRef<Path>,
-        target: EncryptionInput,
-    ) -> Result<()> {
+    pub fn enable_encryption(path: impl AsRef<Path>, target: EncryptionInput) -> Result<()> {
         crate::encryption_admin::enable_encryption(path, target)
     }
 
     /// Convert an encrypted database file to unencrypted in place.
     #[cfg(feature = "encrypt")]
-    pub fn disable_encryption(
-        path: impl AsRef<Path>,
-        current: EncryptionInput,
-    ) -> Result<()> {
+    pub fn disable_encryption(path: impl AsRef<Path>, current: EncryptionInput) -> Result<()> {
         crate::encryption_admin::disable_encryption(path, current)
     }
 

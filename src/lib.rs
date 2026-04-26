@@ -89,6 +89,18 @@
 #![deny(clippy::print_stderr)]
 #![deny(clippy::dbg_macro)]
 #![deny(clippy::unreachable)]
+// Test code is allowed to use the convenience panickers — the strict
+// lint profile above is for production library code, not assertion
+// scaffolding inside `#[cfg(test)] mod tests` blocks.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::print_stdout,
+        clippy::print_stderr
+    )
+)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod builder;
@@ -114,7 +126,7 @@ pub use db::Emdb;
 pub use encryption::{Cipher, EncryptionInput};
 pub use error::{Error, Result};
 pub use namespace::{Namespace, NamespaceIter, NamespaceKeyIter};
-pub use transaction::Transaction;
 #[cfg(feature = "nested")]
 pub use nested::Focus;
+pub use transaction::Transaction;
 pub use ttl::Ttl;

@@ -109,7 +109,8 @@ impl Header {
             .copy_from_slice(&self.created_at.to_le_bytes());
         buf[format::TAIL_HINT_OFFSET..format::TAIL_HINT_OFFSET + 8]
             .copy_from_slice(&self.tail_hint.to_le_bytes());
-        buf[format::ENCRYPTION_SALT_OFFSET..format::ENCRYPTION_SALT_OFFSET + format::ENCRYPTION_SALT_LEN]
+        buf[format::ENCRYPTION_SALT_OFFSET
+            ..format::ENCRYPTION_SALT_OFFSET + format::ENCRYPTION_SALT_LEN]
             .copy_from_slice(&self.encryption_salt);
         buf[format::ENCRYPTION_VERIFY_OFFSET
             ..format::ENCRYPTION_VERIFY_OFFSET + format::ENCRYPTION_VERIFY_LEN]
@@ -422,7 +423,7 @@ impl Store {
         if needed > writer.capacity {
             self.grow_locked(&mut writer, needed)?;
         }
-        pwrite_all(&mut writer.file,offset, framed)?;
+        pwrite_all(&mut writer.file, offset, framed)?;
         writer.tail = needed;
         self.tail_atomic.store(needed, Ordering::Release);
         Ok(offset)
@@ -479,7 +480,9 @@ impl Store {
         if needed > writer.capacity {
             self.grow_locked(&mut writer, needed)?;
         }
-        let WriterState { file, encode_buf, .. } = &mut *writer;
+        let WriterState {
+            file, encode_buf, ..
+        } = &mut *writer;
         pwrite_all(file, offset, encode_buf.as_slice())?;
         writer.tail = needed;
         self.tail_atomic.store(needed, Ordering::Release);
@@ -523,7 +526,9 @@ impl Store {
         if needed > writer.capacity {
             self.grow_locked(&mut writer, needed)?;
         }
-        let WriterState { file, encode_buf, .. } = &mut *writer;
+        let WriterState {
+            file, encode_buf, ..
+        } = &mut *writer;
         pwrite_all(file, base_offset, encode_buf.as_slice())?;
         writer.tail = needed;
         self.tail_atomic.store(needed, Ordering::Release);
@@ -597,9 +602,7 @@ impl Store {
         // `self.path`. On Windows this is required before `rename` can
         // overwrite. Existing reader-side mmaps stay alive via their
         // own `Arc<Mmap>` clones — the kernel keeps the inode pinned.
-        let placeholder = OpenOptions::new()
-            .read(true)
-            .open(replacement_path)?;
+        let placeholder = OpenOptions::new().read(true).open(replacement_path)?;
         let old_file = std::mem::replace(&mut writer.file, placeholder);
         drop(old_file);
 
@@ -607,10 +610,7 @@ impl Store {
         std::fs::rename(replacement_path, &self.path)?;
 
         // Reopen the writer's File handle on the (now new) original path.
-        let new_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)?;
+        let new_file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         writer.file = new_file;
 
         // Re-read the new header to get its tail_hint and capacity.
@@ -622,7 +622,8 @@ impl Store {
 
         writer.tail = new_header.tail_hint;
         writer.capacity = new_len;
-        self.tail_atomic.store(new_header.tail_hint, Ordering::Release);
+        self.tail_atomic
+            .store(new_header.tail_hint, Ordering::Release);
 
         // Refresh the in-memory header.
         let mut hdr = self.header.write().map_err(|_| Error::LockPoisoned)?;
@@ -774,7 +775,10 @@ mod tests {
                 .expect("append");
         }
         let tail = store.tail();
-        assert!(tail > INITIAL_CAPACITY, "should have grown past initial capacity");
+        assert!(
+            tail > INITIAL_CAPACITY,
+            "should have grown past initial capacity"
+        );
 
         drop(store);
         let _ = std::fs::remove_file(&path);

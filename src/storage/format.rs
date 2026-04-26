@@ -30,8 +30,7 @@
 use crate::{Error, Result};
 
 /// On-disk magic at the start of every file. 16 bytes, padded with zero.
-pub(crate) const MAGIC: [u8; 16] =
-    *b"EMDB\0\0\0\0\0\0\0\0\0\0\0\0";
+pub(crate) const MAGIC: [u8; 16] = *b"EMDB\0\0\0\0\0\0\0\0\0\0\0\0";
 /// File-format version. Bumped on every breaking format change.
 pub(crate) const FORMAT_VERSION: u32 = 1;
 /// Header occupies a single 4 KB block at the start of the file.
@@ -513,7 +512,9 @@ mod tests {
     #[test]
     fn round_trip_insert_record() {
         let bytes = build_unencrypted_insert(0, b"alpha", b"one", 0);
-        let decoded = try_decode_record(&bytes, 0, 0).expect("decode ok").expect("some");
+        let decoded = try_decode_record(&bytes, 0, 0)
+            .expect("decode ok")
+            .expect("some");
         match decoded.view {
             RecordView::Insert {
                 ns_id,
@@ -546,7 +547,10 @@ mod tests {
         // Flip a bit in the value field.
         bytes[12] ^= 1;
         let decoded = try_decode_record(&bytes, 0, 0).expect("decode ok");
-        assert!(decoded.is_none(), "CRC mismatch must surface as truncation point");
+        assert!(
+            decoded.is_none(),
+            "CRC mismatch must surface as truncation point"
+        );
     }
 
     #[test]
@@ -566,7 +570,7 @@ mod tests {
     fn unknown_tag_reports_corruption() {
         let mut bytes = build_unencrypted_insert(0, b"k", b"v", 0);
         bytes[4] = 0x42; // unknown tag, but legal flags
-        // recompute CRC so the only error is the unknown tag
+                         // recompute CRC so the only error is the unknown tag
         let len = read_u32(&bytes, 0).unwrap() as usize;
         let crc = record_crc(&bytes[4..4 + len]);
         let crc_offset = 4 + len;

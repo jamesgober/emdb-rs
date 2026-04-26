@@ -182,8 +182,7 @@ fn bench_emdb(elements: usize) -> Vec<PhaseResult> {
             let (key, value) = random_pair(&mut rng);
             chunk.push((key.to_vec(), value));
             if chunk.len() == BULK_INSERT_CHUNK {
-                db.insert_many(chunk.drain(..))
-                    .expect("emdb insert_many");
+                db.insert_many(chunk.drain(..)).expect("emdb insert_many");
             }
         }
         if !chunk.is_empty() {
@@ -212,7 +211,8 @@ fn bench_emdb(elements: usize) -> Vec<PhaseResult> {
             let (key, value) = random_pair(&mut rng);
             chunk.push((key.to_vec(), value));
         }
-        db.insert_many(chunk.into_iter()).expect("emdb batch insert");
+        db.insert_many(chunk.into_iter())
+            .expect("emdb batch insert");
         db.flush().expect("emdb batch flush");
     }
     results.push(PhaseResult::duration("batch writes", start.elapsed()));
@@ -227,8 +227,7 @@ fn bench_emdb(elements: usize) -> Vec<PhaseResult> {
     results.push(PhaseResult::duration("nosync writes", start.elapsed()));
     db.flush().expect("emdb post-nosync flush");
 
-    let total_elements =
-        elements + INDIVIDUAL_WRITES + BATCH_WRITES * BATCH_SIZE + NOSYNC_WRITES;
+    let total_elements = elements + INDIVIDUAL_WRITES + BATCH_WRITES * BATCH_SIZE + NOSYNC_WRITES;
 
     // Phase: len()
     let start = Instant::now();
@@ -404,8 +403,7 @@ fn bench_redb(elements: usize) -> Vec<PhaseResult> {
     }
     results.push(PhaseResult::duration("nosync writes", start.elapsed()));
 
-    let total_elements =
-        elements + INDIVIDUAL_WRITES + BATCH_WRITES * BATCH_SIZE + NOSYNC_WRITES;
+    let total_elements = elements + INDIVIDUAL_WRITES + BATCH_WRITES * BATCH_SIZE + NOSYNC_WRITES;
 
     // len()
     let start = Instant::now();
@@ -545,10 +543,7 @@ fn bench_sled(elements: usize) -> Vec<PhaseResult> {
     cleanup_dir(&path);
     let mut results = Vec::new();
 
-    let db = sled::Config::new()
-        .path(&path)
-        .open()
-        .expect("sled open");
+    let db = sled::Config::new().path(&path).open().expect("sled open");
     let mut rng = make_rng();
 
     // Bulk load — one batch flush at the end.
@@ -599,8 +594,7 @@ fn bench_sled(elements: usize) -> Vec<PhaseResult> {
     results.push(PhaseResult::duration("nosync writes", start.elapsed()));
     db.flush().expect("sled post-nosync flush");
 
-    let total_elements =
-        elements + INDIVIDUAL_WRITES + BATCH_WRITES * BATCH_SIZE + NOSYNC_WRITES;
+    let total_elements = elements + INDIVIDUAL_WRITES + BATCH_WRITES * BATCH_SIZE + NOSYNC_WRITES;
 
     // len() — sled's len walks every key.
     let start = Instant::now();
@@ -726,7 +720,9 @@ fn directory_size(path: &Path) -> u64 {
 
 fn main() {
     let elements = bulk_elements();
-    println!("emdb lmdb-style bench: {elements} bulk records, {KEY_SIZE}B keys, {VALUE_SIZE}B values\n");
+    println!(
+        "emdb lmdb-style bench: {elements} bulk records, {KEY_SIZE}B keys, {VALUE_SIZE}B values\n"
+    );
 
     println!("running emdb...");
     let emdb_results = bench_emdb(elements);
@@ -758,10 +754,7 @@ fn print_table(emdb: &[PhaseResult], redb: &[PhaseResult], sled: &[PhaseResult])
             "| {:<28} | {:>14} | {:>14} | {:>14} |",
             "phase", "emdb", "redb", "sled"
         );
-        println!(
-            "|{:-<30}|{:->16}|{:->16}|{:->16}|",
-            "", "", "", ""
-        );
+        println!("|{:-<30}|{:->16}|{:->16}|{:->16}|", "", "", "", "");
     } else {
         println!("| {:<28} | {:>14} |", "phase", "emdb");
         println!("|{:-<30}|{:->16}|", "", "");

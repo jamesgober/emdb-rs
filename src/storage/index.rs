@@ -154,7 +154,6 @@ impl Index {
         }
     }
 
-
     /// Replace the offset for `key`, with a resolver callback that the
     /// index uses to disambiguate hash collisions. The resolver is
     /// invoked only when an existing `Single` slot needs to be checked
@@ -207,10 +206,8 @@ impl Index {
                             Ok(Some(existing))
                         }
                         Some(existing_key) => {
-                            *slot = Slot::Multi(vec![
-                                (existing_key, existing),
-                                (key.to_vec(), offset),
-                            ]);
+                            *slot =
+                                Slot::Multi(vec![(existing_key, existing), (key.to_vec(), offset)]);
                             Ok(None)
                         }
                         None => {
@@ -347,7 +344,10 @@ mod tests {
     fn insert_and_get_round_trip() {
         let idx = Index::new();
         let h = Index::hash_key(b"alpha");
-        assert!(idx.replace(h, b"alpha", 100, no_resolver).unwrap().is_none());
+        assert!(idx
+            .replace(h, b"alpha", 100, no_resolver)
+            .unwrap()
+            .is_none());
         assert_eq!(idx.get(h, b"alpha").unwrap(), Some(100));
     }
 
@@ -394,7 +394,9 @@ mod tests {
         for i in 0_u32..200 {
             let key = format!("k{i:04}");
             let h = Index::hash_key(key.as_bytes());
-            let _ = idx.replace(h, key.as_bytes(), i as u64, no_resolver).unwrap();
+            let _ = idx
+                .replace(h, key.as_bytes(), i as u64, no_resolver)
+                .unwrap();
         }
         assert_eq!(idx.len().unwrap(), 200);
     }
@@ -405,7 +407,9 @@ mod tests {
         for i in 0_u32..50 {
             let key = format!("k{i}");
             let h = Index::hash_key(key.as_bytes());
-            let _ = idx.replace(h, key.as_bytes(), i as u64, no_resolver).unwrap();
+            let _ = idx
+                .replace(h, key.as_bytes(), i as u64, no_resolver)
+                .unwrap();
         }
         idx.clear().unwrap();
         assert_eq!(idx.len().unwrap(), 0);
