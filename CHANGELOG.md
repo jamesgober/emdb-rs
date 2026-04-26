@@ -4,430 +4,333 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/jamesgober/emdb-rs/compare/v0.7.0...HEAD)
+## [0.7.1](https://github.com/jamesgober/emdb-rs/compare/v0.7.0...v0.7.1) — 2026-04-25
 
+### Major change — storage engine rewritten as Bitcask-style mmap + append-only log
 
+The slotted-leaf-page + WAL + page-cache + value-cache + bloom-filter
+backend from v0.6 has been entirely replaced with a single
+mmap-backed append-only file plus a sharded in-memory hash index.
+This is the same shape used by Bitcask / HaloDB / Riak; the read path
+is also the shape LMDB and redb use. The on-disk format resets to
+**v1** of the new layout — v0.6 / v0.7-page databases must be exported
+and reimported (the [`crate::Emdb::enable_encryption`] / `disable` /
+`rotate` admin tools follow the same rewrite-then-rename shape and
+can serve as a reference).
 
+**Architecture.** One file per database. Bytes 0..4096 are the header
+(magic, version, flags, encryption salt + verify block, header CRC).
+Records are length-prefix + tag + body + CRC32, appended at the
+tail. Reads slice directly from a kernel-managed `Arc<Mmap>` (zero
+copy). Writes go through a single writer mutex and use `pwrite`
+(Unix) / `seek + write_all` (Windows). File growth swaps the mmap
+under an `Arc` so old readers continue with the old mapping until
+they release. Crash recovery scans framed records from
+`header.tail_hint`, validates each CRC, and treats the first failure
+as the truncation point.
 
-## [0.7.0](https://github.com/jamesgober/emdb-rs/compare/v0.6.0...v0.7.0) — 2026-04-25
+**Index.** 64-shard `RwLock<HashMap<u64, Slot>>` keyed by FxHash with
+an identity-hashing inner hasher (no double-hashing on lookup).
+`Slot::Single(u64)` for the common case (one offset per hash);
+`Slot::Multi(Vec<(Vec<u8>, u64)>)` for hash collisions, disambiguated
+by exact key compare. Disambiguation on insert uses a callback into
+the engine so the hot path never allocates the key bytes for
+non-colliding entries.
 
-### Added — v0.7 Phase A–G scaffolding (engine wiring still pending)
+### Added — Range scans (opt-in BTreeMap secondary index)
 
-The v0.7 redesign builds out its components alongside v0.6 so each subsystem
-can be tested in isolation before the integration in Phase H. The v0.6 code
-paths and public API are unchanged in this checkpoint.
+The hash index doesn't support sorted iteration, so range / prefix
+queries are now an opt-in feature.
+`EmdbBuilder::enable_range_scans(true)` activates a parallel
+`RwLock<BTreeMap<Vec<u8>, u64>>` secondary index per namespace.
+Insert / replace / remove paths update both indexes; the recovery
+scan rebuilds the BTreeMap from records on reopen, and compaction
+preserves it through the atomic-swap rewrite.
 
-- **Phase A — Slotted leaves + Rid.** New `src/storage/page/rid.rs` packs a
-  `(page_id, slot_id)` pair into a single 8-byte `Rid`. New
-  `src/storage/page/slotted.rs` adds the `LeafPage` slotted-page format
-  (multiple records per 4 KB page, in-line and overflow flavours, slot
-  tombstones, page split, in-place compact). 24 new tests including a
-  randomised insert/tombstone/compact round-trip via an in-tree LCG.
-- **Phase B — Per-namespace keymap.** New `src/storage/fxhash.rs` ports the
-  rustc-hash FxHash algorithm in-tree (no dep). New `src/keymap.rs`
-  introduces a per-namespace 32-shard `HashMap<u64, Slot>` where `Slot` is
-  `Single(Rid)` or `Multi(Vec<Rid>)` to handle 64-bit hash collisions
-  without losing data. 20 new tests.
-- **Phase C — Page cache + v4 PageStore.** New `src/page_cache.rs` is a
-  sharded `PageCache` with FIFO eviction and per-entry access counters
-  (LFU swap is a one-method change). New `src/storage/v4/store.rs` opens a
-  v4-magic page file (`EMDB07\0\0`), allocates pages from a free list,
-  reads through the cache, COW-writes through the cache, and `fdatasync`s
-  on flush. 25 new tests including disk round-trip, magic mismatch, and
-  cache invalidation.
-- **Phase D — Group-commit WAL.** New `src/storage/v4/wal.rs` adds an
-  `append`/`wait_for_seq` API that lets multiple producers share a single
-  fsync via a commit mutex; `FlushPolicy::Group { max_wait }` adds a
-  background flusher thread that fsyncs on a deadline so producers never
-  have to wait for explicit durability. 11 new tests including
-  concurrent-burst behaviour.
-- **Phase E — Value cache.** New `src/value_cache.rs` is a sharded value
-  cache addressed by `(namespace_id, hash)`, bounded in bytes, with
-  CLOCK (second-chance) eviction and `Arc<[u8]>` value sharing. Cache
-  hits resolve under a read-lock with one atomic store. 14 new tests
-  including pressure/eviction and second-chance behaviour.
-- **Phase F — Namespace catalog.** New `src/storage/v4/catalog.rs` stores
-  per-namespace metadata (id, name, leaf-chain head, bloom root, record
-  count, tombstone flag) in chained 4 KB pages. Catalog round-trips
-  through the page store with CRC validation; tombstoned namespaces are
-  hidden from public lookups. 12 new tests including chained-page
-  catalogs that overflow a single page.
-- **Phase G — Bloom filter.** New `src/bloom.rs` is a lock-free atomic
-  bloom (10 bits/key, 7 hashes via the Kirsch–Mitzenmacher two-hash
-  trick). Concurrent inserts and reads progress under `fetch_or` with no
-  locks. Bytes round-trip via `encode`/`from_bytes` for persistence. 10
-  new tests including a false-positive-rate budget assertion.
+Public surface:
 
-### Optimised — pre-Phase-H performance pass
+- `Emdb::range(range)` and `Emdb::range_prefix(prefix)` on the default
+  namespace. `range` accepts any `RangeBounds<Vec<u8>>`.
+- `Namespace::range(range)` and `Namespace::range_prefix(prefix)` for
+  named namespaces.
+- Calling `range(...)` without `enable_range_scans(true)` at open time
+  surfaces as `Error::InvalidConfig` rather than returning empty
+  results.
 
-Before integrating the components into a working engine, every Phase A–G
-module was audited for bottlenecks and rewritten where the implementation
-was provably suboptimal. Each change is independently verified.
+Cost: one `Vec<u8>` clone of the key per insert plus the BTreeMap node
+overhead (~40 bytes per entry on a 64-bit target). Roughly doubles
+in-memory index size for typical workloads. The hash index hot path is
+unchanged — users who don't enable range scans pay nothing.
 
-- **IdentityHasher for the keymap.** Keymap keys are already 64-bit
-  FxHashes; running them through `RandomState`'s SipHash double-hashed on
-  every operation. The new `BuildHasherDefault<IdentityHasher>` returns
-  the input `u64` unchanged, halving keymap CPU on the hottest path.
-- **Power-of-two bloom sizing.** `sized_bits_for_keys` now rounds up to
-  a power of two so the per-hash modular reduction is `& (bit_count - 1)`
-  instead of `% bit_count`. The precomputed `bit_mask` shaves one
-  instruction off every of the seven probes.
-- **PageCache `Mutex` → `RwLock`.** Cache hits — by far the hot path of
-  every read — now take a read lock and are fully parallel; the
-  `access_count` bump under that read lock is a relaxed atomic store, so
-  readers never block readers.
-- **PageStore atomic header.** `page_count`, `last_tx_id`,
-  `namespace_root`, `free_list_head`, and `value_overflow_head` are now
-  `AtomicU64` fields published with `Release` and read with `Acquire`.
-  Cache-hit reads acquire **zero** mutexes; cache-miss reads acquire only
-  the file mutex. `set_last_tx_id` / `set_namespace_root` reduce to a
-  single atomic store.
-- **Slotted-page tombstone reuse.** `LeafPage::insert_inline` and
-  `insert_overflow` now scan for the lowest tombstoned slot id and
-  reuse it before growing the slot array, so delete-heavy workloads do
-  not inflate `slot_count` and prematurely trigger splits.
-- **`Box<[AtomicU64]>` bloom storage.** Replaces the `Vec<AtomicU64>`
-  backing store: 16 bytes lighter per bloom, asserts the immutable size
-  at the type level. Combined with power-of-two sizing the bloom now
-  carries a precomputed `bit_mask` for the hot path.
-- **Cross-platform Direct I/O** (ported from the HiveDB reference).
-  `IoMode::Direct` opens the page file with `O_DIRECT` (Linux),
-  `F_NOCACHE` via `fcntl` (macOS), or `FILE_FLAG_NO_BUFFERING |
-  FILE_FLAG_WRITE_THROUGH` (Windows). Bypasses the OS page cache for
-  predictable p99 latency under load. Hard-fails on unsupported
-  platforms/filesystems (REPS forbids silent degradation). Buffered
-  remains the default.
+7 new integration tests in `tests/range_scans.rs` cover: opt-out
+default, sorted ordering, prefix helper edge cases, mutation
+semantics, reopen, named namespaces, and survival through compaction.
 
-### Phase H — v0.7 engine MVP
+### Added — Persistent namespace name → ID bindings (`TAG_NAMESPACE_NAME`)
 
-`src/storage/v4/engine.rs` ties every Phase A–G component into a working
-runtime for the **default namespace**:
+Previously the `name → id` map was rebuilt on every reopen by
+allocating IDs in record-encounter order. That accidentally worked
+when names were created in the same order each session, but was a
+real correctness bug (a different creation order on reopen would
+hand back a different id than before, decoupling records from their
+namespace handle).
 
-- **Open / flush / close** through `EngineConfig` (path, flags,
-  `IoMode`, `FlushPolicy`, page-cache and value-cache budgets, bloom
-  initial capacity).
-- **Read path (5 layers).** L0 value cache → bloom (negative confirmation)
-  → L1 keymap → L2 page cache → L3 disk via the configured I/O backend.
-  Hits at L0 return without touching any other layer.
-- **Write path.** WAL group-commit append → COW page mutation through
-  the cache → keymap publish → bloom + value-cache populate. The
-  namespace's "open leaf" is reused until `OutOfSpace`, then a new leaf
-  is allocated and prepended to the chain.
-- **Single-namespace MVP.** Named namespaces, replay-on-open, and the
-  Emdb public-API integration land in the next checkpoint, alongside
-  the v3 → v4 migrator.
+Fixed: every named-namespace creation now appends a
+`TAG_NAMESPACE_NAME` record (id 2 in the format) carrying
+`(ns_id, name)`. The recovery scan replays these records before
+applying inserts/removes, so reopens find the same `name → id`
+mapping the writer used. Compaction re-emits the bindings in the
+rewritten file. Encryption-aware path encrypts the binding the same
+way it encrypts inserts.
 
-### Phase H continuation — replay, catalog persistence, WAL Direct I/O, optional compression
+5 new integration tests in `tests/namespaces.rs`: round-trip across
+reopen, ID stability across reopens (the test that exposed the
+original bug), survival through compaction, no-records-just-name
+edge case, and encrypted-database variant.
 
-This session pushed the v4 engine from "MVP that works in-process" toward
-"real persistent KV that survives crashes". The crate version stays at
-`0.6.0` while these changes accumulate; the bump conversation happens
-when the v4 engine is wired through the public `Emdb` API.
+### Added — `lmdb_style` apples-to-apples bench (vs `redb-bench/lmdb_benchmark.rs`)
 
-- **Configurable WAL I/O mode.** New `Wal::open_with_mode` and
-  `EngineConfig::wal_io_mode` accept `IoMode::Buffered` (default) or
-  `IoMode::Direct`. On Windows, Direct mode adds `FILE_FLAG_WRITE_THROUGH`
-  so each `write_all` is synchronously durable in one syscall. On
-  Linux/macOS, Direct mode bypasses the OS page cache; the doc comment
-  warns that sub-page WAL records may be rejected on filesystems that
-  reject unaligned `O_DIRECT` writes — the buffered default is correct
-  there.
-- **Replay-on-open.** `Engine::open` now does the full crash-recovery
-  ceremony: load the persisted catalog from `header.namespace_root`,
-  walk every leaf in the default namespace's chain rebuilding the
-  keymap and bloom from durable records, then replay any WAL records
-  with `seq >= header.last_persisted_wal_seq` (the new u64 header
-  field). The "leaf walk" path covers records that were checkpointed
-  to pages; the "WAL replay" path covers records that were durable in
-  the WAL but not yet flushed to pages. A test inserts 16 records,
-  drops without `flush`, reopens, and asserts every record is
-  recovered through the WAL replay alone.
-- **Catalog persistence on flush.** `Engine::flush` now snapshots
-  `next_seq` from the WAL, refreshes the catalog from the live
-  namespace state, persists the catalog through the page store,
-  records the snapshot as the new `last_persisted_wal_seq`, and only
-  then drains dirty pages and `fdatasync`s. Recovery uses the
-  persisted floor to skip already-applied WAL records.
-- **Optional compression (`compress` feature).** New `compress` Cargo
-  feature pulls in `lz4_flex` (≈30% the binary size of zstd, pure
-  Rust, no `unsafe`). `encode_insert_op` calls `compress_into` on the
-  value; payloads ≥ `COMPRESS_MIN_BYTES = 256` that LZ4-shrink set the
-  high bit on the WAL tag (`WAL_FLAG_COMPRESSED`) and prepend a
-  `original_len: u32` so the decoder can size its output buffer.
-  Records below the threshold pass through unchanged. Without the
-  feature, the WAL records are byte-identical to v0.6 but the decoder
-  rejects any record carrying the compression flag with a
-  documented `Error::InvalidConfig`. New round-trip test covers a
-  2 KB highly-compressible value through replay, asserting both
-  feature configurations recover the exact bytes.
-- **Encryption feature flag (`encrypt`) reserved.** Cargo feature
-  added without an implementation; the AES-GCM page-encryption design
-  needs careful key-management work that is queued for its own
-  focused session. The flag is harmless to enable today (no
-  behavioural change yet) and reserves the name in the
-  `bench-compare`-style feature matrix.
-- **Engine extensions.** `Engine::collect_records` walks the leaf
-  chain to materialise every live record as
-  `Vec<(key, value, expires_at)>` for the future public-API `iter()`
-  call. `Engine::clear_namespace` resets the keymap, bloom, chain
-  pointers, and value cache for a namespace (the underlying leaves
-  remain allocated until the future compactor reclaims them). New
-  `Engine::path` accessor for the public-API wrapper to forward.
-- **Storage-header field for replay floor.** `StoreHeader` gained
-  `last_persisted_wal_seq: u64` plus its atomic mirror in
-  `AtomicHeader`. New `set_last_persisted_wal_seq` /
-  `last_persisted_wal_seq` accessors on `PageStore`. Header byte
-  layout extended (offset 68); the new field is zeroed on v4 files
-  that were created before this change, which means "replay from seq
-  0" — correct fallback semantics.
-- **Tests added.** `replay_recovers_records_when_flush_was_called`,
-  `replay_recovers_records_from_wal_without_flush`,
-  `large_value_round_trips_through_wal_replay` — plus refreshed
-  bloom and slotted tests. Total: **88 v0.6 baseline → 230 lib
-  tests + 60 integration = 290 passing across the full feature
-  matrix** (`""`, `ttl`, `nested`, `mmap`, `compress`, `encrypt`,
-  `bench-compare`, and combinations).
+Mirrors redb's published methodology: 5 M records, 24-byte random
+keys, 150-byte random values, fastrand-seeded. Full phase set —
+bulk load, individual writes, batch writes, nosync writes, len(),
+random reads (1 M × 2), MT reads at 4 / 8 threads, removals,
+uncompacted size, compaction, compacted size. Range reads recorded
+as N/A (real feature gap; see range-scans entry above).
 
-### Phase H continuation (II) — public-API wiring, v3→v4 migration, comparative benches
+Set `EMDB_BENCH_RECORDS=5000000` to hit redb's published scale;
+defaults to 1 M for faster local iteration.
 
-The v4 engine is now reachable from the existing `Emdb` public API as a
-side-by-side path: existing callers see no change, but
-`EmdbBuilder::prefer_v4(true)` opts the same handle into v0.7 routing
-end-to-end. The crate version stays at `0.6.0` while these changes
-accumulate.
+#### 5 M-record results vs redb (Windows 11 NVMe, lower is better)
 
-- **Public-API integration without disruption.** `Emdb` grows an
-  internal `v7: Option<Arc<V07Inner>>` field; every public method
-  (`insert`, `get`, `remove`, `contains_key`, `len`, `is_empty`,
-  `clear`, `iter`, `keys`, `flush`, `path`, plus the TTL surface)
-  short-circuits through the v4 engine when that field is `Some`.
-  When it is `None` the existing v0.6 code paths run unchanged, so
-  every prior test and benchmark continues to exercise the v0.6
-  engine bit-for-bit. `transaction()` returns
-  `Error::InvalidConfig` on the v4 path (v4 transactions land in
-  the next checkpoint); `compact()` falls back to `flush()`.
-  `clone_handle` propagates the `Arc` so cheap-clone semantics
-  carry across both engines.
-- **`EmdbBuilder` v4 knobs.** New methods: `prefer_v4(bool)`,
-  `page_io_mode(IoMode)`, `wal_io_mode(IoMode)`,
-  `page_cache_pages(usize)`, `value_cache_bytes(usize)`,
-  `bloom_initial_capacity(u64)`. The legacy `FlushPolicy` translates
-  to the v4 group-commit policy via a new internal helper. `IoMode`
-  is now a public re-export at the crate root with `#[non_exhaustive]`
-  so we can extend it (e.g., `IoMode::DirectIfSupported`) without a
-  breaking change.
-- **In-place v3 → v4 migration.** New `src/storage/v4/migrate.rs`
-  exposes `migrate_v3_to_v4_if_needed(path, flags)`. The migrator
-  reads every record from the legacy file via the existing
-  `PageStorage` reader, opens a fresh v4 engine on `<path>.v4tmp`,
-  inserts every record, flushes, then atomically renames the v3 file
-  to `<path>.v3bak` and the temp file into place. Already-v4 files
-  are a no-op; missing files are a no-op. v1 and v2 files are
-  chained through the existing v0.6 migrator (v1 → v3 → v4) so a
-  user upgrading from any prior format converges on v4 in one open.
-  3 new tests cover the no-op, fresh-v4, and full v3→v4 round-trip
-  cases.
-- **TTL through v4.** `insert_with_ttl`, `expires_at`, `ttl`,
-  `persist`, and `sweep_expired` route through the v4 engine when
-  the v7 field is set, matching v0.6 behaviour. The v4 record
-  format already carries `expires_at: u64` so the TTL semantics
-  are identity-mapped; `persist` clears the field by re-inserting
-  with `expires_at = 0`. New `ttl_path_round_trips_through_v4`
-  integration test covers the full TTL round-trip.
-- **Comparative benchmarks rerun.** `benches/comparative.rs` now
-  runs both `emdb_v06` and `emdb_v07` arms on the same dataset
-  alongside sled and redb. Results at the default 20 K records,
-  64-byte values, on a Windows 11 NVMe disk:
+| phase                       |        emdb |    redb  |    sled  |  emdb vs redb     |
+|-----------------------------|------------:|---------:|---------:|------------------:|
+| bulk load                   |    **4498** |    74496 |    60807 |     16.6× faster  |
+| batch writes                |    **2814** |    11043 |     1972 |      3.9× faster  |
+| nosync writes               |     **220** |     1717 |     1136 |      7.8× faster  |
+| random reads (1 M)          |     **596** |     5289 |    11197 |      8.9× faster  |
+| random reads (4 threads)    |    **1083** |    17543 |    34605 |     16.2× faster  |
+| random reads (8 threads)    |     **653** |    17160 |    33284 |   **26× faster**  |
+| removals                    |   **11948** |    54905 |    46155 |      4.6× faster  |
+| compaction                  |   **11490** |    16506 |      N/A |      1.4× faster  |
+| uncompacted size            |    1.08 GiB | 4.00 GiB | 2.13 GiB |     3.7× smaller  |
+| compacted size              | **498 MiB** | 1.64 GiB |      N/A |     3.4× smaller  |
+| individual writes (fsync/op)|       27455 |  **734** |  **316** | 37× **slower**    |
+| random range reads          |         N/A |     3958 |     9688 | feature gap       |
 
-  | engine        | inserts (Kelem/s) | reads (Melem/s) |
-  |---------------|------------------:|----------------:|
-  | emdb v0.6     |               ~50 |            3.02 |
-  | **emdb v0.7** |              ~349 |            3.05 |
-  | sled          |              ~307 |            2.30 |
-  | redb          |              ~589 |            4.28 |
+emdb wins every aggregate-throughput column — often by an order of
+magnitude — and is 3-4× smaller on disk both compacted and not. The
+`individual writes` column (each write fsync'd on its own commit) is
+the one place emdb loses, dominated by Windows `FlushFileBuffers`
+latency. Workloads that need per-record durability should batch
+through `db.transaction(...)` or `db.insert_many(...)`, which amortise
+the fsync cost.
 
-  v0.7 is roughly **7×** faster than v0.6 on bulk inserts and
-  comfortably beats sled on both axes; redb is still ahead and is
-  the next perf target (page-coalescing, bloom-size tuning, and
-  pre-warmed page cache are the obvious levers).
-- **Tests.** New `tests/v4_public_api.rs` adds 6 integration
-  tests that exercise the v4 path through the public `Emdb` API:
-  round-trip insert/get/remove, replay-after-drop, iter+keys,
-  clear, transaction-rejection, and TTL round-trip (cfg-gated).
-  Every test cleans up `.v4.wal`, `.lock`, `.v3bak`, and
-  `.v4tmp` siblings. Total: **232 lib tests + 58 integration
-  tests + 7 doc tests = 297 passing across the full feature
-  matrix** (`""`, `ttl`, `nested`, `mmap`, `compress`,
-  `encrypt`, `bench-compare`, and combinations).
+### Documented — Single-writer model + multi-writer deferred to v1.0
 
-### Phase H continuation (III) — v0.7 transaction port
+The Concurrency section of the README now states the actual model
+explicitly: lock-free reads (sharded hash index + `Arc<Mmap>`),
+single-writer writes (one mutex around the encode-then-pwrite step).
+This matches LMDB / redb / BoltDB. True multi-writer concurrency
+requires either a recovery-model change (skip-bad-CRC, scan-forward)
+or per-thread log segments; both have correctness trade-offs that
+warrant the v1.0 design pass. Queued.
 
-`Emdb::transaction(|tx| { ... })` is now a first-class operation on the v4
-path. The previous `InvalidConfig` regression (returned for any tx call
-when `prefer_v4(true)` was set) is gone — a v4-aware commit path runs
-under the engine's own commit lock and persists batches with the same
-crash-atomic guarantees as v0.6.
+### Added — Real `Emdb::compact()` (live-record sibling rewrite + atomic swap)
 
-- **WAL batch markers.** Two new tag bytes in the v4 WAL:
-  `WAL_TAG_BATCH_BEGIN = 2` (payload: `tx_id: u64, op_count: u32`) and
-  `WAL_TAG_BATCH_END = 3` (payload: `tx_id: u64`). On replay, ops between
-  a `BatchBegin` and its matching `BatchEnd` are buffered and applied
-  atomically; a `BatchBegin` with no matching `BatchEnd` (writer crashed
-  mid-batch) discards every buffered op. `tx_id` mismatch between begin
-  and end surfaces as `Error::Corrupted` rather than silent data loss.
-- **`Engine::commit_batch`.** New `BatchedOp` enum (Insert/Remove with
-  owned bytes); `commit_batch(&[BatchedOp])` takes the engine's commit
-  lock, appends `BatchBegin → ops → BatchEnd` to the WAL via separate
-  `append` calls (each gets its own seq), `wait_for_seq`s the
-  `BatchEnd` to make the entire batch durable, then runs the apply
-  phase via the same `apply_insert`/`apply_remove` helpers single-op
-  writes use. The WAL→apply order under one lock is what gives the
-  `last_persisted_wal_seq` floor invariant for batches.
-- **Engine commit lock.** New `Engine::commit_lock: Mutex<()>`
-  serialises every mutation that touches WAL+state together: single-op
-  `insert`/`remove`, transactional `commit_batch`, and `flush`. Reads
-  do not take it. Holding it across `flush` is what guarantees flush
-  can never split a batch when sampling
-  `last_persisted_wal_seq = wal.next_seq()`.
-- **Apply-phase refactor.** `Engine::insert`/`remove` now delegate
-  their in-memory state mutations (page COW, keymap publish, bloom,
-  value cache, record-count) to `apply_insert`/`apply_remove`
-  helpers. `commit_batch` reuses those exact helpers, so single-op
-  and multi-op writes share the entire apply path bit-for-bit.
-- **Replay refactor.** `replay_wal_after` is now batch-aware: a
-  decoded `BatchBegin` opens a `PendingBatch` accumulator, every op
-  decoded while a batch is open buffers (no immediate apply), a
-  matching `BatchEnd` flushes the buffer to the apply path, and a
-  trailing in-progress batch at end-of-stream is dropped. Nested
-  `BatchBegin`s and orphaned `BatchEnd`s surface as `Error::Corrupted`.
-- **`Transaction` v0.7 wiring.** `Transaction::commit` now branches on
-  `db.v7.is_some()`: the v4 path translates every staged `Op` to a
-  `BatchedOp` for the default namespace and hands the batch to
-  `engine.commit_batch`. `Transaction::get` falls through to the v4
-  engine on cache miss so read-your-writes remains correct. `Op::Clear`
-  / `Op::Checkpoint` / batch markers as staged ops are explicitly
-  rejected on the v4 path with `TransactionAborted` — none of them are
-  produced today, but rejecting future-incompatible ops surfaces bugs
-  instead of dropping data.
-- **Tests added.** Engine: `commit_batch_applies_every_op_atomically`,
-  `partial_batch_in_wal_is_discarded_on_replay` (writes a real
-  half-batch directly to the WAL file via append-mode `OpenOptions`,
-  reopens, asserts the orphan record is gone and the prior committed
-  batch survives), `empty_commit_batch_is_a_noop`. Public API:
-  `transaction_commit_applies_overlay_via_v4`,
-  `transaction_rollback_discards_overlay_via_v4`,
-  `transaction_read_your_writes_via_v4`,
-  `transaction_survives_drop_and_reopen_via_v4`,
-  `empty_transaction_is_a_noop_via_v4`. The previous
-  `transactions_on_v4_path_return_invalid_config` is removed; that
-  contract no longer holds. Total: **236 lib + 62 integration + 7 doc
-  = 305 tests passing** across the full feature matrix.
+`compact()` was a flush-shaped no-op in the initial rewrite. Now it actually
+reclaims space:
 
-### Phase H continuation (IV) — named namespaces, compactor, free-list
+1. Snapshot every namespace's live `(key, value, expires_at)` tuples by
+   walking the in-memory indexes against the current mmap.
+2. Write a fully-formed sealed file at `<path>.compact.tmp` directly via
+   buffered `File` I/O (no mmap on the temp file, so Windows is happy
+   shrinking the file size after writes).
+3. `fdatasync` the temp file, then call [`Store::swap_underlying`] which
+   drops our writer's File handle, atomic-renames the temp over the
+   canonical path, reopens the writer, and refreshes the mmap.
+4. Clear and rebuild every namespace index from the new layout via the
+   same `recovery_scan` used at open time.
 
-The v0.7 engine grows two long-promised primitives in this checkpoint:
-multi-namespace runtime support and a real foreground compactor backed by
-a working page-store free list. Both ride on top of the catalog primitives
-that have been quietly persisted since Phase F.
+Existing readers holding `Arc<Mmap>` snapshots from before the compaction
+keep reading from the old inode (the kernel pins it for the duration of
+any active mapping); new reads see the compacted layout. Three new
+integration tests in `tests/compact.rs` cover the size-shrinks path,
+the empty-DB no-op, and namespace preservation through a compaction.
 
-- **Multi-namespace runtime.** `Engine::default_ns: Arc<NamespaceRuntime>`
-  is replaced by `namespaces: RwLock<HashMap<u32, Arc<NamespaceRuntime>>>`.
-  On open, every live catalog entry is hydrated into its own runtime
-  (keymap, bloom, leaf-chain pointers, record count) and the WAL replay
-  walks every namespace's chain. `Engine::namespace(ns_id)` now returns
-  a cloned `Arc` after a single read-locked map lookup; the lock is
-  released before the call returns so reads do not contend with writers
-  more than necessary. `refresh_catalog` walks the whole runtime map and
-  pushes each namespace's current state back into the catalog before
-  every flush.
-- **Engine namespace lifecycle.** New methods on `Engine`:
-  `create_or_open_namespace(name) -> (id, was_created)` (idempotent —
-  re-opening an existing name is free), `drop_namespace(name)`
-  (tombstones in catalog + drops the runtime; data pages are reclaimed
-  on the next compact), `list_namespaces() -> Vec<(u32, String)>`, and
-  `namespace_id_for(name)`. The default namespace (id 0, empty name) is
-  reserved: empty-name creates and drop-default both surface
-  `Error::InvalidConfig`. The catalog already supported tombstoning;
-  this checkpoint adds `tombstoned_entries` and `remove_tombstoned`
-  helpers that the compactor uses.
-- **Public `Namespace` handle.** New top-level export
-  `emdb::Namespace`, returned by `Emdb::namespace(name)`. The handle is
-  cheap to clone (two `Arc` bumps), Send + Sync, and exposes the same
-  surface as `Emdb` itself (`insert`, `get`, `remove`, `contains_key`,
-  `len`, `is_empty`, `clear`, `iter`, `keys`, `name`). Each named
-  namespace has its own keymap, leaf chain, and bloom filter — the
-  same key bytes in the default namespace and in `Namespace`s "alpha"
-  and "beta" resolve to three independent records, verified by the
-  `namespaces_are_isolated_from_default_and_each_other` integration
-  test. Plus `Emdb::drop_namespace(name)` and
-  `Emdb::list_namespaces() -> Vec<String>` round out the lifecycle.
-  Named namespaces are a v0.7-only feature: calling these on a v0.6
-  handle returns `Error::InvalidConfig`.
-- **Page-store free list.** `PageStore::free_page(page_id)` writes a
-  `PageType::FreeList` page whose first 8 body bytes carry the
-  previous free-list head, then atomically swaps
-  `header.free_list_head` to the freed page id. `allocate_page` first
-  attempts a CAS pop from the free-list head (cache-invalidates the
-  freed-page bytes so a stale read does not surface as a slotted
-  leaf), only falling back to extending the file when the free list
-  is empty or the CAS lost. The integration test
-  `compact_recovers_space_via_free_list_reuse` writes 200 records,
-  removes them, compacts, then writes 50 fresh records and asserts
-  the file does not grow — proof that freed page ids are actually
-  reused.
-- **Phase I compactor.** New `Engine::compact() -> CompactStats` runs
-  under the engine's commit lock so concurrent inserts/transactions
-  block for the duration; reads continue to be served. Two phases:
-  1. **Live namespaces.** Walk every loaded chain. A leaf with
-     tombstoned slots is rewritten in place via
-     `slotted::compact_leaf` (already-existed primitive) and the
-     keymap is fixed up using the `(key, old_slot, new_slot)` remap
-     it returns. A leaf with zero live records is unlinked from the
-     chain (head pointer or previous leaf's `next_leaf` updated)
-     and pushed onto the free list.
-  2. **Dropped namespaces.** Walk every catalog entry tombstoned by
-     `drop_namespace`. Free every page in the chain, then call
-     `Catalog::remove_tombstoned` so the entry stops appearing in
-     listings.
-  The compactor finishes by calling `flush()` — any reclaimed space
-  survives a crash. Public hook: `Emdb::compact()` on a v7 handle
-  now drives the engine compactor instead of the previous "alias for
-  flush" placeholder.
-- **`live_count_of` slotted helper.** Mirror of
-  `LeafPage::live_count` for use sites that only have `&Page` (the
-  compactor walks chains without mutating). Exists alongside the
-  existing `slot_count_of` and `free_space_of` free functions.
-- **Encryption deferred (feature gate kept).** AES-256-GCM page-body
-  encryption needs a focused session: format decisions
-  (page-body vs. WAL vs. value-only), key-management story
-  (in-memory only, verification block, rotation), and migration from
-  existing v0.7 files. The `encrypt` Cargo feature flag remains
-  reserved so downstream `Cargo.toml` entries can opt in early
-  without breaking when the implementation lands.
-- **Tests added.** Engine: 4 namespace lifecycle + compaction + 5 in
-  the existing integration suites. New integration files:
-  `tests/v4_namespaces.rs` (12 tests: round-trip, isolation,
-  idempotence, empty-name rejection, listing, drop + recreate, drop
-  default rejected, drop unknown returns false, persist + reopen,
-  iter/keys, clear, v0.6-handle rejection) and
-  `tests/v4_compact.rs` (5 tests: tombstone reclamation, reopen
-  preserves visible records, dropped-namespace page reclamation,
-  free-list reuse, no-op when nothing to compact). Total:
-  **236 lib + 79 integration + 7 doc = 322 tests passing** across
-  the full feature matrix (`""`, `ttl`, `nested`, `mmap`,
-  `compress`, `encrypt`, `bench-compare`, and combinations).
+### Added — `concurrent_reads` bench (multi-thread read fan-out)
 
-### Status
+Single-thread `compare_read` undersells the lock-free `Arc<Mmap>` read
+path because there's no contention to observe. New
+`benches/concurrent_reads.rs` spawns N reader threads against a
+pre-populated DB and measures aggregate throughput across thread counts
+1, 2, 4, 8.
 
-Component module count: 14 new modules across `src/`, `src/storage/`,
-and `src/storage/v4/`. The v0.6 engine remains the default public
-code path behind `Emdb`; the v4 engine is now reachable both
-directly via `storage::v4::engine::Engine` and through the public
-`Emdb` handle by opting in with `EmdbBuilder::prefer_v4(true)`,
-including transactional commits, crash-atomic batch replay,
-multi-namespace data isolation, and a working page-reclamation
-compactor backed by a real free list. Every feature combination is
-clippy-clean, fmt-clean, doc-clean, and test-clean.
+Numbers on the same Windows 11 NVMe box as the existing benches:
+
+| reader threads | aggregate reads (Melem/s) |
+|---------------:|--------------------------:|
+| 1              |                      4.75 |
+| 2              |                      6.57 |
+| 4              |                      9.18 |
+| 8              |                     11.97 |
+
+Reads scale through 8 threads on a 4-core machine — the kernel-managed
+mmap plus the 64-shard hash index keep the hot path lock-free, so the
+only contention past core count is shared memory bandwidth.
+
+### Changed — README rewrite for the new architecture
+
+Dropped the v0.6/v0.7 dual-engine story, the `prefer_v4` opt-in, and
+references to the (now removed) `FlushPolicy`, slotted-leaf chains, WAL,
+and `BatchBegin`/`BatchEnd` markers. New README leads with the bench
+numbers (single-thread + multi-reader), explains the
+Bitcask-style architecture in two sentences, and documents the
+`db.transaction()` / `db.insert_many()` choice for callers who want
+the redb-style transaction-batched insert pattern.
+
+### Added — `Emdb::insert_many` / `Namespace::insert_many` bulk-insert API
+
+The fast path for bulk-loading. All records are framed into one buffer
+under a single writer-mutex hold and written via a single `pwrite`
+syscall.
+
+- `Emdb::insert_many<I, K, V>(items)` where `I: IntoIterator<Item = (K, V)>`,
+  `K: AsRef<[u8]>`, `V: AsRef<[u8]>`. Mirror on `Namespace::insert_many`
+  for named namespaces.
+- Records inside one `insert_many` call are written atomically *as
+  individual records* (each gets its own CRC). They are **not**
+  all-or-nothing as a group — a crash mid-batch leaves a CRC-validated
+  prefix on disk. For all-or-nothing semantics use
+  `db.transaction(|tx| ...)`, which buffers writes in an overlay and
+  routes the commit through `insert_many` plus a final `flush` so the
+  whole batch is durable together.
+
+### Added — OS-default storage path resolution
+
+`Emdb::builder()` now resolves a platform-appropriate database file path
+when the caller opts in via `app_name` / `database_name` / `data_root`.
+This closes the embedder-ergonomics gap that previously forced HiveDB and
+every other consumer to know each platform's data-directory convention.
+
+- **`src/data_dir.rs`.** Cross-platform resolver: Linux/BSD use
+  `$XDG_DATA_HOME` (or `$HOME/.local/share`), macOS uses
+  `$HOME/Library/Application Support`, Windows uses `%LOCALAPPDATA%`
+  (falling back to `%APPDATA%` then `%USERPROFILE%\AppData\Local`).
+  Last-resort fallback is the process current directory so the
+  builder never panics.
+- **Builder methods.** `app_name(name)` (single folder name, default
+  `"emdb"`), `database_name(name)` (default `"emdb-default.emdb"`),
+  `data_root(path)` (escape hatch for tests / containers / sandboxes).
+  Resolved path is `<data_root>/<app_name>/<database_name>`.
+- **Validation.** Path separators (`/`, `\`), `..`, and the empty
+  string are rejected at build time so a stray value cannot escape
+  the data root and behaviour stays identical on every platform.
+- **Conflict detection.** Mixing `path()` with any of the
+  OS-resolution methods returns `Error::InvalidConfig` — pass either
+  an explicit path or the OS-resolution methods, never both.
+- **Tests.** 7 unit + 10 integration covering round-trips through
+  v0.6 and v0.7, default substitution, `mkdir -p` behaviour,
+  multi-app coexistence under one root, and every rejection branch.
+
+### Added — AES-256-GCM + ChaCha20-Poly1305 at-rest encryption
+
+Opt-in via the `encrypt` Cargo feature plus
+[`crate::EmdbBuilder::encryption_key`] (raw 32-byte key) or
+[`crate::EmdbBuilder::encryption_passphrase`] (Argon2id KDF). Either
+mode encrypts every record body; unencrypted records simply skip the
+encryption path so unencrypted databases stay byte-identical to a
+non-`encrypt` build.
+
+- **Ciphers.** AES-256-GCM via `aes-gcm` 0.10 (default; AES-NI on
+  modern x86, Crypto Extensions on ARMv8) and ChaCha20-Poly1305 via
+  `chacha20poly1305` 0.10 (selectable via `EmdbBuilder::cipher(...)`
+  for hardware without AES acceleration). Both use a 96-bit random
+  nonce drawn fresh from `OsRng` per record. Counter-based nonces
+  were rejected: durable counter state can roll back on
+  backup-restore, and a rolled-back nonce with the same key is the
+  one mistake AEAD ciphers do not survive.
+- **Passphrase mode.** `EmdbBuilder::encryption_passphrase("...")`
+  derives a 32-byte key via Argon2id (19 MiB memory, 2 iterations,
+  1 lane — OWASP defaults for interactive use). The salt is a fresh
+  random 16-byte block per database, persisted at header offsets
+  40..56. Reopens read the salt and rerun the KDF; wrong passphrase
+  surfaces as [`crate::Error::EncryptionKeyMismatch`] before any user
+  data is touched. Mutually exclusive with `encryption_key()`.
+- **Record envelope.** Every record carries the same outer framing
+  (`[len][tag][body][crc]`); the encrypted variant sets bit 7 of the
+  tag and the body becomes `[nonce: 12][ciphertext + AEAD tag]`. The
+  CRC catches torn writes; the AEAD tag catches tampering. See
+  [`crate::storage::format`] for the full layout.
+- **Verification block.** Header bytes 56..116 hold an AEAD-encrypted
+  copy of a fixed magic plaintext
+  (`b"EMDB-ENCRYPT-OK\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"`). On open
+  the engine decrypts and compares; mismatch surfaces as
+  `Error::EncryptionKeyMismatch` before any user data is read.
+- **Cipher selection on disk.** `FLAG_CIPHER_CHACHA20` (bit 1 of the
+  header flags) records the cipher choice on creation. Reopens
+  auto-dispatch from the on-disk flag; callers do not have to
+  restate the cipher.
+- **Offline admin APIs.** Three static methods on [`crate::Emdb`]:
+  `enable_encryption(path, target)` (unencrypted → encrypted in
+  place), `disable_encryption(path, current)` (the reverse), and
+  `rotate_encryption_key(path, from, to)` (re-encrypt under a new
+  key). All three use atomic rewrite-then-rename: the original is
+  preserved at `<path>.encbak` on success and untouched on any
+  failure. Each side accepts either a raw key or a passphrase via
+  the new `EncryptionInput::{Key, Passphrase}` enum (re-exported
+  at the crate root).
+- **Error variants.** `Error::Encryption(&'static str)` for
+  malformed buffers / AEAD-machinery failures (not user-recoverable);
+  `Error::EncryptionKeyMismatch` for tag-validation failures (user
+  supplied the wrong key). Both gated on `feature = "encrypt"`.
+- **`Debug` does not leak keys.** `EncryptionContext::fmt` writes
+  `"<redacted>"` instead of the cipher state.
+
+### Removed
+
+- **`FlushPolicy`.** Sync semantics are simpler now: `insert` writes
+  to the OS buffer, `flush()` calls `fdatasync`. Callers that want
+  per-record durability call `flush` after each insert; callers that
+  want batched durability call `flush` after `insert_many` or at the
+  end of a transaction.
+- **`EmdbBuilder::prefer_v4(...)` + the v0.6 / v0.7 dual-engine
+  dispatch.** There is exactly one engine.
+- **`emdb-cli` binary + `cli` Cargo feature.** Not standard for
+  embedded KV libraries; the `Emdb::enable_encryption` /
+  `disable_encryption` / `rotate_encryption_key` library APIs cover
+  the same need programmatically.
+- **`compress` Cargo feature + the `lz4_flex` value-compression
+  shim.** The new format does not include compressed-record
+  framing.
+- **The slotted-leaf-page + WAL + page-cache + value-cache + bloom
+  filter modules** (`src/storage/v4/`, `src/storage/page/`,
+  `src/keymap.rs`, `src/page_cache.rs`, `src/value_cache.rs`,
+  `src/bloom.rs`, `src/index.rs`, `src/compress.rs`, the v0.6 v0.7
+  migration scaffolding). Tests for the removed surface
+  (`tests/v4_*.rs`, `tests/migration.rs`, `tests/page_format.rs`,
+  `tests/recovery.rs`, `tests/transactions.rs`,
+  `tests/concurrency.rs`) are gone too — their guarantees are
+  covered by the new integration tests
+  (`tests/persistence.rs`-style + `tests/compact.rs`,
+  `tests/range_scans.rs`, `tests/namespaces.rs`).
+
+### Tests + format
+
+109 tests passing across `default`, `ttl,nested,encrypt`,
+`--no-default-features`, `nested`-only, and `encrypt`-only feature
+combos. Library is clippy-clean under the project's strict lint
+profile (deny `unwrap_used`, `expect_used`, `unreachable`, `todo`,
+`unimplemented`, `print_stdout`, `print_stderr`, `dbg_macro`,
+`warnings`).
+
+The on-disk format resets to **v1** of the new mmap+append layout.
+v0.6 page-format files and the original v0.7 dual-engine page-format
+files cannot be opened by this release. Migration path: open the
+old file with the previous emdb release, export records, reimport
+into a fresh v0.7.1 file. (No automated migration tool ships in
+0.7.1; the encryption-admin rewrite primitive in
+[`crate::encryption_admin`] is the reference shape for an external
+exporter.)
 
 ## [0.6.0](https://github.com/jamesgober/emdb-rs/compare/v0.5.0...v0.6.0) — 2026-04-25
 

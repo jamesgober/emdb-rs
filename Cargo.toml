@@ -1,6 +1,6 @@
 [package]
 name = "emdb"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -39,39 +39,35 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 crc32fast = "1.4"
 fs4 = "0.8"
-# Optional WAL-record compression. lz4_flex is pure Rust, ~30% size of zstd's
-# binary, and tuned for the small-record sizes typical of a KV WAL.
-lz4_flex = { version = "0.11", default-features = false, optional = true }
+# Memory-mapped reads on every platform. mmap is the foundation of the
+# storage engine — no longer feature-gated.
+memmap2 = "0.9"
+# Optional at-rest AES-256-GCM encryption.
+aes-gcm = { version = "0.10", optional = true, default-features = false, features = ["aes", "alloc"] }
+# ChaCha20-Poly1305 AEAD as an alternative to AES-GCM.
+chacha20poly1305 = { version = "0.10", optional = true, default-features = false, features = ["alloc"] }
+# Cryptographically-secure RNG for AEAD nonces.
+rand_core = { version = "0.6", optional = true, default-features = false, features = ["getrandom"] }
+# Argon2id KDF for passphrase-derived keys.
+argon2 = { version = "0.5", optional = true, default-features = false, features = ["alloc"] }
+# Comparative-bench peers (dev convenience, not for production users).
 redb = { version = "2.1", optional = true }
 redis = { version = "0.27", optional = true }
 sled = { version = "0.34", optional = true }
 rocksdb = { version = "0.22", optional = true }
 
-[target.'cfg(unix)'.dependencies]
-# Optional mmap-backed reads for the v0.6 page pager.
-memmap2 = { version = "0.9", optional = true }
-
-[target.'cfg(windows)'.dependencies]
-# Optional mmap-backed reads for the v0.6 page pager.
-memmap2 = { version = "0.9", optional = true }
-
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }
+fastrand = "2"
 
 [features]
 default = ["ttl"]
 ttl = []
 nested = []
-mmap = ["dep:memmap2"]
-# WAL-record compression via lz4_flex. Records below COMPRESS_MIN_BYTES bypass
-# compression to avoid the per-record overhead on already-small payloads.
-compress = ["dep:lz4_flex"]
-# Reserved feature gate for AES-GCM at-rest encryption. The on-disk format
-# decisions, key-management story, and WAL-vs-page-body trade-offs need a
-# focused session before this can ship; the feature flag exists today so
-# downstream Cargo.toml entries can opt in early without breaking when the
-# implementation lands.
-encrypt = []
+# AES-256-GCM + ChaCha20-Poly1305 at-rest encryption with raw-key or
+# Argon2id-derived passphrase. Activates the
+# `EmdbBuilder::encryption_key`/`encryption_passphrase` APIs.
+encrypt = ["dep:aes-gcm", "dep:rand_core", "dep:argon2", "dep:chacha20poly1305"]
 bench-compare = ["dep:redb", "dep:sled"]
 bench-redis = ["dep:redis"]
 bench-rocksdb = ["dep:rocksdb"]
@@ -93,17 +89,14 @@ name = "kv"
 harness = false
 
 [[bench]]
-name = "persistence"
-harness = false
-
-[[bench]]
-name = "transactions"
-harness = false
-
-[[bench]]
-name = "concurrency"
-harness = false
-
-[[bench]]
 name = "comparative"
 harness = false
+
+[[bench]]
+name = "concurrent_reads"
+harness = false
+
+[[bench]]
+name = "lmdb_style"
+harness = false
+required-features = ["ttl", "bench-compare"]
