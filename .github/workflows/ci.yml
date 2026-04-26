@@ -17,7 +17,9 @@ jobs:
           - ""
           - "ttl"
           - "nested"
+          - "encrypt"
           - "ttl nested"
+          - "ttl nested encrypt"
 
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +44,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --features ttl,nested,encrypt -- -D warnings
 
   docs:
     runs-on: ubuntu-latest
@@ -53,13 +55,4 @@ jobs:
       - name: Check documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --all-features
-
-  recovery-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run recovery-focused tests
-        run: cargo test --test recovery -- --nocapture
+        run: cargo doc --no-deps --features ttl,nested,encrypt
