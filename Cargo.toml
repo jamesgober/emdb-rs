@@ -100,3 +100,7 @@ harness = false
 name = "lmdb_style"
 harness = false
 required-features = ["ttl", "bench-compare"]
+
+[[example]]
+name = "smoke"
+required-features = ["ttl", "nested", "encrypt"]
