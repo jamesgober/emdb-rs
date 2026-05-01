@@ -33,7 +33,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TTL: insert with explicit short TTL, verify it expires
     db.insert_with_ttl("ephemeral", "ghost", Ttl::After(Duration::from_millis(50)))?;
     println!("  inserted 'ephemeral' with 50ms TTL");
-    assert!(db.get("ephemeral")?.is_some(), "should be alive immediately");
+    assert!(
+        db.get("ephemeral")?.is_some(),
+        "should be alive immediately"
+    );
     std::thread::sleep(Duration::from_millis(80));
     assert!(
         db.get("ephemeral")?.is_none(),
@@ -93,7 +96,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = sessions.remove(b"sid-abc")?;
     db.flush()?;
     let size_after_removes = std::fs::metadata(&path)?.len();
-    println!("  after removes (tombstones added), size = {} bytes", size_after_removes);
+    println!(
+        "  after removes (tombstones added), size = {} bytes",
+        size_after_removes
+    );
 
     db.compact()?;
     db.flush()?;
@@ -121,7 +127,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  reopen successful; len() = {}", db.len()?);
     assert_eq!(db.get(b"hello")?, None, "removed key stays removed");
     assert_eq!(db.get(b"user:001")?.as_deref(), Some(b"alice".as_slice()));
-    assert_eq!(db.get(b"tx-key-2")?.as_deref(), Some(b"tx-val-2".as_slice()));
+    assert_eq!(
+        db.get(b"tx-key-2")?.as_deref(),
+        Some(b"tx-val-2".as_slice())
+    );
     println!("  ✓ default-namespace records intact");
 
     let sessions = db.namespace("sessions")?;
