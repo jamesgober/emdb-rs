@@ -237,6 +237,18 @@ impl std::fmt::Debug for Store {
     }
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Best-effort fast-reopen checkpoint: persist the latest
+        // `tail_hint` so the next open starts its recovery scan past
+        // the bulk of the log instead of from the data-region start.
+        // Errors here are swallowed because Drop cannot fail; if the
+        // header doesn't make it to disk the next open just re-scans
+        // the whole log (correct, just slower).
+        let _ = self.persist_header();
+    }
+}
+
 impl Store {
     /// Open or create a store at `path`. On a fresh file the header is
     /// initialised with the supplied `flags`. The returned store is
@@ -543,8 +555,35 @@ impl Store {
     ///
     /// Returns I/O errors from the sync.
     pub(crate) fn flush(&self) -> Result<()> {
+        // Sync data only. The header's `tail_hint` is a hot-start hint
+        // for recovery — the recovery scan validates every record's
+        // CRC and discovers the real tail anyway, so a stale hint just
+        // costs a longer scan, never correctness or data loss. Writing
+        // the 4 KB header on every flush() is a measurable cost on
+        // Windows (each `seek + write_all` is ~2 syscalls and
+        // `FlushFileBuffers` cost scales with dirty-page count); we
+        // amortise it via [`Self::persist_header`], called on graceful
+        // close and explicitly when the caller wants a fast-reopen
+        // checkpoint.
+        let writer = self.writer.lock().map_err(|_| Error::LockPoisoned)?;
+        writer.file.sync_data()?;
+        Ok(())
+    }
+
+    /// Persist the in-memory header (with the current `tail_hint`) to
+    /// disk and `sync_data` afterwards. Cheap fast-reopen checkpoint:
+    /// the next [`Self::open`] of this file will start its recovery
+    /// scan from the persisted hint instead of from the data-region
+    /// start. Called automatically on graceful drop; can be called
+    /// explicitly by callers that want to trade flush latency for
+    /// reopen latency.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from the write/sync, or
+    /// [`Error::LockPoisoned`] on poisoned locks.
+    pub(crate) fn persist_header(&self) -> Result<()> {
         let mut writer = self.writer.lock().map_err(|_| Error::LockPoisoned)?;
-        // Persist the header with the latest tail_hint.
         let tail = writer.tail;
         let mut header = self.header.write().map_err(|_| Error::LockPoisoned)?;
         header.tail_hint = tail;
