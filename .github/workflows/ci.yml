@@ -40,6 +40,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@1.75.0
+      # Some transitive dependencies in the encryption stack (notably
+      # `base64ct` via `argon2 -> password-hash`) have started shipping
+      # with `edition = "2024"` in their newest patch releases, which
+      # Rust 1.75 does not understand. The dep tree still has older
+      # versions that compile cleanly on 1.75; pin the offenders here
+      # so the MSRV job exercises code that *we* control without
+      # tripping over RustCrypto's MSRV churn. Add new lines to this
+      # block whenever a future patch release tightens MSRV upstream.
+      - name: Pin transitive deps to MSRV-compatible versions
+        run: |
+          cargo update -p base64ct --precise 1.6.0
       - name: Build with MSRV (default features)
         run: cargo build --verbose
       - name: Build with MSRV (all features)
