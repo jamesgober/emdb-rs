@@ -152,7 +152,7 @@
 //! ## Cargo features
 //!
 //! - `ttl` *(default)* — per-record expiration and `default_ttl`.
-//! - `nested` — dotted-prefix group operations and [`Focus`] handles.
+//! - `nested` — dotted-prefix group operations and `Focus` handles.
 //! - `encrypt` — AES-256-GCM + ChaCha20-Poly1305 at-rest encryption
 //!   with raw-key or Argon2id-derived passphrase.
 //! - `bench-compare`, `bench-rocksdb`, `bench-redis` — comparative
