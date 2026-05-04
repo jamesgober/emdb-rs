@@ -58,6 +58,21 @@ impl Namespace {
         self.engine().get(self.ns_id, key.as_ref())
     }
 
+    /// Zero-copy fetch: returns a [`crate::ValueRef`] reading
+    /// directly from the kernel-managed mmap region. See
+    /// [`crate::Emdb::get_zerocopy`] for the trade-offs and the
+    /// encrypted-database fallback behaviour.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get`].
+    pub fn get_zerocopy(&self, key: impl AsRef<[u8]>) -> Result<Option<crate::ValueRef>> {
+        Ok(self
+            .engine()
+            .get_zerocopy(self.ns_id, key.as_ref())?
+            .map(|(v, _)| v))
+    }
+
     /// Remove a key, returning the previous value if any.
     pub fn remove(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         self.engine().remove(self.ns_id, key.as_ref())
@@ -86,20 +101,21 @@ impl Namespace {
         self.engine().clear_namespace(self.ns_id)
     }
 
-    /// Materialise every live record as `(key, value)` pairs.
+    /// Iterate over `(key, value)` pairs in this namespace.
+    ///
+    /// The iterator snapshots live record offsets at the time of
+    /// this call and decodes records lazily on `next()`. Memory
+    /// use scales with offset count, not total value size.
     pub fn iter(&self) -> Result<NamespaceIter> {
-        let snapshot = self.engine().collect_records(self.ns_id)?;
-        Ok(NamespaceIter {
-            inner: snapshot.into_iter(),
-        })
+        let offsets = self.engine().snapshot_offsets(self.ns_id)?;
+        Ok(NamespaceIter::new(Arc::clone(&self.inner), offsets))
     }
 
-    /// Iterate every live key.
+    /// Iterate every live key in this namespace. Same lazy
+    /// semantics as [`Self::iter`].
     pub fn keys(&self) -> Result<NamespaceKeyIter> {
-        let snapshot = self.engine().collect_records(self.ns_id)?;
-        Ok(NamespaceKeyIter {
-            inner: snapshot.into_iter(),
-        })
+        let offsets = self.engine().snapshot_offsets(self.ns_id)?;
+        Ok(NamespaceKeyIter::new(Arc::clone(&self.inner), offsets))
     }
 
     /// Range-scan keys in this namespace, returning `(key, value)`
@@ -130,30 +146,127 @@ impl Namespace {
             None => self.range(start..),
         }
     }
+
+    /// Streaming range scan: same semantics as [`Self::range`] but
+    /// returns an iterator that decodes values lazily on `next()`.
+    /// See [`crate::Emdb::range_iter`] for details.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::range`].
+    pub fn range_iter<R>(&self, range: R) -> Result<NamespaceRangeIter>
+    where
+        R: std::ops::RangeBounds<Vec<u8>>,
+    {
+        let pairs = self.engine().snapshot_range_offsets(self.ns_id, range)?;
+        Ok(NamespaceRangeIter::new(Arc::clone(&self.inner), pairs))
+    }
+
+    /// Streaming variant of [`Self::range_prefix`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::range_iter`].
+    pub fn range_prefix_iter(&self, prefix: impl AsRef<[u8]>) -> Result<NamespaceRangeIter> {
+        let prefix = prefix.as_ref();
+        let start = prefix.to_vec();
+        match crate::db::next_prefix(prefix) {
+            Some(end) => self.range_iter(start..end),
+            None => self.range_iter(start..),
+        }
+    }
 }
 
 /// Iterator over `(key, value)` pairs from [`Namespace::iter`].
+///
+/// Decodes records lazily from a snapshot of offsets captured at
+/// `iter()` time.
 pub struct NamespaceIter {
-    inner: std::vec::IntoIter<(Vec<u8>, Vec<u8>, u64)>,
+    inner: Arc<Inner>,
+    offsets: std::vec::IntoIter<u64>,
+}
+
+impl NamespaceIter {
+    fn new(inner: Arc<Inner>, offsets: Vec<u64>) -> Self {
+        Self {
+            inner,
+            offsets: offsets.into_iter(),
+        }
+    }
 }
 
 impl Iterator for NamespaceIter {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, v, _)| (k, v))
+        for offset in self.offsets.by_ref() {
+            match self.inner.engine.decode_owned_at(offset) {
+                Ok(Some((key, value, _))) => return Some((key, value)),
+                Ok(None) => continue,
+                Err(_) => continue,
+            }
+        }
+        None
     }
 }
 
 /// Iterator over keys from [`Namespace::keys`].
 pub struct NamespaceKeyIter {
-    inner: std::vec::IntoIter<(Vec<u8>, Vec<u8>, u64)>,
+    inner: Arc<Inner>,
+    offsets: std::vec::IntoIter<u64>,
+}
+
+impl NamespaceKeyIter {
+    fn new(inner: Arc<Inner>, offsets: Vec<u64>) -> Self {
+        Self {
+            inner,
+            offsets: offsets.into_iter(),
+        }
+    }
 }
 
 impl Iterator for NamespaceKeyIter {
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, _, _)| k)
+        for offset in self.offsets.by_ref() {
+            match self.inner.engine.decode_owned_at(offset) {
+                Ok(Some((key, _value, _))) => return Some(key),
+                Ok(None) => continue,
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+}
+
+/// Streaming range iterator returned by
+/// [`Namespace::range_iter`] / [`Namespace::range_prefix_iter`].
+pub struct NamespaceRangeIter {
+    inner: Arc<Inner>,
+    pairs: std::vec::IntoIter<(Vec<u8>, u64)>,
+}
+
+impl NamespaceRangeIter {
+    fn new(inner: Arc<Inner>, pairs: Vec<(Vec<u8>, u64)>) -> Self {
+        Self {
+            inner,
+            pairs: pairs.into_iter(),
+        }
+    }
+}
+
+impl Iterator for NamespaceRangeIter {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for (key, offset) in self.pairs.by_ref() {
+            match self.inner.engine.read_value_with_meta_at(offset, &key) {
+                Ok(Some((value, _expires))) => return Some((key, value)),
+                Ok(None) => continue,
+                Err(_) => continue,
+            }
+        }
+        None
     }
 }

@@ -15,4 +15,4 @@ pub(crate) mod index;
 #[allow(dead_code)]
 pub(crate) mod store;
 
-pub(crate) use engine::{Engine, EngineConfig, RecordSnapshot, DEFAULT_NAMESPACE_ID};
+pub(crate) use engine::{Engine, EngineConfig, DEFAULT_NAMESPACE_ID};

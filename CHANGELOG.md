@@ -4,6 +4,94 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2](https://github.com/jamesgober/emdb-rs/compare/v0.7.1...v0.7.2) — 2026-05-03
+
+A polish release ahead of v0.8's architectural work. Nothing here
+breaks the v0.7 file format or the public API; everything is
+additive or a documentation correction.
+
+### Added
+
+- **`Emdb::checkpoint()`** — explicit fast-reopen checkpoint. The
+  `flush()` path was deliberately stripped of header rewriting in
+  v0.7.1 because writing the 4 KB header on every per-record
+  `flush()` dominates Windows `FlushFileBuffers` cost and dragged
+  the per-record-durability column hard. The trade-off is that
+  reopens after long writer sessions need to walk the data region
+  from the last persisted `tail_hint` up to the actual tail. For
+  large databases that can be slow.
+
+  `checkpoint()` rewrites the header with the current tail and
+  `fdatasync`s, so the next [`Emdb::open`] starts its recovery
+  scan past the bulk of the log. Call it at quiescent points
+  (after a bulk load, before a long idle period, on graceful
+  shutdown). The drop of the last handle still attempts a
+  checkpoint as a backstop, but `Drop` cannot return errors —
+  long-lived processes that care about reopen latency should call
+  `checkpoint()` explicitly so they can surface I/O errors to the
+  caller.
+
+  Backed by [`Store::persist_header`] under the hood; the new
+  public API is the contract surface.
+
+- **`tests/checkpoint.rs`** — five integration tests covering: a
+  fresh database, post-flush checkpoints, repeated checkpoints
+  with no intervening writes, the drop-time fallback path, and
+  the round-trip-after-checkpoint correctness check (every
+  inserted record is still readable after reopen).
+
+### Changed
+
+- **README — honest framing of the two columns where the
+  comparison reads as a defect.** Both rows previously read as
+  weaknesses; both deserve more nuance.
+
+  - `individual writes (fsync/op)` reads "see note 1" instead of
+    "37× slower". The note explains that the column is bounded by
+    one `FlushFileBuffers` per record on Windows (≈27 ms / call,
+    irrespective of dirty-page count) — that is an OS floor, not
+    an emdb design defect — and references the v0.8 group-commit
+    pipeline that closes the gap. Workloads that need per-record
+    durability already have two paths that win in the aggregate
+    columns: `db.transaction(|tx| ...)` (one fsync per
+    transaction) and `db.insert_many(...)` (one fsync per batch).
+  - `random range reads` reads "opt-in" instead of "N/A / feature
+    gap". emdb does support range scans — they require
+    [`EmdbBuilder::enable_range_scans(true)`] at open time
+    (documented in the README's [Range scans](#range-scans)
+    section). The phase reads as N/A only because the
+    `lmdb_style` bench runs in hash-only mode by default. A fair
+    head-to-head bench requires the streaming range API arriving
+    in v0.8 (today's `range()` materialises the full result set,
+    so the redb pattern of "range from key, take 10" would walk
+    every match before returning).
+
+  Both notes link forward to the v0.8 work that closes each gap.
+
+- **README Status block** updated to v0.7.2; added a paragraph on
+  the v0.8 / v1.0 roadmap so consumers can see what's queued.
+- **README Persistence section** documents the new
+  `checkpoint()` call alongside `flush()` so the durability /
+  fast-reopen split is discoverable from the front page rather
+  than only from the API docs.
+
+### CI
+
+- **MSRV job pinned to 1.75.** The `rust-version` in `Cargo.toml`
+  has claimed 1.75 since v0.5; CI never enforced it. New job
+  builds with both default and `ttl,nested,encrypt` feature sets
+  on the pinned toolchain. Future MSRV bumps are now a deliberate
+  CI change, not an accident.
+- Build/test step renamed to clarify it covers unit + integration
+  + doctests in one invocation.
+
+### Notes
+
+- No file format change. v0.7.1 databases open unchanged in
+  v0.7.2.
+- No new dependencies.
+- No public API removed; `checkpoint()` is a pure addition.
+
 ## [0.7.1](https://github.com/jamesgober/emdb-rs/compare/v0.7.0...v0.7.1) — 2026-04-25
 
 ### Major change — storage engine rewritten as Bitcask-style mmap + append-only log
