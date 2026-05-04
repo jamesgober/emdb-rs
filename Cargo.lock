@@ -459,6 +459,7 @@ dependencies = [
  "redis",
  "rocksdb",
  "sled",
+ "zeroize",
 ]
 
 [[package]]

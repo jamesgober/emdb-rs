@@ -22,7 +22,7 @@ pub struct EmdbBuilder {
     pub(crate) enable_range_scans: bool,
     pub(crate) flush_policy: crate::FlushPolicy,
     #[cfg(feature = "encrypt")]
-    pub(crate) encryption_key: Option<[u8; 32]>,
+    pub(crate) encryption_key: Option<crate::encryption::KeyBytes>,
     #[cfg(feature = "encrypt")]
     pub(crate) encryption_passphrase: Option<String>,
     #[cfg(feature = "encrypt")]
@@ -108,10 +108,18 @@ impl EmdbBuilder {
 
     /// Enable AES-256-GCM at-rest encryption with a raw 32-byte key.
     /// Mutually exclusive with [`Self::encryption_passphrase`].
+    ///
+    /// The key bytes are wrapped in [`zeroize::Zeroizing`] internally
+    /// so they clear on drop. The caller is still responsible for
+    /// zeroizing their own copy of the key after passing it in —
+    /// this method takes the array by value, so the caller's
+    /// original is moved here, but a `Copy` wouldn't be (and
+    /// `[u8; 32]` is `Copy`). Keep the original behind a
+    /// `Zeroizing<[u8; 32]>` on the caller side if you can.
     #[cfg(feature = "encrypt")]
     #[must_use]
     pub fn encryption_key(mut self, key: [u8; 32]) -> Self {
-        self.encryption_key = Some(key);
+        self.encryption_key = Some(crate::encryption::KeyBytes::from(key));
         self
     }
 

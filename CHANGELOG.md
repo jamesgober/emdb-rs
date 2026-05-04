@@ -29,13 +29,35 @@ a single `fdatasync`. The protocol is a leader-follower scheme
 For a workload of N independent producer threads each writing one
 record then calling `flush` for per-record durability, this turns
 `N × fsync_cost` into roughly `(N / max_batch) × fsync_cost`. The
-"individual writes (fsync/op)" column in the `lmdb_style` bench —
-which read 37× slower than redb in v0.7.x because it paid one
-`FlushFileBuffers` per record — moves substantially under
-`Group { max_wait: 500 µs, max_batch: 32 }`. Single-threaded
-flush is unchanged from v0.7.x: with no follower to wait for, the
-leader's `max_wait` window terminates as soon as no follower
-arrives, and the sync runs.
+new `benches/group_commit.rs` baseline measures **7.40× aggregate
+write throughput** under `Group { max_wait: 500 µs, max_batch: 8 }`
+vs. `OnEachFlush` on a 4-core consumer box with 8 producer threads
+(see the README's bench section). Single-threaded flush is
+unchanged from v0.7.x: with no follower to wait for, the leader's
+`max_wait` window terminates as soon as no follower arrives.
+
+Two implementation details that landed alongside `Group` so it
+actually wins:
+
+1. **Sync handle decoupled from the writer mutex.** The store now
+   holds a `try_clone`'d sibling `File` exclusively for `sync_data`
+   calls. This means an in-flight fsync no longer blocks concurrent
+   `pwrite` from other threads — without this, every `flush()`
+   already serialised through the writer mutex, leaving group
+   commit nothing to fuse. The clone is refreshed on file rename
+   (in `swap_underlying`); on file growth it stays valid because
+   `set_len` does not invalidate cloned descriptors.
+2. **Followers wake the leader on arrival.** The coordinator now
+   `cv.notify_all()` after incrementing `pending`, so the leader
+   immediately re-checks the `pending >= max_batch` exit condition
+   instead of sleeping the full `max_wait` regardless of follower
+   arrival.
+
+`max_batch` should be set close to the expected concurrent flusher
+count (typically `num_cpus::get()`). Setting it higher than the
+real concurrency turns the leader's `max_wait` into pure tail
+latency — the documentation on `FlushPolicy::Group` calls this out
+explicitly.
 
 Public surface:
 
@@ -157,6 +179,73 @@ internal representation moved from `IntoIter<RecordSnapshot>` to
 `(Arc<Inner>, IntoIter<u64>)` — reflects the shift to lazy
 decode. No SemVer impact for callers using them via the
 `Iterator` trait.
+
+### Added — `benches/group_commit.rs`
+
+A multi-thread per-record-flush benchmark that exercises the new
+group-commit pipeline directly. Runs the same workload twice —
+once under `OnEachFlush` and once under `Group { max_wait: 500 µs,
+max_batch: 32 }` — and prints aggregate writes/sec plus a speedup
+column. Tunable via env vars (`EMDB_BENCH_GC_THREADS`,
+`EMDB_BENCH_GC_PER_THREAD`, `EMDB_BENCH_GC_MAX_WAIT_US`,
+`EMDB_BENCH_GC_MAX_BATCH`) so callers can match their own deployment
+profile.
+
+### Security — `zeroize` on key material
+
+`zeroize` is added as a direct optional dependency gated on the
+`encrypt` feature (it was already present transitively via
+`aes-gcm` / `argon2`; the explicit declaration just enforces the
+relationship). A new `crate::encryption::KeyBytes` type alias
+wraps `[u8; 32]` in `zeroize::Zeroizing`, and every internal
+storage location for raw key material now uses it:
+
+- `EmdbBuilder::encryption_key` field — was `Option<[u8; 32]>`,
+  now `Option<KeyBytes>`. Public method signature still takes
+  `[u8; 32]` by value; the bytes are wrapped immediately on
+  entry.
+- `EngineConfig::encryption_key` — same change.
+- `derive_key_from_passphrase` return type — was `[u8; 32]`,
+  now `KeyBytes`. The Argon2id `hash_password_into` call writes
+  through the wrapper's mutable reference, so the derived key
+  never exists on the heap outside the `Zeroizing` envelope.
+
+The cipher state inside `EncryptionContext` already zeroized on
+drop via RustCrypto's transitive `zeroize` integration. Together
+these mean no copy of the raw key material remains in heap memory
+once the `EmdbBuilder` and any derived `EngineConfig` /
+`EncryptionContext` drop. Closes the REPS Security
+"MUST use the `zeroize` crate" item.
+
+The public `EncryptionInput::Key([u8; 32])` enum variant is
+intentionally unchanged — switching its payload would be a
+SemVer break without meaningful benefit (the bytes spend
+microseconds on the stack between `EncryptionInput::Key`
+construction and the builder wrapping them in `Zeroizing`).
+
+### CI
+
+- New `audit` job runs `cargo audit` against the RustSec advisory
+  database and fails on warnings. Catches CVEs in transitive deps
+  before they reach a release.
+- New `deny` job runs `cargo deny check` against the policy in
+  the new `deny.toml`. Enforces license, banned-crate, duplicate-
+  version, and source-registry rules. Both `audit` and `deny` are
+  required by REPS for production-track crates.
+- `clippy::undocumented_unsafe_blocks` added to the crate-root lint
+  set. Every `unsafe { ... }` block now carries a `// SAFETY:`
+  comment that the compiler validates the *presence* of (not the
+  content — that's still a human-review job).
+
+### Documentation
+
+- Crate-level docs (`src/lib.rs`) extended with sections on the new
+  v0.8 surface: zero-copy reads, streaming iteration, range scans,
+  group-commit durability, and the Cargo feature matrix.
+  Doctest-validated; previous 6 doctest count is now 10.
+- `// Phase 1` / `// Phase 2` comment style replaced throughout the
+  storage and encryption-admin code paths with descriptive comments
+  per REPS documentation guidance. Behaviour unchanged.
 
 ### Notes
 

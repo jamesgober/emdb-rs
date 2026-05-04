@@ -50,6 +50,11 @@ chacha20poly1305 = { version = "0.10", optional = true, default-features = false
 rand_core = { version = "0.6", optional = true, default-features = false, features = ["getrandom"] }
 # Argon2id KDF for passphrase-derived keys.
 argon2 = { version = "0.5", optional = true, default-features = false, features = ["alloc"] }
+# Memory-zeroing wrappers for key material. Already present
+# transitively via aes-gcm; declared explicitly here so the
+# encryption-path source can wrap raw key bytes in `Zeroizing` and
+# the dep is enforced rather than incidental.
+zeroize = { version = "1", optional = true, default-features = false }
 # Comparative-bench peers (dev convenience, not for production users).
 redb = { version = "2.1", optional = true }
 redis = { version = "0.27", optional = true }
@@ -67,7 +72,7 @@ nested = []
 # AES-256-GCM + ChaCha20-Poly1305 at-rest encryption with raw-key or
 # Argon2id-derived passphrase. Activates the
 # `EmdbBuilder::encryption_key`/`encryption_passphrase` APIs.
-encrypt = ["dep:aes-gcm", "dep:rand_core", "dep:argon2", "dep:chacha20poly1305"]
+encrypt = ["dep:aes-gcm", "dep:rand_core", "dep:argon2", "dep:chacha20poly1305", "dep:zeroize"]
 bench-compare = ["dep:redb", "dep:sled"]
 bench-redis = ["dep:redis"]
 bench-rocksdb = ["dep:rocksdb"]
@@ -95,6 +100,11 @@ harness = false
 [[bench]]
 name = "concurrent_reads"
 harness = false
+
+[[bench]]
+name = "group_commit"
+harness = false
+required-features = ["ttl"]
 
 [[bench]]
 name = "lmdb_style"

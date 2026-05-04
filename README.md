@@ -32,59 +32,95 @@ milliseconds. Run on a Windows 11 NVMe consumer box. Reproduce with
 
 | phase                       |        emdb |    redb  |    sled  |  emdb vs redb     |
 |-----------------------------|------------:|---------:|---------:|------------------:|
-| bulk load                   |    **4498** |    74496 |    60807 |     16.6× faster  |
-| batch writes                |    **2814** |    11043 |     1972 |      3.9× faster  |
-| nosync writes               |     **220** |     1717 |     1136 |      7.8× faster  |
-| random reads (1M)           |     **596** |     5289 |    11197 |      8.9× faster  |
-| random reads (4 threads)    |    **1083** |    17543 |    34605 |     16.2× faster  |
-| random reads (8 threads)    |     **653** |    17160 |    33284 | **26× faster**    |
-| removals                    |   **11948** |    54905 |    46155 |      4.6× faster  |
-| compaction                  |   **11490** |    16506 |      N/A |      1.4× faster  |
-| uncompacted size            |    1.08 GiB | 4.00 GiB | 2.13 GiB |     3.7× smaller  |
+| bulk load                   |    **3089** |    48221 |    32994 |     15.6× faster  |
+| batch writes                |    **2752** |     6555 |     1325 |      2.4× faster  |
+| nosync writes               |     **125** |     1142 |      681 |      9.1× faster  |
+| random reads (1M)           |     **351** |     3071 |     6255 |      8.7× faster  |
+| random reads (4 threads)    |     **799** |    14761 |    22692 |     18.5× faster  |
+| random reads (8 threads)    |     **503** |    14413 |    24372 | **28.6× faster**  |
+| removals                    |    **6659** |    35388 |    56910 |      5.3× faster  |
+| compaction                  |    **7158** |    11473 |      N/A |      1.6× faster  |
+| uncompacted size            |    1.08 GiB | 4.00 GiB | 2.15 GiB |     3.7× smaller  |
 | compacted size              | **498 MiB** | 1.64 GiB |      N/A |     3.4× smaller  |
-| individual writes (fsync/op)|       27455 |  **734** |  **316** | see note 1        |
-| random range reads          |       opt-in|     3958 |     9688 | see note 2        |
+| individual writes (fsync/op)|       26779 |  **611** |  **534** | see note 1        |
+| random range reads          |       opt-in|     2538 |     6164 | see note 2        |
 
 emdb wins every aggregate-throughput column at 5 M scale, often by
-**order-of-magnitude margins**. Two notes on the columns where
-the picture is more nuanced:
+**order-of-magnitude margins**. Two notes on the columns where the
+picture is more nuanced:
 
 1. **`individual writes` is fsync-bound.** This phase calls
-   `db.insert(); db.flush();` per record. Each `db.flush()` is one
-   `fdatasync` (one `FlushFileBuffers` on Windows), and that syscall
-   is the floor — ~27 ms / call on the reference NVMe consumer box,
-   regardless of how few bytes were dirtied. redb and sled win this
-   column because their commit machinery folds adjacent writes into
-   a single sync (redb's WAL + write transaction batching; sled's
-   LSM log appends). emdb's group-commit pipeline lands in **v0.8**
-   and closes this gap; until then, workloads that need per-record
-   durability should batch through `db.transaction(|tx| ...)` (one
-   fsync per transaction) or `db.insert_many(...)` (one fsync per
-   batch), both of which already dominate redb in the aggregate
-   columns above.
+   `db.insert(); db.flush();` per record from a single thread. Each
+   `db.flush()` is one `fdatasync` (one `FlushFileBuffers` on
+   Windows) and that syscall is the floor — ~27 ms / call on the
+   reference NVMe consumer box, regardless of how few bytes were
+   dirtied. redb and sled win this single-threaded column because
+   their commit machinery folds adjacent writes into a single sync.
+   For multi-threaded per-record-durability workloads, opt into
+   `FlushPolicy::Group` — the [group-commit benchmark
+   below](#group-commit-multi-threaded-per-record-durability) shows
+   it converting 8 concurrent flushers into one shared fsync for
+   a **7× write-throughput win**. Single-thread workloads should
+   still batch through `db.transaction(|tx| ...)` or
+   `db.insert_many(...)`, both of which already dominate redb in
+   the aggregate columns above.
 2. **Range reads are opt-in, not unsupported.** emdb's primary
    index is hash-keyed, so the default open does not pay the memory
    tax for sorted iteration. Set
    `EmdbBuilder::enable_range_scans(true)` to maintain a parallel
    `BTreeMap` secondary index per namespace — see the
    [Range scans](#range-scans) section below for the API and the
-   memory-cost trade-off. The `lmdb_style` bench runs in hash-only
-   mode (which is why the row reads `opt-in`); a fair head-to-head
-   range bench requires the streaming range API arriving in v0.8.
+   memory-cost trade-off. v0.8 also adds streaming
+   `Emdb::range_iter` / `range_prefix_iter` so consumers that only
+   read the first few elements pay only for what they consume.
 
 ### Read scaling under fan-out
 
-The MT random-read columns above show emdb scaling to **7.66 M reads/sec
-aggregate at 8 threads** on a 4-core consumer box, while redb stalls
-near 290 K/sec past one thread. The lock-free `Arc<Mmap>` read path
-plus the 64-shard hash index keep the hot path contention-free; past
-core count, shared memory bandwidth is the only cap.
+The MT random-read columns above show emdb scaling to **9.94 M
+reads/sec aggregate at 8 threads** on a 4-core consumer box, while
+redb stalls near 347 K/sec past one thread. The lock-free `Arc<Mmap>`
+read path plus the 64-shard hash index keep the hot path contention-
+free; past core count, shared memory bandwidth is the only cap.
 
 For more thread-count granularity, run
 `cargo bench --bench concurrent_reads`.
 
-See [docs/BENCH.md](docs/BENCH.md) for full run instructions and tuning
-notes.
+### Group commit: multi-threaded per-record durability
+
+`FlushPolicy::Group` lets concurrent `flush()` calls share a single
+`fdatasync`. The shape that motivates it is N independent producer
+threads each writing one record then calling `flush` for per-record
+durability — a pattern where `OnEachFlush` pays N syncs even though
+one would do.
+
+Run with `cargo bench --bench group_commit --features ttl`. Default
+workload is 8 threads × 200 writes/thread:
+
+| policy         | wall time (ms) |   writes/sec |    speedup |
+|----------------|---------------:|-------------:|-----------:|
+| OnEachFlush    |          1490  |       1 073  |      1.00× |
+| Group          |       **201**  |    **7 946** |  **7.40×** |
+
+`max_batch` should be set close to the expected concurrent flusher
+count (typically `num_cpus`). Setting it higher means the leader
+waits the full `max_wait` for followers that can never arrive,
+turning batching into pure tail latency.
+
+```rust,no_run
+use std::time::Duration;
+use emdb::{Emdb, FlushPolicy};
+
+let db = Emdb::builder()
+    .flush_policy(FlushPolicy::Group {
+        max_wait: Duration::from_micros(500),
+        max_batch: 8,
+    })
+    .build()?;
+# Ok::<(), emdb::Error>(())
+```
+
+See [docs/BENCH.md](docs/BENCH.md) for full run instructions and
+tuning notes.
 
 ## Status
 
