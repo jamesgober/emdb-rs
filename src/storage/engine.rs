@@ -772,6 +772,111 @@ impl Engine {
         Ok(self.get_with_meta(ns_id, key)?.map(|(v, _)| v))
     }
 
+    /// Zero-copy variant of [`Self::get`]. Returns the value as a
+    /// [`crate::ValueRef`] that holds a strong reference to the
+    /// mmap region, so the bytes can be read without allocation.
+    /// Encrypted databases fall back to an owned plaintext buffer
+    /// inside the [`crate::ValueRef`] (zero-copy is impossible
+    /// across an AEAD boundary).
+    pub(crate) fn get_zerocopy(
+        &self,
+        ns_id: u32,
+        key: &[u8],
+    ) -> Result<Option<(crate::ValueRef, u64)>> {
+        let ns = self.namespace(ns_id)?;
+        let key_hash = Index::hash_key(key);
+        let offset = match ns.index.get(key_hash, key)? {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        self.read_zerocopy_at(offset, key)
+    }
+
+    /// Decode the record at `offset`, returning a [`crate::ValueRef`]
+    /// pointing at the value bytes (or carrying owned plaintext for
+    /// encrypted databases) plus the record's `expires_at`.
+    /// Returns `Ok(None)` if the offset's record is no longer a
+    /// live `Insert` whose key matches `expected_key`.
+    fn read_zerocopy_at(
+        &self,
+        offset: u64,
+        expected_key: &[u8],
+    ) -> Result<Option<(crate::ValueRef, u64)>> {
+        let mmap = self.store.mmap()?;
+        let bytes: &[u8] = &mmap;
+
+        #[cfg(feature = "encrypt")]
+        if let Some(ctx) = self.encryption.as_ref() {
+            let ctx = Arc::clone(ctx);
+            let result = format::try_decode_encrypted_record(
+                bytes,
+                offset as usize,
+                offset,
+                |nonce, ct| {
+                    let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
+                    input.extend_from_slice(nonce);
+                    input.extend_from_slice(ct);
+                    ctx.decrypt(&input)
+                },
+            )?;
+            return Ok(match result {
+                Some((
+                    OwnedRecord::Insert {
+                        key,
+                        value,
+                        expires_at,
+                        ..
+                    },
+                    _,
+                )) => {
+                    if key.as_slice() == expected_key {
+                        Some((crate::ValueRef::from_owned(value), expires_at))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            });
+        }
+
+        // Plaintext path: figure out the byte range of the value
+        // inside the mmap, then construct an mmap-backed ValueRef.
+        let decoded = format::try_decode_record(bytes, offset as usize, offset)?;
+        let (value_range, expires_at) = match decoded {
+            Some(d) => match d.view {
+                RecordView::Insert {
+                    key,
+                    value,
+                    expires_at,
+                    ..
+                } => {
+                    if key != expected_key {
+                        return Ok(None);
+                    }
+                    // Compute the absolute byte range of `value`
+                    // inside `mmap` via pointer arithmetic. The
+                    // slice `value` was borrowed directly from
+                    // `bytes` (== `&mmap`), so subtracting base
+                    // pointers is the right way to recover the
+                    // offset without re-parsing the framing.
+                    let base = bytes.as_ptr() as usize;
+                    let val_start = value.as_ptr() as usize - base;
+                    let val_end = val_start + value.len();
+                    (val_start..val_end, expires_at)
+                }
+                _ => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+
+        // The `bytes`/`decoded` borrows of `mmap` end here under NLL,
+        // so moving `mmap` into `ValueRef` is fine.
+        Ok(Some((
+            crate::ValueRef::from_mmap(mmap, value_range),
+            expires_at,
+        )))
+    }
+
     /// Fetch value + expires_at for a key in one pass. Used by the TTL
     /// path in `Emdb::get` so it doesn't have to make two record reads.
     pub(crate) fn get_with_meta(&self, ns_id: u32, key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
@@ -870,6 +975,13 @@ impl Engine {
     /// Force pending writes to disk.
     pub(crate) fn flush(&self) -> Result<()> {
         self.store.flush()
+    }
+
+    /// Persist the in-memory header (with current `tail_hint`) to disk.
+    /// Implements the fast-reopen checkpoint exposed via
+    /// [`crate::Emdb::checkpoint`].
+    pub(crate) fn checkpoint(&self) -> Result<()> {
+        self.store.persist_header()
     }
 
     /// Compact the on-disk file by rewriting only live records, then
@@ -1138,6 +1250,105 @@ impl Engine {
             }
         }
         Ok(out)
+    }
+
+    /// Snapshot the live record offsets in `ns_id`, sorted ascending.
+    /// Used by lazy iterators (`iter`, `keys`) so they can decode
+    /// records on demand instead of materialising everything up front.
+    pub(crate) fn snapshot_offsets(&self, ns_id: u32) -> Result<Vec<u64>> {
+        let ns = self.namespace(ns_id)?;
+        let mut offsets = ns.index.collect_offsets()?;
+        offsets.sort_unstable();
+        Ok(offsets)
+    }
+
+    /// Snapshot the (key, offset) pairs in a `range` query under a
+    /// single read-lock acquisition, sorted by key. Used by lazy
+    /// range iterators so the BTreeMap lock isn't held across the
+    /// caller's iteration. The keys are cloned out of the BTreeMap
+    /// (cheap relative to value reads); offsets are looked up in
+    /// the mmap on each `next()`.
+    pub(crate) fn snapshot_range_offsets<R>(
+        &self,
+        ns_id: u32,
+        range: R,
+    ) -> Result<Vec<(Vec<u8>, u64)>>
+    where
+        R: RangeBounds<Vec<u8>>,
+    {
+        let ns = self.namespace(ns_id)?;
+        let range_lock = ns.range_index.as_ref().ok_or(Error::InvalidConfig(
+            "range scans not enabled; pass `EmdbBuilder::enable_range_scans(true)` at open time",
+        ))?;
+
+        let guard = range_lock.read().map_err(|_| Error::LockPoisoned)?;
+        let start = match range.start_bound() {
+            Bound::Included(v) => Bound::Included(v.as_slice()),
+            Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(v) => Bound::Included(v.as_slice()),
+            Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        Ok(guard
+            .range::<[u8], _>((start, end))
+            .map(|(k, off)| (k.clone(), *off))
+            .collect())
+    }
+
+    /// Decode a single record at `offset` into an owned tuple. Used by
+    /// the lazy iterator's `next()`. Returns `Ok(None)` when the
+    /// record is no longer a live `Insert` (overwritten in place,
+    /// tombstoned, or unrelated record kind at the offset).
+    pub(crate) fn decode_owned_at(&self, offset: u64) -> Result<Option<RecordSnapshot>> {
+        let mmap = self.store.mmap()?;
+        let bytes: &[u8] = &mmap;
+
+        #[cfg(feature = "encrypt")]
+        if let Some(ctx) = self.encryption.as_ref() {
+            let ctx = Arc::clone(ctx);
+            let result = format::try_decode_encrypted_record(
+                bytes,
+                offset as usize,
+                offset,
+                |nonce, ct| {
+                    let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
+                    input.extend_from_slice(nonce);
+                    input.extend_from_slice(ct);
+                    ctx.decrypt(&input)
+                },
+            )?;
+            return Ok(match result {
+                Some((
+                    OwnedRecord::Insert {
+                        key,
+                        value,
+                        expires_at,
+                        ..
+                    },
+                    _,
+                )) => Some((key, value, expires_at)),
+                _ => None,
+            });
+        }
+
+        Self::decode_plaintext_into_triple(bytes, offset)
+    }
+
+    /// Read just the value at `offset`, validating the on-disk key
+    /// matches `expected_key`. Returns `Ok(None)` if the record was
+    /// overwritten by a later record with a different key (hash
+    /// collision repaired) or is no longer an `Insert`. Used by
+    /// lazy range iterators that already know the key from the
+    /// BTreeMap snapshot.
+    pub(crate) fn read_value_with_meta_at(
+        &self,
+        offset: u64,
+        expected_key: &[u8],
+    ) -> Result<Option<(Vec<u8>, u64)>> {
+        self.read_value_at(offset, expected_key)
     }
 
     /// Materialise every live record in `ns_id` as `(key, value, expires_at)`.

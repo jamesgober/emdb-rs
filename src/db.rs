@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::builder::EmdbBuilder;
 use crate::lockfile::LockFile;
-use crate::storage::{Engine, EngineConfig, RecordSnapshot, DEFAULT_NAMESPACE_ID};
+use crate::storage::{Engine, EngineConfig, DEFAULT_NAMESPACE_ID};
 use crate::Result;
 
 #[cfg(feature = "ttl")]
@@ -222,6 +222,42 @@ impl Emdb {
         self.inner.engine.insert_many(DEFAULT_NAMESPACE_ID, owned)
     }
 
+    /// Zero-copy fetch: returns a [`crate::ValueRef`] that reads
+    /// directly from the kernel-managed mmap region (no copy, no
+    /// allocation) on unencrypted databases.
+    ///
+    /// Encrypted databases fall back to an owned plaintext buffer
+    /// inside the [`crate::ValueRef`] — AEAD decryption necessarily
+    /// allocates fresh bytes — but the caller-facing type is the
+    /// same.
+    ///
+    /// The returned reference holds a strong handle to the mmap
+    /// region, so it is safe to keep across writer activity (file
+    /// growth, in-place updates) — the kernel keeps the original
+    /// mapping alive until the last [`crate::ValueRef`] derived
+    /// from it drops.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get`].
+    pub fn get_zerocopy(&self, key: impl AsRef<[u8]>) -> Result<Option<crate::ValueRef>> {
+        let key = key.as_ref();
+        match self.inner.engine.get_zerocopy(DEFAULT_NAMESPACE_ID, key)? {
+            None => Ok(None),
+            Some((value_ref, expires_at)) => {
+                #[cfg(feature = "ttl")]
+                {
+                    if expires_at != 0 && is_expired(Some(expires_at), now_unix_millis()) {
+                        return Ok(None);
+                    }
+                }
+                #[cfg(not(feature = "ttl"))]
+                let _ = expires_at;
+                Ok(Some(value_ref))
+            }
+        }
+    }
+
     /// Fetch a value by key.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
@@ -276,20 +312,51 @@ impl Emdb {
         self.inner.engine.flush()
     }
 
+    /// Persist a fast-reopen checkpoint: rewrites the file header with
+    /// the current tail offset and `fdatasync`s.
+    ///
+    /// `flush` only syncs record bytes; it deliberately does not
+    /// rewrite the header on every call because that would dominate
+    /// per-record fsync latency on Windows. The recovery scan is
+    /// always correct without an up-to-date header — it just costs a
+    /// linear walk of the data region from the last persisted hint.
+    /// `checkpoint` updates the hint so the next [`Self::open`] starts
+    /// its scan past the bulk of the log.
+    ///
+    /// Call this at quiescent points (after a bulk load, before a
+    /// long idle period, on graceful shutdown). The [`Drop`] of the
+    /// last handle attempts a checkpoint as a backstop, but its
+    /// success is not guaranteed (`Drop` cannot return errors), so
+    /// callers that depend on a fast next-open should call this
+    /// explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from the header write or the `fdatasync`,
+    /// or [`crate::Error::LockPoisoned`] on poisoned engine locks.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.inner.engine.checkpoint()
+    }
+
     /// Iterator over `(key, value)` pairs in the default namespace.
+    ///
+    /// The iterator captures a snapshot of live record offsets at
+    /// the time of this call and decodes each record lazily on
+    /// `next()`. Memory use is `O(N)` for `N` record offsets — it
+    /// does *not* eagerly materialise every value. Records inserted
+    /// after the snapshot is taken are not visible; records removed
+    /// after the snapshot are skipped on decode.
     pub fn iter(&self) -> Result<EmdbIter> {
-        let snapshot = self.inner.engine.collect_records(DEFAULT_NAMESPACE_ID)?;
-        Ok(EmdbIter {
-            inner: snapshot.into_iter(),
-        })
+        let offsets = self.inner.engine.snapshot_offsets(DEFAULT_NAMESPACE_ID)?;
+        Ok(EmdbIter::new(Arc::clone(&self.inner), offsets))
     }
 
     /// Iterator over keys in the default namespace.
+    ///
+    /// Same lazy snapshot semantics as [`Self::iter`].
     pub fn keys(&self) -> Result<EmdbKeyIter> {
-        let snapshot = self.inner.engine.collect_records(DEFAULT_NAMESPACE_ID)?;
-        Ok(EmdbKeyIter {
-            inner: snapshot.into_iter(),
-        })
+        let offsets = self.inner.engine.snapshot_offsets(DEFAULT_NAMESPACE_ID)?;
+        Ok(EmdbKeyIter::new(Arc::clone(&self.inner), offsets))
     }
 
     /// Range-scan keys in the default namespace, returning `(key, value)`
@@ -326,6 +393,31 @@ impl Emdb {
         self.inner.engine.range_scan(DEFAULT_NAMESPACE_ID, range)
     }
 
+    /// Streaming range scan: same semantics as [`Self::range`] but
+    /// returns an iterator that decodes values lazily on `next()`.
+    /// Use this when only the first few elements are needed (e.g.
+    /// "find the next 10 keys at or after this prefix") so the cost
+    /// of decoding the rest of the range is never paid.
+    ///
+    /// The iterator snapshots `(key, offset)` pairs from the
+    /// secondary BTreeMap under a single read-lock acquisition;
+    /// subsequent inserts that fall within the range are not
+    /// visible. Values are read through the mmap on demand.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::range`].
+    pub fn range_iter<R>(&self, range: R) -> Result<EmdbRangeIter>
+    where
+        R: std::ops::RangeBounds<Vec<u8>>,
+    {
+        let pairs = self
+            .inner
+            .engine
+            .snapshot_range_offsets(DEFAULT_NAMESPACE_ID, range)?;
+        Ok(EmdbRangeIter::new(Arc::clone(&self.inner), pairs))
+    }
+
     /// Range-scan all keys with a given prefix in the default namespace.
     /// Convenience wrapper over [`Self::range`] that constructs a half-
     /// open `[prefix, prefix++)` range.
@@ -340,6 +432,20 @@ impl Emdb {
         match end {
             Some(end) => self.range(start..end),
             None => self.range(start..),
+        }
+    }
+
+    /// Streaming variant of [`Self::range_prefix`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::range_iter`].
+    pub fn range_prefix_iter(&self, prefix: impl AsRef<[u8]>) -> Result<EmdbRangeIter> {
+        let prefix = prefix.as_ref();
+        let start = prefix.to_vec();
+        match next_prefix(prefix) {
+            Some(end) => self.range_iter(start..end),
+            None => self.range_iter(start..),
         }
     }
 
@@ -540,28 +646,108 @@ impl Inner {
 }
 
 /// Iterator over `(key, value)` pairs from [`Emdb::iter`].
+///
+/// Decodes records lazily from the snapshot of offsets captured at
+/// `iter()` time. Skips offsets whose record can no longer be
+/// decoded as a live `Insert` (overwritten in place or otherwise
+/// invalidated since the snapshot).
 pub struct EmdbIter {
-    inner: std::vec::IntoIter<RecordSnapshot>,
+    inner: Arc<Inner>,
+    offsets: std::vec::IntoIter<u64>,
+}
+
+impl EmdbIter {
+    fn new(inner: Arc<Inner>, offsets: Vec<u64>) -> Self {
+        Self {
+            inner,
+            offsets: offsets.into_iter(),
+        }
+    }
 }
 
 impl Iterator for EmdbIter {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, v, _)| (k, v))
+        for offset in self.offsets.by_ref() {
+            match self.inner.engine.decode_owned_at(offset) {
+                Ok(Some((key, value, _))) => return Some((key, value)),
+                Ok(None) => continue,
+                Err(_) => continue,
+            }
+        }
+        None
     }
 }
 
 /// Iterator over keys from [`Emdb::keys`].
+///
+/// Same lazy semantics as [`EmdbIter`]; values are decoded then
+/// discarded so the cost is one decode per key.
 pub struct EmdbKeyIter {
-    inner: std::vec::IntoIter<RecordSnapshot>,
+    inner: Arc<Inner>,
+    offsets: std::vec::IntoIter<u64>,
+}
+
+impl EmdbKeyIter {
+    fn new(inner: Arc<Inner>, offsets: Vec<u64>) -> Self {
+        Self {
+            inner,
+            offsets: offsets.into_iter(),
+        }
+    }
 }
 
 impl Iterator for EmdbKeyIter {
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, _, _)| k)
+        for offset in self.offsets.by_ref() {
+            match self.inner.engine.decode_owned_at(offset) {
+                Ok(Some((key, _value, _))) => return Some(key),
+                Ok(None) => continue,
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+}
+
+/// Streaming range iterator returned by [`Emdb::range_iter`] and
+/// [`Emdb::range_prefix_iter`].
+///
+/// The iterator carries a snapshot of `(key, offset)` pairs taken
+/// from the namespace's BTreeMap secondary index at construction
+/// time. Each `next()` consumes one pair, decodes the value via
+/// the shared mmap, and yields `(key, value)`. The BTreeMap lock
+/// is *not* held across iteration. Pairs whose backing record has
+/// been overwritten between snapshot and decode are skipped.
+pub struct EmdbRangeIter {
+    inner: Arc<Inner>,
+    pairs: std::vec::IntoIter<(Vec<u8>, u64)>,
+}
+
+impl EmdbRangeIter {
+    fn new(inner: Arc<Inner>, pairs: Vec<(Vec<u8>, u64)>) -> Self {
+        Self {
+            inner,
+            pairs: pairs.into_iter(),
+        }
+    }
+}
+
+impl Iterator for EmdbRangeIter {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for (key, offset) in self.pairs.by_ref() {
+            match self.inner.engine.read_value_with_meta_at(offset, &key) {
+                Ok(Some((value, _expires))) => return Some((key, value)),
+                Ok(None) => continue,
+                Err(_) => continue,
+            }
+        }
+        None
     }
 }
 

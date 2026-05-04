@@ -119,14 +119,16 @@ mod nested;
 mod storage;
 mod transaction;
 mod ttl;
+mod value_ref;
 
 pub use builder::EmdbBuilder;
-pub use db::Emdb;
+pub use db::{Emdb, EmdbIter, EmdbKeyIter, EmdbRangeIter};
 #[cfg(feature = "encrypt")]
 pub use encryption::{Cipher, EncryptionInput};
 pub use error::{Error, Result};
-pub use namespace::{Namespace, NamespaceIter, NamespaceKeyIter};
+pub use namespace::{Namespace, NamespaceIter, NamespaceKeyIter, NamespaceRangeIter};
 #[cfg(feature = "nested")]
 pub use nested::Focus;
 pub use transaction::Transaction;
 pub use ttl::Ttl;
+pub use value_ref::ValueRef;

@@ -42,23 +42,35 @@ milliseconds. Run on a Windows 11 NVMe consumer box. Reproduce with
 | compaction                  |   **11490** |    16506 |      N/A |      1.4× faster  |
 | uncompacted size            |    1.08 GiB | 4.00 GiB | 2.13 GiB |     3.7× smaller  |
 | compacted size              | **498 MiB** | 1.64 GiB |      N/A |     3.4× smaller  |
-| individual writes (fsync/op)|       27455 |  **734** |  **316** | 37× **slower**    |
-| random range reads          |         N/A |     3958 |     9688 | feature gap       |
+| individual writes (fsync/op)|       27455 |  **734** |  **316** | see note 1        |
+| random range reads          |       opt-in|     3958 |     9688 | see note 2        |
 
 emdb wins every aggregate-throughput column at 5 M scale, often by
-**order-of-magnitude margins**. Two honest caveats:
+**order-of-magnitude margins**. Two notes on the columns where
+the picture is more nuanced:
 
-1. **`individual writes` is fsync-bound.** On Windows
-   `FlushFileBuffers` is slow regardless of dirty-page count, and
-   emdb pays it on every `db.flush()`. redb / sled batch their syncs
-   differently and win this column. For per-record durability-on-every-write
-   workloads, prefer `db.transaction(|tx| ...)` (one fsync per
-   transaction) or `db.insert_many(...)` (one fsync per batch).
-2. **Range reads are not enabled by default.** emdb's primary index
-   is hash-keyed, so unsorted iteration is the default. Set
+1. **`individual writes` is fsync-bound.** This phase calls
+   `db.insert(); db.flush();` per record. Each `db.flush()` is one
+   `fdatasync` (one `FlushFileBuffers` on Windows), and that syscall
+   is the floor — ~27 ms / call on the reference NVMe consumer box,
+   regardless of how few bytes were dirtied. redb and sled win this
+   column because their commit machinery folds adjacent writes into
+   a single sync (redb's WAL + write transaction batching; sled's
+   LSM log appends). emdb's group-commit pipeline lands in **v0.8**
+   and closes this gap; until then, workloads that need per-record
+   durability should batch through `db.transaction(|tx| ...)` (one
+   fsync per transaction) or `db.insert_many(...)` (one fsync per
+   batch), both of which already dominate redb in the aggregate
+   columns above.
+2. **Range reads are opt-in, not unsupported.** emdb's primary
+   index is hash-keyed, so the default open does not pay the memory
+   tax for sorted iteration. Set
    `EmdbBuilder::enable_range_scans(true)` to maintain a parallel
-   `BTreeMap` secondary index — see the [Range scans](#range-scans)
-   section below.
+   `BTreeMap` secondary index per namespace — see the
+   [Range scans](#range-scans) section below for the API and the
+   memory-cost trade-off. The `lmdb_style` bench runs in hash-only
+   mode (which is why the row reads `opt-in`); a fair head-to-head
+   range bench requires the streaming range API arriving in v0.8.
 
 ### Read scaling under fan-out
 
@@ -76,13 +88,18 @@ notes.
 
 ## Status
 
-**v0.7.1.** The storage engine is a Bitcask-style mmap-backed
+**v0.7.2.** The storage engine is a Bitcask-style mmap-backed
 append-only log with a sharded in-memory hash index. Single-writer,
 multi-reader. Optional at-rest encryption (AES-256-GCM or
 ChaCha20-Poly1305, raw key or Argon2id passphrase). Optional
 sorted-iteration secondary index via
 `EmdbBuilder::enable_range_scans(true)`. Pre-1.0; the API may still
 change before 1.0.
+
+The next release (v0.8) lands the group-commit pipeline that closes
+the per-record-durability gap, plus streaming `iter` / `keys` /
+`range`, a zero-copy `get` variant, and a deterministic
+crash-recovery test harness. v1.0 is the API freeze.
 
 ## Installation
 
@@ -120,6 +137,15 @@ assert_eq!(reopened.get("user:1")?, Some(b"james".to_vec()));
 # let _cleanup = std::fs::remove_file(path);
 # Ok::<(), emdb::Error>(())
 ```
+
+`flush()` durably writes the record bytes; it does not rewrite the
+file header. The header carries a `tail_hint` that lets the next
+open skip past the bulk of the log instead of scanning from byte
+4096. Call `checkpoint()` at quiescent points (after a bulk load,
+on graceful shutdown) to update that hint and pay one extra fsync
+in exchange for fast reopens. The drop of the last handle attempts
+a checkpoint as a backstop; explicit calls are recommended for
+long-lived processes that care about reopen latency.
 
 ## Storage path resolution
 

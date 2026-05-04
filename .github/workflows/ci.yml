@@ -30,8 +30,20 @@ jobs:
       - name: Build
         run: cargo build --no-default-features --features "${{ matrix.features }}" --verbose
 
-      - name: Test
+      - name: Test (unit + integration + doc)
         run: cargo test --no-default-features --features "${{ matrix.features }}" --verbose
+
+  msrv:
+    name: MSRV (1.75)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@1.75.0
+      - name: Build with MSRV (default features)
+        run: cargo build --verbose
+      - name: Build with MSRV (all features)
+        run: cargo build --features ttl,nested,encrypt --verbose
 
   lint:
     runs-on: ubuntu-latest
