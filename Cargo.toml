@@ -1,6 +1,6 @@
 [package]
 name = "emdb"
-version = "0.8.0"
+version = "0.8.5"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -103,6 +103,11 @@ harness = false
 
 [[bench]]
 name = "group_commit"
+harness = false
+required-features = ["ttl"]
+
+[[bench]]
+name = "write_through"
 harness = false
 required-features = ["ttl"]
 

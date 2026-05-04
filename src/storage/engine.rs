@@ -1000,6 +1000,42 @@ impl Engine {
         self.store.persist_header()
     }
 
+    /// Compute a [`crate::EmdbStats`] snapshot. O(namespaces) plus
+    /// one filesystem `metadata` call. Lock contention with active
+    /// writers is brief — record counts are atomic loads.
+    pub(crate) fn stats(&self) -> Result<crate::EmdbStats> {
+        let mut live_records: u64 = 0;
+        let mut named_namespace_count: usize = 0;
+        {
+            let guard = self.namespaces.read().map_err(|_| Error::LockPoisoned)?;
+            for (ns_id, ns) in guard.iter() {
+                live_records = live_records.saturating_add(ns.record_count.load(Ordering::Acquire));
+                if *ns_id != DEFAULT_NAMESPACE_ID {
+                    named_namespace_count += 1;
+                }
+            }
+        }
+
+        let logical_size_bytes = self.store.tail();
+        let file_size_bytes = std::fs::metadata(self.store.path())
+            .map(|m| m.len())
+            .unwrap_or(logical_size_bytes);
+        let preallocated_bytes = file_size_bytes.saturating_sub(logical_size_bytes);
+
+        let header = self.store.header()?;
+        let encrypted = (header.flags & format::FLAG_ENCRYPTED) != 0;
+
+        Ok(crate::EmdbStats {
+            live_records,
+            namespace_count: named_namespace_count,
+            logical_size_bytes,
+            file_size_bytes,
+            preallocated_bytes,
+            range_scans_enabled: self.range_scans_enabled,
+            encrypted,
+        })
+    }
+
     /// Compact the on-disk file by rewriting only live records, then
     /// atomically swapping the new file in for the old.
     ///
@@ -1075,6 +1111,84 @@ impl Engine {
             }
         }
         self.recovery_scan()?;
+
+        Ok(())
+    }
+
+    /// Write a snapshot of the live record set to `target`,
+    /// producing a self-contained, openable database file. Backs
+    /// [`crate::Emdb::backup_to`].
+    ///
+    /// Atomicity: the records are written to `<target>.tmp`,
+    /// `fdatasync`'d, then renamed over `target`. A failure at any
+    /// point leaves `target` untouched; the temp file is
+    /// best-effort cleaned up.
+    ///
+    /// Refuses to write to the database's own path — that would
+    /// be a concurrent-write hazard.
+    pub(crate) fn backup_to(&self, target: &std::path::Path) -> Result<()> {
+        let source_path = self.store.path().to_path_buf();
+        let target_canonical = match target.canonicalize() {
+            Ok(p) => p,
+            // If the target doesn't exist yet (the common case for a
+            // backup), canonicalize fails; in that case compare the
+            // raw path against the source. We only canonicalise the
+            // source side so symlink shenanigans can't trick the
+            // check.
+            Err(_) => target.to_path_buf(),
+        };
+        if let Ok(source_canonical) = source_path.canonicalize() {
+            if target_canonical == source_canonical || target == source_path {
+                return Err(Error::InvalidConfig(
+                    "backup target must differ from the source database path",
+                ));
+            }
+        } else if target == source_path {
+            return Err(Error::InvalidConfig(
+                "backup target must differ from the source database path",
+            ));
+        }
+
+        // Snapshot every namespace + its name, same shape as the
+        // compactor uses.
+        let namespaces: Vec<(u32, String)> = self.list_namespaces()?;
+        let mut snapshots: Vec<(u32, String, Vec<RecordSnapshot>)> =
+            Vec::with_capacity(namespaces.len());
+        for (ns_id, name) in &namespaces {
+            let records = self.collect_records(*ns_id)?;
+            snapshots.push((*ns_id, name.clone(), records));
+        }
+
+        let mut tmp_path = target.to_path_buf();
+        let original_name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("emdb-backup");
+        tmp_path.set_file_name(format!("{original_name}.backup.tmp"));
+
+        // Best-effort cleanup of any stale leftover.
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let header = self.store.header()?;
+        if let Err(err) = self.write_compacted_file(&tmp_path, &header, &snapshots) {
+            // Best-effort cleanup of the half-written temp file.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+
+        // Atomic rename. Cross-platform: `std::fs::rename` is
+        // atomic on the same filesystem on every supported
+        // platform. If the target already exists, Windows requires
+        // it to be removed first; do that with a best-effort
+        // remove so callers can overwrite older backups.
+        if target.exists() {
+            std::fs::remove_file(target)?;
+        }
+        if let Err(err) = std::fs::rename(&tmp_path, target) {
+            // Best-effort cleanup if the rename failed.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(Error::from(err));
+        }
 
         Ok(())
     }

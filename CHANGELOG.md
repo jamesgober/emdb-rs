@@ -4,6 +4,166 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5](https://github.com/jamesgober/emdb-rs/compare/v0.8.0...v0.8.5) — 2026-05-04
+
+Production-polish beta. Five additive features, all small,
+none touching the file format or the existing public surface.
+Closes the operational gaps that come up the moment emdb is
+deployed: "where do I get a backup?", "how do I tell who has
+this lock?", "how do I monitor it?", "can I run with
+synchronous-write durability?", "can I paginate iteration?".
+
+### Added — `Emdb::stats()` returning `EmdbStats`
+
+Point-in-time database introspection. Returns a `Copy`,
+`#[non_exhaustive]` struct with:
+
+- `live_records` — count across every namespace
+- `namespace_count` — number of named namespaces
+- `logical_size_bytes` — current writer tail
+- `file_size_bytes` — total file size including pre-allocated
+  padding
+- `preallocated_bytes` — `file_size_bytes - logical_size_bytes`
+- `range_scans_enabled` — whether the BTreeMap secondary index
+  is live
+- `encrypted` — whether the file is encrypted at rest
+
+O(namespaces) plus one filesystem `metadata` call. Cheap enough
+for per-second health-check polling. Documented as safe to call
+inline from async contexts (no blocking cost).
+
+### Added — `Emdb::backup_to(path)` atomic snapshot
+
+Writes a self-contained, openable database file at `target`.
+Same atomic-rename pattern the compactor uses: writes to
+`<target>.backup.tmp`, `fdatasync`s, renames into place.
+
+The result is a normal emdb file — open it with `Emdb::open` and
+every record is there. No proprietary dump format, no archive,
+no shell script wrappers. Refuses to back up to the live
+database's own path. Overwrites an existing target by default
+(callers wanting timestamped snapshots embed the timestamp in
+the path).
+
+Documented as a heavy operation worth wrapping in
+`tokio::task::spawn_blocking` from async contexts; the work
+scales with database size.
+
+### Added — `Emdb::lock_holder` / `Emdb::break_lock` admin
+
+Two static methods for diagnosing and recovering from stuck
+lockfiles.
+
+- `Emdb::lock_holder(path)` returns the metadata of whoever
+  holds the advisory lock at `<path>.lock` — PID, acquired-at
+  timestamp, and crate version. Returns `Ok(None)` when the
+  database is unlocked.
+- `Emdb::break_lock(path)` deletes the `.lock` and `.lock-meta`
+  sidecars so a fresh `open` can succeed. Caller is documented
+  as responsible for confirming the holder is dead before
+  calling — the doc comment names specific OS tooling
+  (`ps -p`, `Get-Process`) that production operators use.
+
+The lockfile design changed to support this. The OS advisory
+lock is now held on `<path>.lock` whose body stays empty;
+holder metadata lives in a sibling `<path>.lock-meta` file that
+is free to read regardless of whether the lock is held. The
+split exists because Windows uses mandatory file locks — a
+holder's `LockFileEx` blocks other handles' reads on the same
+range. Putting metadata in a second file makes "show me who has
+the lock" a portable, deadlock-free read.
+
+The new `LockHolder` type is `pub` and `#[non_exhaustive]`.
+
+### Added — `FlushPolicy::WriteThrough`
+
+Third variant of `FlushPolicy`. Opens the file with
+`FILE_FLAG_WRITE_THROUGH` (Windows) / `O_SYNC` (Linux, macOS,
+BSDs) so every `pwrite` is durable on return; `flush()` becomes
+a near-free `sync_data` belt-and-braces call.
+
+For single-thread per-record-durability workloads the trade-off
+is favourable on Windows: the bench's `individual writes` phase
+calls `db.flush()` per record, which under `OnEachFlush` pays
+one `FlushFileBuffers` per call (~27 ms on consumer NVMe).
+`WriteThrough` lets the OS commit synchronously inside `pwrite`
+instead, with cheaper per-record latency. The cost shifts: bulk
+loads under `WriteThrough` are slower because every `pwrite`
+waits for disk; the bulk-load path no longer benefits from the
+OS write-back cache.
+
+Cross-platform implementation:
+
+- Windows: `FILE_FLAG_WRITE_THROUGH = 0x8000_0000` via
+  `OpenOptionsExt::custom_flags`. Hardcoded constant — no
+  `windows-sys` dependency for one bit.
+- Linux: `O_SYNC = 0x101000`.
+- macOS / BSDs: `O_SYNC = 0x80`.
+- Other Unix targets we have not certified: flag value `0`.
+  `WriteThrough` semantics degrade to `OnEachFlush` on those
+  targets (correct, just no perf win — documented in the
+  variant's doc comment).
+
+The flag is propagated across `Store::swap_underlying`, so a
+database opened with `WriteThrough` keeps the synchronous-write
+semantics through a compaction.
+
+### Added — `iter_from(start)` / `iter_after(start)` cursor iteration
+
+Streaming iterators over keys at-or-after / strictly-after a
+given start key, in lexicographic order. Mirrors on
+`Emdb` and `Namespace`. Built on the existing `range_iter`
+machinery — same lazy snapshot semantics, same one-decode-per-
+`next()` cost model. Requires `enable_range_scans(true)` at
+open time.
+
+The motivating workload is paginated APIs: pass the last-seen
+key as the cursor and resume iteration from the next record.
+The integration tests include a complete pagination example
+that walks 50 records 10 at a time.
+
+### Lockfile body format
+
+`<path>.lock-meta` body schema v1:
+
+```text
+emdb-lock v1
+pid=<u32>
+acquired_at=<unix-millis>
+crate_version=<semver>
+```
+
+Lines past the version header are `key=value` pairs; unknown
+keys are ignored on read for forward-compat. Documented in the
+`lockfile` module docs.
+
+### Tests
+
+22 new integration tests in `tests/v0_8_5_features.rs` covering
+every new feature. Each suite exercises happy path plus edge
+cases: empty inputs, missing files, idempotency, self-target
+rejection, cross-platform behaviour, concurrent writers,
+snapshot-iterator semantics under contention, pagination
+round-trips. Plus 6 new unit tests in `src/lockfile.rs`
+covering the body parser and break_lock idempotency.
+
+Test totals: **167 tests across all CI feature combinations**
+(up from 145 in 0.8.0). Every combo (no-default-features, ttl,
+nested, encrypt, ttl+nested, ttl+nested+encrypt) green.
+
+### Notes
+
+- No file format change. v0.7.x and v0.8.0 databases open
+  unchanged in v0.8.5.
+- No public-API breakage. All five additions are additive;
+  `FlushPolicy` is `#[non_exhaustive]` so the new variant
+  doesn't break exhaustive matches in caller code.
+- One observable lockfile change: a new sibling file
+  `<path>.lock-meta` appears alongside `<path>.lock` while a
+  database is held. Cleanup tooling that scans for `*.lock`
+  should also handle `*.lock-meta`. Both are removed on
+  graceful drop.
+
 ## [0.8.0](https://github.com/jamesgober/emdb-rs/compare/v0.7.1...v0.8.0) — 2026-05-03
 
 The release that closes the per-record-durability gap and turns the

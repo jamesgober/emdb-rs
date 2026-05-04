@@ -175,6 +175,28 @@ impl Namespace {
             None => self.range_iter(start..),
         }
     }
+
+    /// Streaming iterator over keys at or after `start` in this
+    /// namespace, in lexicographic order. Mirrors
+    /// [`crate::Emdb::iter_from`] for named namespaces.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::range_iter`].
+    pub fn iter_from(&self, start: impl AsRef<[u8]>) -> Result<NamespaceRangeIter> {
+        self.range_iter(start.as_ref().to_vec()..)
+    }
+
+    /// Streaming iterator over keys strictly after `start` in this
+    /// namespace. Mirrors [`crate::Emdb::iter_after`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::range_iter`].
+    pub fn iter_after(&self, start: impl AsRef<[u8]>) -> Result<NamespaceRangeIter> {
+        let start = start.as_ref().to_vec();
+        self.range_iter((std::ops::Bound::Excluded(start), std::ops::Bound::Unbounded))
+    }
 }
 
 /// Iterator over `(key, value)` pairs from [`Namespace::iter`].

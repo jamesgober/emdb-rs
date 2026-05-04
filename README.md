@@ -32,18 +32,18 @@ milliseconds. Run on a Windows 11 NVMe consumer box. Reproduce with
 
 | phase                       |        emdb |    redb  |    sled  |  emdb vs redb     |
 |-----------------------------|------------:|---------:|---------:|------------------:|
-| bulk load                   |    **3089** |    48221 |    32994 |     15.6× faster  |
-| batch writes                |    **2752** |     6555 |     1325 |      2.4× faster  |
-| nosync writes               |     **125** |     1142 |      681 |      9.1× faster  |
-| random reads (1M)           |     **351** |     3071 |     6255 |      8.7× faster  |
-| random reads (4 threads)    |     **799** |    14761 |    22692 |     18.5× faster  |
-| random reads (8 threads)    |     **503** |    14413 |    24372 | **28.6× faster**  |
-| removals                    |    **6659** |    35388 |    56910 |      5.3× faster  |
-| compaction                  |    **7158** |    11473 |      N/A |      1.6× faster  |
+| bulk load                   |    **3086** |    68231 |    39506 |     22.1× faster  |
+| batch writes                |    **2616** |     6656 |     1370 |      2.5× faster  |
+| nosync writes               |     **131** |     1063 |      697 |      8.1× faster  |
+| random reads (1M)           |     **332** |     2814 |     6201 |      8.5× faster  |
+| random reads (4 threads)    |     **817** |    11945 |    22813 |     14.6× faster  |
+| random reads (8 threads)    |     **511** |    12838 |    22891 | **25.1× faster**  |
+| removals                    |    **6161** |    32840 |    25271 |      5.3× faster  |
+| compaction                  |    **6513** |    14163 |      N/A |      2.2× faster  |
 | uncompacted size            |    1.08 GiB | 4.00 GiB | 2.15 GiB |     3.7× smaller  |
 | compacted size              | **498 MiB** | 1.64 GiB |      N/A |     3.4× smaller  |
-| individual writes (fsync/op)|       26779 |  **611** |  **534** | see note 1        |
-| random range reads          |       opt-in|     2538 |     6164 | see note 2        |
+| individual writes (fsync/op)|       25281 |  **644** |  **452** | see note 1        |
+| random range reads          |       opt-in|     2329 |     6247 | see note 2        |
 
 emdb wins every aggregate-throughput column at 5 M scale, often by
 **order-of-magnitude margins**. Two notes on the columns where the
@@ -98,8 +98,8 @@ workload is 8 threads × 200 writes/thread:
 
 | policy         | wall time (ms) |   writes/sec |    speedup |
 |----------------|---------------:|-------------:|-----------:|
-| OnEachFlush    |          1490  |       1 073  |      1.00× |
-| Group          |       **201**  |    **7 946** |  **7.40×** |
+| OnEachFlush    |          2192  |         730  |      1.00× |
+| Group          |       **272**  |    **5 880** |  **8.06×** |
 
 `max_batch` should be set close to the expected concurrent flusher
 count (typically `num_cpus`). Setting it higher means the leader
@@ -119,22 +119,55 @@ let db = Emdb::builder()
 # Ok::<(), emdb::Error>(())
 ```
 
+### `FlushPolicy::WriteThrough`: opt-in per-pwrite durability
+
+For workloads where `OnEachFlush`'s per-`flush()` cost is dominated
+by `FlushFileBuffers` latency (the canonical Windows
+single-thread-per-record-durability pain), v0.8.5 adds
+`FlushPolicy::WriteThrough` as a third policy. The file is opened
+with `FILE_FLAG_WRITE_THROUGH` (Windows) / `O_SYNC` (Unix) so every
+`pwrite` is durable on return; `flush()` becomes near-free.
+
+The trade-off is real: bulk loads under `WriteThrough` are slower
+because every individual `pwrite` waits for disk instead of
+benefiting from the OS write-back cache. Whether `WriteThrough`
+beats `OnEachFlush` depends on the workload, the file's existing
+size, and the OS's `FlushFileBuffers` cost on that file. Benchmark
+on your actual data to decide.
+
+Reproduce on your machine:
+
+```powershell
+cargo bench --bench write_through --features ttl
+```
+
+```rust
+use emdb::{Emdb, FlushPolicy};
+
+let db = Emdb::builder()
+    .flush_policy(FlushPolicy::WriteThrough)
+    .build()?;
+# Ok::<(), emdb::Error>(())
+```
+
 See [docs/BENCH.md](docs/BENCH.md) for full run instructions and
 tuning notes.
 
 ## Status
 
-**v0.8.0.** The storage engine is a Bitcask-style mmap-backed
+**v0.8.5 (beta).** The storage engine is a Bitcask-style mmap-backed
 append-only log with a sharded in-memory hash index. Single-writer,
 multi-reader. Optional at-rest encryption (AES-256-GCM or
 ChaCha20-Poly1305, raw key or Argon2id passphrase). Optional
 sorted-iteration secondary index via
-`EmdbBuilder::enable_range_scans(true)`. Optional group-commit
-flush pipeline via
-`EmdbBuilder::flush_policy(FlushPolicy::Group { .. })` that fuses
-concurrent `flush()` calls into one `fdatasync`. Streaming `iter`
-/ `keys` / `range` and a zero-copy `get_zerocopy` read API land in
-this release. Pre-1.0; the API may still change before 1.0.
+`EmdbBuilder::enable_range_scans(true)`. Three flush-policy
+variants (`OnEachFlush`, `Group`, `WriteThrough`) for picking the
+right durability cost model for the workload. Streaming `iter` /
+`keys` / `range` plus cursor-style `iter_from` / `iter_after`. A
+zero-copy `get_zerocopy` read API. Atomic `backup_to(path)`
+snapshots, point-in-time `stats()` introspection, and stale-
+lockfile recovery via `lock_holder` + `break_lock`. Pre-1.0; the
+API may still change before 1.0.
 
 The remaining work for v1.0 is API stabilisation: an audit pass
 for `pub` vs `pub(crate)`, full doc coverage on every public item,
@@ -146,7 +179,7 @@ changes are planned before 1.0.
 
 ```toml
 [dependencies]
-emdb = "0.8.0"
+emdb = "0.8.5"
 ```
 
 ## Quick start
