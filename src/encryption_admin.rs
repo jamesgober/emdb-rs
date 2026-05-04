@@ -103,9 +103,9 @@ pub(crate) fn rewrite_database(
     let _ = std::fs::remove_file(&tmp);
     remove_sidecars(&tmp);
 
-    // Phase 1: open the source database in read mode and snapshot
-    // every namespace's records. `flush()` here is harmless (no
-    // pending writes on a freshly-opened handle) but ensures any OS
+    // Open the source database in read mode and snapshot every
+    // namespace's records. `flush()` here is harmless (no pending
+    // writes on a freshly-opened handle) but ensures any OS
     // page-cache buffering settles before we read.
     let src = open_with_mode(path, from)?;
     src.flush()?;
@@ -124,7 +124,7 @@ pub(crate) fn rewrite_database(
     }
     drop(src);
 
-    // Phase 2: open destination at the temp path with the new mode and
+    // Open destination at the temp path with the new mode and
     // stream every record across.
     let dst = match open_with_mode(&tmp, to) {
         Ok(d) => d,
@@ -154,12 +154,12 @@ pub(crate) fn rewrite_database(
         return Err(err);
     }
 
-    // Phase 3: atomic swap. Rename original to `<path>.encbak`, then
-    // rename `<path>.enc.tmp` to original. The .encbak is left behind
-    // for caller verification; failure to rename surfaces as Io and
-    // leaves either the original (rename1 failed) or the new file
-    // (rename2 failed but original is gone — caller can recover from
-    // .encbak) on disk.
+    // Atomic swap: rename the original to `<path>.encbak`, then
+    // rename `<path>.enc.tmp` to the original path. The `.encbak` is
+    // left behind for caller verification; failure to rename surfaces
+    // as `Io` and leaves either the original (first rename failed) or
+    // the new file (second rename failed but original is gone — the
+    // caller can recover from `.encbak`) on disk.
     if bak.exists() {
         let _ = std::fs::remove_file(&bak);
     }

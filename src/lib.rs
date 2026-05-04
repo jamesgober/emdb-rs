@@ -17,9 +17,25 @@
 //! truncates at the first bad CRC. This is the Bitcask family of
 //! storage engines, the same shape used by Riak, HaloDB, and others.
 //!
-//! ## Examples
+//! Single-writer, multi-reader. The 64-shard primary index plus the
+//! lock-free `Arc<Mmap>` read path make multi-threaded reads scale to
+//! many millions of operations per second on a single open handle.
+//! Writes serialise on one mutex covering the encode-and-pwrite step;
+//! producers should batch through [`Emdb::insert_many`] or
+//! [`Emdb::transaction`] when latency matters.
 //!
-//! Persistent usage:
+//! ## Quick start
+//!
+//! ```rust
+//! use emdb::Emdb;
+//!
+//! let db = Emdb::open_in_memory();
+//! db.insert("name", "emdb")?;
+//! assert_eq!(db.get("name")?, Some(b"emdb".to_vec()));
+//! # Ok::<(), emdb::Error>(())
+//! ```
+//!
+//! Persistent file-backed:
 //!
 //! ```no_run
 //! use emdb::Emdb;
@@ -28,7 +44,8 @@
 //! {
 //!     let db = Emdb::open(&path)?;
 //!     db.insert("name", "emdb")?;
-//!     db.flush()?;
+//!     db.flush()?;        // make record bytes durable
+//!     db.checkpoint()?;   // persist tail_hint for fast reopen
 //! }
 //! let db = Emdb::open(&path)?;
 //! assert_eq!(db.get("name")?, Some(b"emdb".to_vec()));
@@ -36,7 +53,7 @@
 //! # Ok::<(), emdb::Error>(())
 //! ```
 //!
-//! TTL usage:
+//! TTL:
 //!
 //! ```no_run
 //! # #[cfg(feature = "ttl")]
@@ -57,7 +74,63 @@
 //! # Ok::<(), emdb::Error>(())
 //! ```
 //!
-//! ## Storage Path Resolution
+//! ## Zero-copy reads
+//!
+//! [`Emdb::get_zerocopy`] returns a [`ValueRef`] that points directly
+//! into the kernel-managed mmap region — no allocation, no copy.
+//! Encrypted databases fall back to an owned plaintext buffer inside
+//! the same [`ValueRef`] type.
+//!
+//! ```rust
+//! use emdb::Emdb;
+//!
+//! let db = Emdb::open_in_memory();
+//! db.insert("k", "v")?;
+//! if let Some(v) = db.get_zerocopy("k")? {
+//!     let want: &[u8] = b"v";
+//!     assert!(v == want);
+//! }
+//! # Ok::<(), emdb::Error>(())
+//! ```
+//!
+//! ## Streaming iteration
+//!
+//! [`Emdb::iter`] / [`Emdb::keys`] yield records lazily, decoding one
+//! record per `next()` call from a snapshot of offsets captured at
+//! construction time. Memory use scales with the offset count, not
+//! the total value size.
+//!
+//! Range queries are opt-in via
+//! [`EmdbBuilder::enable_range_scans`]; once enabled,
+//! [`Emdb::range_iter`] / [`Emdb::range_prefix_iter`] return streaming
+//! iterators backed by a parallel `BTreeMap` secondary index.
+//!
+//! ## Group-commit durability
+//!
+//! Per-record `flush()` workloads with concurrent writers can opt
+//! into the group-commit pipeline so multiple in-flight `flush()`
+//! calls share a single `fdatasync`:
+//!
+//! ```no_run
+//! use std::time::Duration;
+//!
+//! use emdb::{Emdb, FlushPolicy};
+//!
+//! let db = Emdb::builder()
+//!     .flush_policy(FlushPolicy::Group {
+//!         max_wait: Duration::from_micros(500),
+//!         max_batch: 32,
+//!     })
+//!     .build()?;
+//! # Ok::<(), emdb::Error>(())
+//! ```
+//!
+//! Default policy is [`FlushPolicy::OnEachFlush`], which performs one
+//! `fdatasync` per call — the right choice when there is only one
+//! writer thread or when durability is already batched at the
+//! application layer.
+//!
+//! ## Storage path resolution
 //!
 //! emdb does not pick a default path for you. You either pass an
 //! explicit path, or opt into OS-aware resolution via the builder.
@@ -75,6 +148,15 @@
 //!     .build()?;
 //! # Ok::<(), emdb::Error>(())
 //! ```
+//!
+//! ## Cargo features
+//!
+//! - `ttl` *(default)* — per-record expiration and `default_ttl`.
+//! - `nested` — dotted-prefix group operations and [`Focus`] handles.
+//! - `encrypt` — AES-256-GCM + ChaCha20-Poly1305 at-rest encryption
+//!   with raw-key or Argon2id-derived passphrase.
+//! - `bench-compare`, `bench-rocksdb`, `bench-redis` — comparative
+//!   bench peers (dev-only, never required by application builds).
 
 #![deny(warnings)]
 #![deny(missing_docs)]
@@ -89,6 +171,7 @@
 #![deny(clippy::print_stderr)]
 #![deny(clippy::dbg_macro)]
 #![deny(clippy::unreachable)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 // Test code is allowed to use the convenience panickers — the strict
 // lint profile above is for production library code, not assertion
 // scaffolding inside `#[cfg(test)] mod tests` blocks.

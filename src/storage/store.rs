@@ -31,7 +31,6 @@
 //! but always re-validates so a stale hint is harmless.
 
 use std::fs::{File, OpenOptions};
-use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -228,6 +227,18 @@ pub(crate) struct Store {
     /// the largest valid offset right now?" without taking the writer
     /// lock. Updated under the writer mutex but readable lock-free.
     tail_atomic: AtomicU64,
+    /// Sibling `File` handle (a `try_clone` of the writer's handle)
+    /// used exclusively for `sync_data` calls. Holding this lets
+    /// `flush()` issue an fsync **without** taking the writer mutex,
+    /// so concurrent `pwrite` calls and `sync_data` calls can
+    /// overlap. Without this clone every fsync would serialise
+    /// through the writer mutex, and the group-commit policy could
+    /// not actually fuse anything because OnEachFlush would already
+    /// be serialising for it.
+    ///
+    /// Atomically swapped on file growth and on `swap_underlying`,
+    /// same lifetime story as the mmap arc.
+    sync_handle: RwLock<Arc<File>>,
     /// Active flush policy. `OnEachFlush` (the default) runs
     /// `flush()` as a single `sync_data` per call. `Group` routes
     /// through [`GroupCoord`] so concurrent flushers fuse their
@@ -312,13 +323,13 @@ impl Store {
             (header, len, header.tail_hint)
         };
 
-        // SAFETY: The file backing the mmap is held open by `WriterState::file`
-        // for the lifetime of the Store. The mmap region covers the entire
-        // file at open time. We swap to a fresh mmap whenever we grow the
-        // file (see `ensure_capacity`), keeping the old Arc<Mmap> alive
-        // until existing readers release it. No code path concurrently
-        // truncates or shrinks the file, so the mapping never points at
-        // unmapped pages.
+        // SAFETY: The file backing the mmap is held open by
+        // `WriterState::file` for the lifetime of the Store. The mmap
+        // region covers the entire file at open time. We swap to a
+        // fresh mmap whenever we grow the file (see `grow_locked`),
+        // keeping the old `Arc<Mmap>` alive until existing readers
+        // release it. No code path concurrently truncates or shrinks
+        // the file, so the mapping never points at unmapped pages.
         let mmap = unsafe { Mmap::map(&file)? };
 
         let coord = match policy {
@@ -328,6 +339,13 @@ impl Store {
                 max_batch,
             } => Some(Arc::new(GroupCoord::new(max_wait, max_batch))),
         };
+
+        // Clone the file handle for the sync path. `try_clone`
+        // duplicates the underlying OS file descriptor / handle
+        // without taking ownership; both handles point at the same
+        // inode, and sync_data on either flushes the same dirty
+        // pages.
+        let sync_handle = file.try_clone()?;
 
         Ok(Self {
             path,
@@ -340,6 +358,7 @@ impl Store {
                 encode_buf: Vec::with_capacity(256),
             }),
             tail_atomic: AtomicU64::new(tail),
+            sync_handle: RwLock::new(Arc::new(sync_handle)),
             policy,
             coord,
         })
@@ -596,29 +615,38 @@ impl Store {
     /// Returns I/O errors from the sync, or [`Error::LockPoisoned`]
     /// on poisoned writer / coordinator lock.
     pub(crate) fn flush(&self) -> Result<()> {
+        // Snapshot the sync handle out from under the rwlock so we
+        // do not hold the lock across the (potentially long)
+        // `sync_data` syscall.
+        let sync_handle = {
+            let guard = self.sync_handle.read().map_err(|_| Error::LockPoisoned)?;
+            Arc::clone(&guard)
+        };
+
         match (&self.policy, self.coord.as_ref()) {
             (FlushPolicy::OnEachFlush, _) | (_, None) => {
-                let writer = self.writer.lock().map_err(|_| Error::LockPoisoned)?;
-                writer.file.sync_data()?;
+                // Run sync_data on the cloned handle; the writer
+                // mutex is *not* held, so concurrent appends can
+                // make progress while we sync.
+                sync_handle.sync_data()?;
                 Ok(())
             }
             (FlushPolicy::Group { .. }, Some(coord)) => {
                 // The tail we want durable is whatever the writer
-                // has appended up to right now. Snapshot before
-                // entering the coordinator's wait loop.
+                // has appended up to right now. The coordinator
+                // returns the snapshot we record at sync-issue time
+                // as the durable boundary.
                 let target = self.tail_atomic.load(Ordering::Acquire);
-                let writer_mutex = &self.writer;
                 let tail_atomic = &self.tail_atomic;
-                coord.run(target, || {
-                    // Lock writer briefly: capture tail at sync time
-                    // (which is the offset durability is now
-                    // guaranteed up to) and run sync_data.
-                    let writer = writer_mutex
-                        .lock()
-                        .map_err(|_| io::Error::other("emdb writer mutex poisoned"))?;
+                coord.run(target, move || {
+                    // Capture tail before issuing sync. Bytes up to
+                    // this offset are guaranteed in the OS buffer
+                    // (pwrite is synchronous). sync_data then
+                    // flushes them; bytes appended *during* the
+                    // syscall may or may not be covered, and will
+                    // ride the next leader cycle.
                     let tail_at_sync = tail_atomic.load(Ordering::Acquire);
-                    let _ = writer.tail; // silence unused on writer
-                    group_sync(&writer.file, tail_at_sync)
+                    group_sync(&sync_handle, tail_at_sync)
                 })
             }
         }
@@ -666,6 +694,10 @@ impl Store {
         let new_mmap = unsafe { Mmap::map(&writer.file)? };
         let mut mmap_guard = self.mmap.write().map_err(|_| Error::LockPoisoned)?;
         *mmap_guard = Arc::new(new_mmap);
+        // The cloned sync handle still points at the same inode and
+        // remains valid across `set_len` (extending), so we leave it
+        // as is. We only refresh it on `swap_underlying`, which
+        // changes the underlying file altogether.
         Ok(())
     }
 
@@ -728,6 +760,14 @@ impl Store {
         // the mapping covers the whole new file.
         let new_mmap = unsafe { Mmap::map(&writer.file)? };
         *mmap_guard = Arc::new(new_mmap);
+
+        // The previous `sync_handle` was cloned from the *old* file;
+        // after the rename it points at the now-orphaned inode. Replace
+        // it with a clone of the new writer handle so future syncs land
+        // on the canonical file.
+        let new_sync = writer.file.try_clone()?;
+        let mut sync_guard = self.sync_handle.write().map_err(|_| Error::LockPoisoned)?;
+        *sync_guard = Arc::new(new_sync);
 
         Ok(())
     }

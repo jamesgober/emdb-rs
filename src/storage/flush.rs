@@ -52,9 +52,18 @@ use crate::{Error, Result};
 /// the module docs. Pick this when many threads independently
 /// write records and call `flush` for per-record durability —
 /// the typical request-handler pattern in a multi-threaded
-/// service. Reasonable defaults are `max_wait = 500 µs` and
-/// `max_batch = 32`; the right values depend on
-/// throughput-vs-tail-latency goals.
+/// service.
+///
+/// **Tuning.** `max_batch` should be set close to the expected
+/// number of concurrent flushers (often `num_cpus::get()`). If
+/// it is larger, the leader will wait the full `max_wait` for
+/// followers that can never arrive, turning batching into pure
+/// tail latency. `max_wait` should be small relative to typical
+/// fsync latency — 500 µs is a reasonable default on commodity
+/// SSDs. A useful sanity check: with K concurrent flushers and
+/// a single fsync taking T ms, the policy should produce
+/// roughly `K × throughput_of_OnEachFlush` once K reaches
+/// `max_batch`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default)]
 pub enum FlushPolicy {
@@ -153,6 +162,13 @@ impl GroupCoord {
 
         let mut state = self.state.lock().map_err(|_| Error::LockPoisoned)?;
         state.pending += 1;
+        // Wake the leader (if any) so it can re-check the
+        // `pending >= max_batch` exit condition. Without this,
+        // followers join silently and the leader sleeps the full
+        // `max_wait` regardless of how many followers have arrived —
+        // turning group commit into a *latency tax* instead of a
+        // throughput win.
+        self.cv.notify_all();
 
         // Recheck after locking: the world may have moved while we
         // were unlocked.

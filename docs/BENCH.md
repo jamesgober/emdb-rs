@@ -95,44 +95,74 @@ When logging benchmark output into README or release notes, record:
 
 ## Reference baseline (5 M records, Windows 11 NVMe)
 
-Captured with:
+Captured 2026-05-03 on emdb v0.8.0 vs. redb 2.6 vs. sled 0.34 with:
 
 ```powershell
 $env:EMDB_BENCH_RECORDS = "5000000"
 cargo bench --bench lmdb_style --features ttl,bench-compare
 ```
 
-Lower is better; numbers are wall-time milliseconds (or bytes for the
-size rows).
+Lower is better; numbers are wall-time milliseconds (or bytes for
+the size rows).
 
 | phase                       |        emdb |    redb  |    sled  |
 |-----------------------------|------------:|---------:|---------:|
-| bulk load                   |    **4498** |    74496 |    60807 |
-| batch writes                |    **2814** |    11043 |     1972 |
-| nosync writes               |     **220** |     1717 |     1136 |
-| random reads (1 M)          |     **596** |     5289 |    11197 |
-| random reads (4 threads)    |    **1083** |    17543 |    34605 |
-| random reads (8 threads)    |     **653** |    17160 |    33284 |
-| removals                    |   **11948** |    54905 |    46155 |
-| compaction                  |   **11490** |    16506 |      N/A |
-| uncompacted size            |    1.08 GiB | 4.00 GiB | 2.13 GiB |
+| bulk load                   |    **3089** |    48221 |    32994 |
+| batch writes                |    **2752** |     6555 |     1325 |
+| nosync writes               |     **125** |     1142 |      681 |
+| random reads (1 M)          |     **351** |     3071 |     6255 |
+| random reads (4 threads)    |     **799** |    14761 |    22692 |
+| random reads (8 threads)    |     **503** |    14413 |    24372 |
+| removals                    |    **6659** |    35388 |    56910 |
+| compaction                  |    **7158** |    11473 |      N/A |
+| uncompacted size            |    1.08 GiB | 4.00 GiB | 2.15 GiB |
 | compacted size              | **498 MiB** | 1.64 GiB |      N/A |
-| individual writes (fsync/op)|       27455 |  **734** |  **316** |
-| random range reads          |         N/A |     3958 |     9688 |
+| individual writes (fsync/op)|       26779 |  **611** |  **534** |
+| random range reads          |         N/A |     2538 |     6164 |
 
 Notes:
 
 - emdb wins every aggregate-throughput phase, often by an order of
-  magnitude. Aggregate read throughput at 8 threads is **~7.66 M
+  magnitude. Aggregate read throughput at 8 threads is **~9.94 M
   reads/sec**.
-- The `individual writes` phase syncs after every record. emdb pays
-  one Windows `FlushFileBuffers` per write, which dominates the
-  result. Workloads needing per-record durability should batch via
-  `db.transaction(...)` or `db.insert_many(...)` (the `batch writes`
-  and `bulk load` phases).
-- `random range reads` is N/A because emdb's primary index is
-  hash-keyed. Set `EmdbBuilder::enable_range_scans(true)` to enable
-  the opt-in BTreeMap secondary index.
+- The `individual writes` phase syncs after every record from a
+  single thread. emdb pays one Windows `FlushFileBuffers` per
+  write, which dominates the result; redb / sled win this column
+  because their commit machinery folds adjacent single-thread
+  writes into a single sync. For multi-threaded
+  per-record-durability workloads, opt into `FlushPolicy::Group` —
+  see the group-commit baseline below for the 7× win on N=8
+  concurrent flushers.
+- `random range reads` is N/A because the bench runs in hash-only
+  mode. Set `EmdbBuilder::enable_range_scans(true)` to enable the
+  opt-in BTreeMap secondary index, then use `range_iter` /
+  `range_prefix_iter` for streaming consumption.
 
-These numbers are workload- and hardware-specific. Reproduce on your
-target deployment for decision making.
+These numbers are workload- and hardware-specific. Reproduce on
+your target deployment for decision making.
+
+## Group-commit baseline (8 threads × 200 writes, default policy)
+
+Captured 2026-05-03 with:
+
+```powershell
+cargo bench --bench group_commit --features ttl
+```
+
+Each thread does `db.insert(); db.flush();` in a tight loop.
+Aggregate throughput across all threads:
+
+| policy         | wall time (ms) |   writes/sec |    speedup |
+|----------------|---------------:|-------------:|-----------:|
+| OnEachFlush    |          1490  |       1 073  |      1.00× |
+| Group          |       **201**  |    **7 946** |  **7.40×** |
+
+`Group` policy used `max_wait = 500 µs`, `max_batch = 8` (matching
+the thread count). Tune via env vars `EMDB_BENCH_GC_THREADS`,
+`EMDB_BENCH_GC_PER_THREAD`, `EMDB_BENCH_GC_MAX_WAIT_US`,
+`EMDB_BENCH_GC_MAX_BATCH`.
+
+`max_batch` set higher than the concurrent flusher count is a
+performance trap — the leader waits the full `max_wait` for
+followers that can never arrive. As a rule of thumb, set it to
+`num_cpus::get()` for general server workloads.

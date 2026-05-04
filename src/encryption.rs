@@ -69,8 +69,17 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key as AesKey, Nonce as AesNonce};
 use chacha20poly1305::{ChaCha20Poly1305, Key as ChaChaKey, Nonce as ChaChaNonce};
 use rand_core::{OsRng, RngCore};
+use zeroize::Zeroizing;
 
 use crate::{Error, Result};
+
+/// Key bytes wrapped so they zero on drop. Used for any internal
+/// storage of raw key material (builder fields, KDF outputs, the
+/// resolved key passed to the cipher constructor). The cipher state
+/// itself zeroizes via `aes-gcm` / `chacha20poly1305`'s dependency
+/// on `zeroize`, so once the cipher is constructed and the
+/// `KeyBytes` drops, no copy of the raw key remains in heap memory.
+pub(crate) type KeyBytes = Zeroizing<[u8; 32]>;
 
 /// Length of the AES-GCM nonce in bytes (96-bit random nonce).
 pub(crate) const NONCE_LEN: usize = 12;
@@ -302,7 +311,7 @@ pub(crate) fn random_salt() -> [u8; SALT_LEN] {
 pub(crate) fn derive_key_from_passphrase(
     passphrase: &str,
     salt: &[u8; SALT_LEN],
-) -> Result<[u8; 32]> {
+) -> Result<KeyBytes> {
     use argon2::{Algorithm, Argon2, Params, Version};
 
     if passphrase.is_empty() {
@@ -321,9 +330,14 @@ pub(crate) fn derive_key_from_passphrase(
         .map_err(|_| Error::Encryption("argon2 params construction failed"))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
-    let mut key = [0_u8; 32];
+    // Derive into a `Zeroizing<[u8; 32]>` so the bytes clear on
+    // drop. The argon2 `hash_password_into` call writes through the
+    // mutable reference; once the caller hands the wrapper to the
+    // cipher constructor and lets it drop, nothing readable from the
+    // KDF remains on the heap.
+    let mut key: KeyBytes = Zeroizing::new([0_u8; 32]);
     argon
-        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .hash_password_into(passphrase.as_bytes(), salt, key.as_mut_slice())
         .map_err(|_| Error::Encryption("argon2 key derivation failed"))?;
     Ok(key)
 }

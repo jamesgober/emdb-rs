@@ -91,9 +91,11 @@ pub(crate) struct EngineConfig {
     /// How `db.flush()` interacts with concurrent flush requests.
     /// Defaults to `OnEachFlush` to preserve v0.7.x semantics.
     pub(crate) flush_policy: FlushPolicy,
-    /// Optional 32-byte AES-256 key (post-KDF). `None` for unencrypted.
+    /// Optional 32-byte AES-256 key (post-KDF). `None` for
+    /// unencrypted. Stored in a [`zeroize::Zeroizing`] wrapper so
+    /// the bytes clear when the config is dropped.
     #[cfg(feature = "encrypt")]
-    pub(crate) encryption_key: Option<[u8; 32]>,
+    pub(crate) encryption_key: Option<crate::encryption::KeyBytes>,
     /// Optional cipher choice. `None` defaults to AES-256-GCM on fresh
     /// files; reopens read the cipher from the header's flag bit.
     #[cfg(feature = "encrypt")]
@@ -153,12 +155,13 @@ impl std::fmt::Debug for Engine {
 /// Owned snapshot row used by `iter` / `keys`.
 pub(crate) type RecordSnapshot = (Vec<u8>, Vec<u8>, u64);
 
-/// Output of [`Engine::resolve_encryption`]: the resolved 32-byte key,
-/// an optional fresh salt to persist for new passphrase databases, and
-/// the requested cipher (if explicitly set).
+/// Output of [`Engine::resolve_encryption`]: the resolved 32-byte key
+/// (wrapped in `Zeroizing` so it clears on drop), an optional fresh
+/// salt to persist for new passphrase databases, and the requested
+/// cipher (if explicitly set).
 #[cfg(feature = "encrypt")]
 type ResolvedEncryption = (
-    Option<[u8; 32]>,
+    Option<crate::encryption::KeyBytes>,
     Option<[u8; format::ENCRYPTION_SALT_LEN]>,
     Option<crate::encryption::Cipher>,
 );
@@ -314,7 +317,7 @@ impl Engine {
             return Ok((Some(derived), fresh, cipher));
         }
 
-        if let Some(key) = config.encryption_key {
+        if let Some(key) = config.encryption_key.as_ref() {
             if let Some(header) = peeked {
                 if header.encryption_salt != [0_u8; format::ENCRYPTION_SALT_LEN] {
                     return Err(Error::InvalidConfig(
@@ -322,7 +325,11 @@ impl Engine {
                     ));
                 }
             }
-            return Ok((Some(key), None, cipher));
+            // Cloning a `Zeroizing<[u8; 32]>` copies the bytes; each
+            // clone independently zeroizes on drop, so the original
+            // inside the config and the resolved copy returned here
+            // both clear when their owners go out of scope.
+            return Ok((Some(key.clone()), None, cipher));
         }
 
         // Unencrypted opens. If the file is encrypted, fail loudly.
@@ -1016,8 +1023,8 @@ impl Engine {
     /// temp file is best-effort cleaned up). Returns
     /// [`Error::LockPoisoned`] on any poisoned engine lock.
     pub(crate) fn compact_in_place(&self) -> Result<()> {
-        // Phase 1: snapshot every namespace + its name (so we can
-        // re-emit the name → id binding in the compacted file).
+        // Snapshot every namespace + its name so we can re-emit the
+        // name → id binding in the compacted file.
         let namespaces: Vec<(u32, String)> = self.list_namespaces()?;
         let mut snapshots: Vec<(u32, String, Vec<RecordSnapshot>)> =
             Vec::with_capacity(namespaces.len());
@@ -1026,31 +1033,38 @@ impl Engine {
             snapshots.push((*ns_id, name.clone(), records));
         }
 
-        // Phase 2: write the compacted file directly (no mmap on the
-        // temp file; we just need bytes on disk that `Store` can later
-        // open). This avoids the Windows "can't shrink a mapped file"
-        // problem that would otherwise come up if we routed the temp
-        // file through `Store::open` (which pre-allocates 1 MiB).
+        // Write the compacted file directly (no mmap on the temp
+        // file; we just need bytes on disk that `Store` can later
+        // open). This avoids the Windows "can't shrink a mapped
+        // file" problem that would otherwise come up if we routed
+        // the temp file through `Store::open` (which pre-allocates
+        // 1 MiB).
         let path = self.store.path().to_path_buf();
         let tmp_path = compaction_temp_path(&path);
+        // Best-effort cleanup of any stale leftover from a prior
+        // failed run.
         let _ = std::fs::remove_file(&tmp_path);
 
         let header = self.store.header()?;
         if let Err(err) = self.write_compacted_file(&tmp_path, &header, &snapshots) {
+            // Best-effort cleanup of the half-written temp file; the
+            // original file is untouched.
             let _ = std::fs::remove_file(&tmp_path);
             return Err(err);
         }
 
-        // Phase 3: atomic swap. After this returns, `self.store` is
-        // backed by the new compacted file; old readers' `Arc<Mmap>`
-        // snapshots stay valid until they release.
+        // Atomic swap. After this returns, `self.store` is backed by
+        // the new compacted file; old readers' `Arc<Mmap>` snapshots
+        // stay valid until they release.
         if let Err(err) = self.store.swap_underlying(&tmp_path) {
+            // Best-effort cleanup: the swap failed mid-flight, so the
+            // temp file is still around but the original is intact.
             let _ = std::fs::remove_file(&tmp_path);
             return Err(err);
         }
 
-        // Phase 4: clear and rebuild every namespace index from the
-        // newly-laid-out file via the recovery scan.
+        // Clear and rebuild every namespace index from the newly-laid-
+        // out file via the recovery scan.
         for (ns_id, _) in &namespaces {
             let ns = self.namespace(*ns_id)?;
             ns.index.clear()?;

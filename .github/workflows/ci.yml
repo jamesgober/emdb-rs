@@ -79,3 +79,28 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --features ttl,nested,encrypt
+
+  audit:
+    name: Security audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version "^0.21" || true
+      # The two `--ignore` advisories are dev-only paths via the
+      # bench-compare feature (sled -> fxhash, sled -> parking_lot
+      # -> instant). Both are unmaintained-status notices, not
+      # exploitable vulnerabilities, and neither has a
+      # semver-compatible upgrade. The same two advisories are
+      # documented in `deny.toml` with the same justification.
+      - name: Run audit
+        run: cargo audit --deny warnings --ignore RUSTSEC-2025-0057 --ignore RUSTSEC-2024-0384
+
+  deny:
+    name: Dependency policy (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
