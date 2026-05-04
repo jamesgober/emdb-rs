@@ -6,9 +6,9 @@
 
 <p align="center">
     <a href="https://crates.io/crates/emdb"><img alt="crates.io" src="https://img.shields.io/crates/v/emdb.svg"></a>
+    <a href="https://crates.io/crates/emdb" alt="Download emdb"><img alt="Crates.io Downloads" src="https://img.shields.io/crates/d/emdb?color=%230099ff"></a>
     <a href="https://docs.rs/emdb"><img alt="docs.rs" src="https://docs.rs/emdb/badge.svg"></a>
     <a href="https://github.com/jamesgober/emdb-rs/actions"><img alt="CI" src="https://github.com/jamesgober/emdb-rs/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="https://github.com/jamesgober/emdb-rs/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
 </p>
 
 <p align="center">
