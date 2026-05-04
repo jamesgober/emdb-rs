@@ -105,7 +105,7 @@ crash-recovery test harness. v1.0 is the API freeze.
 
 ```toml
 [dependencies]
-emdb = "0.7"
+emdb = "0.7.2"
 ```
 
 ## Quick start
