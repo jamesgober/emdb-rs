@@ -88,24 +88,29 @@ notes.
 
 ## Status
 
-**v0.7.2.** The storage engine is a Bitcask-style mmap-backed
+**v0.8.0.** The storage engine is a Bitcask-style mmap-backed
 append-only log with a sharded in-memory hash index. Single-writer,
 multi-reader. Optional at-rest encryption (AES-256-GCM or
 ChaCha20-Poly1305, raw key or Argon2id passphrase). Optional
 sorted-iteration secondary index via
-`EmdbBuilder::enable_range_scans(true)`. Pre-1.0; the API may still
-change before 1.0.
+`EmdbBuilder::enable_range_scans(true)`. Optional group-commit
+flush pipeline via
+`EmdbBuilder::flush_policy(FlushPolicy::Group { .. })` that fuses
+concurrent `flush()` calls into one `fdatasync`. Streaming `iter`
+/ `keys` / `range` and a zero-copy `get_zerocopy` read API land in
+this release. Pre-1.0; the API may still change before 1.0.
 
-The next release (v0.8) lands the group-commit pipeline that closes
-the per-record-durability gap, plus streaming `iter` / `keys` /
-`range`, a zero-copy `get` variant, and a deterministic
-crash-recovery test harness. v1.0 is the API freeze.
+The remaining work for v1.0 is API stabilisation: an audit pass
+for `pub` vs `pub(crate)`, full doc coverage on every public item,
+a `cargo-fuzz` target for the record decoder, and a
+`docs/stability.md` SemVer commitment. No further architectural
+changes are planned before 1.0.
 
 ## Installation
 
 ```toml
 [dependencies]
-emdb = "0.7.2"
+emdb = "0.8.0"
 ```
 
 ## Quick start

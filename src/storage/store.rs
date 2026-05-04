@@ -31,6 +31,7 @@
 //! but always re-validates so a stale hint is harmless.
 
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +60,7 @@ fn pwrite_all(file: &mut File, offset: u64, buf: &[u8]) -> std::io::Result<()> {
     }
 }
 
+use crate::storage::flush::{group_sync, FlushPolicy, GroupCoord};
 use crate::storage::format::{
     self, FLAG_ENCRYPTED, FORMAT_VERSION, HEADER_CRC_OFFSET, HEADER_CRC_RANGE, HEADER_LEN, MAGIC,
     MAGIC_OFFSET,
@@ -226,6 +228,14 @@ pub(crate) struct Store {
     /// the largest valid offset right now?" without taking the writer
     /// lock. Updated under the writer mutex but readable lock-free.
     tail_atomic: AtomicU64,
+    /// Active flush policy. `OnEachFlush` (the default) runs
+    /// `flush()` as a single `sync_data` per call. `Group` routes
+    /// through [`GroupCoord`] so concurrent flushers fuse their
+    /// syncs.
+    policy: FlushPolicy,
+    /// Group-commit coordinator, populated only when
+    /// `policy == FlushPolicy::Group`.
+    coord: Option<Arc<GroupCoord>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -264,6 +274,13 @@ impl Store {
     /// Returns [`Error::MagicMismatch`] / [`Error::VersionMismatch`] /
     /// [`Error::Corrupted`] for malformed headers.
     pub(crate) fn open(path: PathBuf, flags: u32) -> Result<Self> {
+        Self::open_with_policy(path, flags, FlushPolicy::default())
+    }
+
+    /// Same as [`Self::open`] but with an explicit [`FlushPolicy`].
+    /// `Group` policies attach a coordinator that fuses concurrent
+    /// `flush()` calls into one `sync_data`.
+    pub(crate) fn open_with_policy(path: PathBuf, flags: u32, policy: FlushPolicy) -> Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -304,6 +321,14 @@ impl Store {
         // unmapped pages.
         let mmap = unsafe { Mmap::map(&file)? };
 
+        let coord = match policy {
+            FlushPolicy::OnEachFlush => None,
+            FlushPolicy::Group {
+                max_wait,
+                max_batch,
+            } => Some(Arc::new(GroupCoord::new(max_wait, max_batch))),
+        };
+
         Ok(Self {
             path,
             header: Arc::new(RwLock::new(header)),
@@ -315,6 +340,8 @@ impl Store {
                 encode_buf: Vec::with_capacity(256),
             }),
             tail_atomic: AtomicU64::new(tail),
+            policy,
+            coord,
         })
     }
 
@@ -547,27 +574,54 @@ impl Store {
         Ok(result)
     }
 
-    /// Force pending writes to disk via `fdatasync`. Updates the
-    /// header's `tail_hint` first so a subsequent open can skip the
-    /// early portion of the recovery scan.
+    /// Force pending writes to disk via `fdatasync`.
+    ///
+    /// Behaviour depends on the active [`FlushPolicy`]:
+    ///
+    /// - `OnEachFlush` (default): one `sync_data` per call. Same
+    ///   shape as v0.7.x.
+    /// - `Group`: routes through the coordinator so concurrent
+    ///   flushers share one `sync_data`. See
+    ///   [`crate::storage::flush`].
+    ///
+    /// In both cases the header's `tail_hint` is *not* rewritten by
+    /// `flush()` — that is a separate cost paid by
+    /// [`Self::persist_header`]. The recovery scan validates every
+    /// record's CRC and discovers the real tail regardless, so a
+    /// stale hint just costs a longer scan, never correctness or
+    /// data loss.
     ///
     /// # Errors
     ///
-    /// Returns I/O errors from the sync.
+    /// Returns I/O errors from the sync, or [`Error::LockPoisoned`]
+    /// on poisoned writer / coordinator lock.
     pub(crate) fn flush(&self) -> Result<()> {
-        // Sync data only. The header's `tail_hint` is a hot-start hint
-        // for recovery — the recovery scan validates every record's
-        // CRC and discovers the real tail anyway, so a stale hint just
-        // costs a longer scan, never correctness or data loss. Writing
-        // the 4 KB header on every flush() is a measurable cost on
-        // Windows (each `seek + write_all` is ~2 syscalls and
-        // `FlushFileBuffers` cost scales with dirty-page count); we
-        // amortise it via [`Self::persist_header`], called on graceful
-        // close and explicitly when the caller wants a fast-reopen
-        // checkpoint.
-        let writer = self.writer.lock().map_err(|_| Error::LockPoisoned)?;
-        writer.file.sync_data()?;
-        Ok(())
+        match (&self.policy, self.coord.as_ref()) {
+            (FlushPolicy::OnEachFlush, _) | (_, None) => {
+                let writer = self.writer.lock().map_err(|_| Error::LockPoisoned)?;
+                writer.file.sync_data()?;
+                Ok(())
+            }
+            (FlushPolicy::Group { .. }, Some(coord)) => {
+                // The tail we want durable is whatever the writer
+                // has appended up to right now. Snapshot before
+                // entering the coordinator's wait loop.
+                let target = self.tail_atomic.load(Ordering::Acquire);
+                let writer_mutex = &self.writer;
+                let tail_atomic = &self.tail_atomic;
+                coord.run(target, || {
+                    // Lock writer briefly: capture tail at sync time
+                    // (which is the offset durability is now
+                    // guaranteed up to) and run sync_data.
+                    let writer = writer_mutex
+                        .lock()
+                        .map_err(|_| io::Error::other("emdb writer mutex poisoned"))?;
+                    let tail_at_sync = tail_atomic.load(Ordering::Acquire);
+                    let _ = writer.tail; // silence unused on writer
+                    group_sync(&writer.file, tail_at_sync)
+                })
+            }
+        }
     }
 
     /// Persist the in-memory header (with the current `tail_hint`) to

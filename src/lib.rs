@@ -129,6 +129,7 @@ pub use error::{Error, Result};
 pub use namespace::{Namespace, NamespaceIter, NamespaceKeyIter, NamespaceRangeIter};
 #[cfg(feature = "nested")]
 pub use nested::Focus;
+pub use storage::FlushPolicy;
 pub use transaction::Transaction;
 pub use ttl::Ttl;
 pub use value_ref::ValueRef;

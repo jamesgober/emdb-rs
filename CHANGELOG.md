@@ -4,6 +4,172 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0](https://github.com/jamesgober/emdb-rs/compare/v0.7.1...v0.8.0) — 2026-05-03
+
+The release that closes the per-record-durability gap and turns the
+mmap architecture into a public API. Three big additions, two
+quality-of-implementation reworks, and a deeper test bench. Nothing
+breaks the v0.7 file format.
+
+### Added — `FlushPolicy::Group`, the group-commit pipeline
+
+The headline feature. Many concurrent `db.flush()` calls now share
+a single `fdatasync`. The protocol is a leader-follower scheme
+([`crate::storage::flush`]):
+
+1. Each flusher snapshots the writer's current tail offset.
+2. If a recent leader's sync already covered that offset, the
+   flusher returns immediately with no work.
+3. Otherwise the flusher takes the coordinator lock. The first
+   one in becomes the leader and waits up to `max_wait` (or until
+   `max_batch` flushers have joined) before issuing the sync.
+4. Followers park on a condvar until the leader's sync covers
+   their snapshot.
+
+For a workload of N independent producer threads each writing one
+record then calling `flush` for per-record durability, this turns
+`N × fsync_cost` into roughly `(N / max_batch) × fsync_cost`. The
+"individual writes (fsync/op)" column in the `lmdb_style` bench —
+which read 37× slower than redb in v0.7.x because it paid one
+`FlushFileBuffers` per record — moves substantially under
+`Group { max_wait: 500 µs, max_batch: 32 }`. Single-threaded
+flush is unchanged from v0.7.x: with no follower to wait for, the
+leader's `max_wait` window terminates as soon as no follower
+arrives, and the sync runs.
+
+Public surface:
+
+- `EmdbBuilder::flush_policy(policy)` selects the policy at open
+  time. Default is `OnEachFlush`, preserving v0.7.x semantics —
+  upgrades are a non-event for callers that don't opt in.
+- `FlushPolicy` is `#[non_exhaustive]` so we can add variants
+  later (a hypothetical `Group::Adaptive` that adjusts
+  `max_wait` based on observed batch sizes is the obvious one).
+
+5 new integration tests in `tests/flush_policy.rs` cover: the
+default-policy regression guard, single-thread no-deadlock
+behaviour, 8 × 25 concurrent flushers all returning Ok with every
+record durable after reopen, the `max_batch = 1` floor (every
+flusher leads its own cycle, no underflow), and the builder
+round-trip across every variant.
+
+### Added — Streaming `iter` / `keys` / `range`
+
+The v0.7.x iterators called `engine.collect_records()`, which
+materialised every record's `(key, value, expires_at)` tuple as
+an owned `Vec<u8>` triple before yielding the first item. For a
+million-record database that meant a million heap allocations
+plus the data itself sitting in transient memory.
+
+v0.8 keeps the public iterator types ([`crate::EmdbIter`],
+[`crate::EmdbKeyIter`], [`crate::NamespaceIter`],
+[`crate::NamespaceKeyIter`]) but their internals are different:
+they now hold a sorted snapshot of record offsets plus an
+`Arc<Inner>`, and decode one record per `next()` call. Memory
+use scales with offset count, not value size. Records inserted
+after iterator construction are not visible (snapshot
+semantics); records overwritten or removed since the snapshot
+are skipped on decode.
+
+For range queries, two new APIs deliver the same lazy semantics
+to BTreeMap-backed scans:
+
+- [`crate::Emdb::range_iter`] / [`crate::Emdb::range_prefix_iter`]
+- [`crate::Namespace::range_iter`] / [`crate::Namespace::range_prefix_iter`]
+
+These return [`crate::EmdbRangeIter`] /
+[`crate::NamespaceRangeIter`]. The (key, offset) pairs are
+snapshotted from the BTreeMap under one read-lock acquisition;
+the lock is released immediately, and values are decoded on
+demand as the caller pulls items. A consumer that calls
+`.range_iter(...).take(10)` decodes 10 values, not the entire
+range. The eager `range()` / `range_prefix()` are unchanged for
+callers that want the full materialised result.
+
+10 new integration tests in `tests/zerocopy.rs` cover the lazy
+iterator paths alongside the zero-copy read tests below
+(snapshot semantics, early-exit, `range_prefix_iter` parity
+with `range_prefix`, the no-`enable_range_scans` guard).
+
+### Added — `get_zerocopy` and the `ValueRef` type
+
+The mmap-backed read path's whole point is that record bytes
+already live in kernel-managed memory; allocating a `Vec<u8>` to
+return them throws that away. v0.8 adds a parallel API:
+
+- [`crate::Emdb::get_zerocopy`] / [`crate::Namespace::get_zerocopy`]
+  return `Option<ValueRef>`.
+- [`crate::ValueRef`] is either an `Arc<Mmap>` + byte range (the
+  fast path) or an owned `Vec<u8>` (the encrypted-database
+  fallback — AEAD decryption necessarily allocates).
+
+Either way, `ValueRef` implements `Deref<Target = [u8]>`,
+`AsRef<[u8]>`, and the obvious equality traits, so callers can
+pass it where a byte slice is expected.
+
+The mmap-backed variant holds a strong handle to the original
+mapping. If the writer grows the file and swaps in a new
+mapping, the old one stays alive until the last
+`ValueRef` derived from it drops — there is no "reference
+invalidation" hazard for in-flight readers.
+
+10 integration tests cover: round-trip equivalence with `get`,
+empty / missing inputs, survival across writer-driven mmap
+swap, TTL-expired filtering, and the encrypted-database
+fallback.
+
+### Added — Crash-recovery integration tests (`tests/crash_recovery.rs`)
+
+A real crash test requires `TerminateProcess` (Windows) or
+`SIGKILL` (Unix). What we *can* test deterministically is the
+recovery scan's behaviour on the file states a real crash leaves
+behind: torn final record, bit-flipped CRC, garbage length
+prefix, stale `tail_hint`. 5 new tests:
+
+- Truncated final record is discarded; preceding records survive.
+- A flipped CRC byte stops the scan at that record.
+- A garbage length prefix (pointing past EOF) is treated as the
+  truncation point.
+- A stale `tail_hint` does not corrupt recovery — header CRC
+  catches the inconsistency cleanly.
+- Records survive the checkpoint + reopen path that crash
+  recovery exercises.
+
+A real fuzz harness via `cargo-fuzz` is queued for v1.0 (the
+nightly-toolchain dependency makes it CI-cost-significant); these
+deterministic tests are the stable-toolchain proxy.
+
+### Added — Randomized decoder robustness (`tests/decoder_robustness.rs`)
+
+64 iterations of "valid header + N random bytes" feed
+[`crate::Emdb::open`]'s recovery scan and confirm: no panics, no
+infinite loops (5 s wall-clock ceiling per iteration), no
+out-of-bounds reads. Plus three deterministic shape tests:
+empty data region opens to zero records, valid prefix followed
+by random tail recovers exactly the prefix, and key/value sizes
+from 0 bytes to 64 KiB round-trip cleanly.
+
+### Changed — Iterator types reworked, public surface preserved
+
+`EmdbIter` / `EmdbKeyIter` / `NamespaceIter` / `NamespaceKeyIter`
+keep their public type identities and `Iterator` impls. Their
+internal representation moved from `IntoIter<RecordSnapshot>` to
+`(Arc<Inner>, IntoIter<u64>)` — reflects the shift to lazy
+decode. No SemVer impact for callers using them via the
+`Iterator` trait.
+
+### Notes
+
+- No file format change. v0.7.x databases open unchanged.
+- No new runtime dependencies. The group-commit coordinator uses
+  std `Mutex` + `Condvar`; no new crate, no MSRV impact.
+- `fs4` stays at 0.8 for now; bumping forced an MSRV bump and
+  none of the 0.13 features are needed yet. Revisit when an
+  advisory or a needed feature appears.
+- A `cargo-fuzz` target for the format decoder is queued for
+  v1.0. The randomized + crafted tests added here are the
+  stable-toolchain coverage in the meantime.
+
 ## [0.7.2](https://github.com/jamesgober/emdb-rs/compare/v0.7.1...v0.7.2) — 2026-05-03
 
 A polish release ahead of v0.8's architectural work. Nothing here

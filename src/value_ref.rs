@@ -52,8 +52,9 @@ use memmap2::Mmap;
 /// if let Some(value) = db.get_zerocopy("k")? {
 ///     // `value` derefs to &[u8].
 ///     assert_eq!(&*value, b"v");
-///     // Or compare directly:
-///     assert!(value == *b"v");
+///     // Or compare directly against any byte slice:
+///     let want: &[u8] = b"v";
+///     assert!(value == want);
 /// }
 /// # Ok::<(), emdb::Error>(())
 /// ```
@@ -72,7 +73,11 @@ enum Repr {
         range: std::ops::Range<usize>,
     },
     /// Bytes were produced by an AEAD decrypt or otherwise
-    /// allocated; we own the `Vec` directly.
+    /// allocated; we own the `Vec` directly. Only constructed on
+    /// builds with the `encrypt` feature, but the variant exists
+    /// unconditionally so the rest of the type signature stays
+    /// stable across feature combinations.
+    #[allow(dead_code)]
     Owned(Vec<u8>),
 }
 
@@ -85,7 +90,10 @@ impl ValueRef {
         }
     }
 
-    /// Construct an owned reference.
+    /// Construct an owned reference. Used by the encrypted-database
+    /// path (where the AEAD decrypt produces fresh plaintext bytes)
+    /// and by unit tests.
+    #[allow(dead_code)]
     pub(crate) fn from_owned(bytes: Vec<u8>) -> Self {
         Self {
             repr: Repr::Owned(bytes),
@@ -195,9 +203,9 @@ mod tests {
     #[test]
     fn equality_against_byte_slice() {
         let v = ValueRef::from_owned(b"hello".to_vec());
-        assert!(v == *b"hello");
-        let s: &[u8] = b"hello";
-        assert!(v == s);
+        let bytes: &[u8] = b"hello";
+        assert!(v == *bytes);
+        assert!(v == bytes);
         assert!(v == b"hello".to_vec());
     }
 }
