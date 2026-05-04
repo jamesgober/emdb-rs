@@ -9,6 +9,8 @@
 #[allow(dead_code)]
 pub(crate) mod engine;
 #[allow(dead_code)]
+pub(crate) mod flush;
+#[allow(dead_code)]
 pub(crate) mod format;
 #[allow(dead_code)]
 pub(crate) mod index;
@@ -16,3 +18,4 @@ pub(crate) mod index;
 pub(crate) mod store;
 
 pub(crate) use engine::{Engine, EngineConfig, DEFAULT_NAMESPACE_ID};
+pub use flush::FlushPolicy;

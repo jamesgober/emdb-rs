@@ -27,6 +27,7 @@ use std::sync::{Arc, RwLock};
 
 use memmap2::Mmap;
 
+use crate::storage::flush::FlushPolicy;
 #[cfg(feature = "encrypt")]
 use crate::storage::format::FLAG_CIPHER_CHACHA20;
 use crate::storage::format::{self, RecordView, FLAG_ENCRYPTED};
@@ -87,6 +88,9 @@ pub(crate) struct EngineConfig {
     /// Off by default — adds a `Vec<u8>` clone per insert and roughly
     /// doubles index memory.
     pub(crate) enable_range_scans: bool,
+    /// How `db.flush()` interacts with concurrent flush requests.
+    /// Defaults to `OnEachFlush` to preserve v0.7.x semantics.
+    pub(crate) flush_policy: FlushPolicy,
     /// Optional 32-byte AES-256 key (post-KDF). `None` for unencrypted.
     #[cfg(feature = "encrypt")]
     pub(crate) encryption_key: Option<[u8; 32]>,
@@ -107,6 +111,7 @@ impl Default for EngineConfig {
             path: PathBuf::new(),
             flags: 0,
             enable_range_scans: false,
+            flush_policy: FlushPolicy::default(),
             #[cfg(feature = "encrypt")]
             encryption_key: None,
             #[cfg(feature = "encrypt")]
@@ -195,7 +200,11 @@ impl Engine {
         #[cfg(not(feature = "encrypt"))]
         let flags = config.flags;
 
-        let store = Arc::new(Store::open(config.path.clone(), flags)?);
+        let store = Arc::new(Store::open_with_policy(
+            config.path.clone(),
+            flags,
+            config.flush_policy,
+        )?);
         let header = store.header()?;
 
         // Build the encryption context (if any). On fresh files we

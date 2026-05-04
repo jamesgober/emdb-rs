@@ -20,6 +20,7 @@ pub struct EmdbBuilder {
     pub(crate) app_name: Option<String>,
     pub(crate) database_name: Option<String>,
     pub(crate) enable_range_scans: bool,
+    pub(crate) flush_policy: crate::FlushPolicy,
     #[cfg(feature = "encrypt")]
     pub(crate) encryption_key: Option<[u8; 32]>,
     #[cfg(feature = "encrypt")]
@@ -85,6 +86,23 @@ impl EmdbBuilder {
     #[must_use]
     pub fn enable_range_scans(mut self, enabled: bool) -> Self {
         self.enable_range_scans = enabled;
+        self
+    }
+
+    /// Set the flush policy.
+    ///
+    /// Default is [`crate::FlushPolicy::OnEachFlush`], which makes
+    /// every `db.flush()` perform its own `fdatasync` (one sync per
+    /// flush call — the v0.7.x behaviour).
+    ///
+    /// [`crate::FlushPolicy::Group`] enables the group-commit
+    /// coordinator: concurrent `flush()` calls fuse into a single
+    /// `fdatasync`. Pick this for multi-threaded workloads that
+    /// flush per record. See the `FlushPolicy` documentation for
+    /// the leader-follower protocol and tuning guidance.
+    #[must_use]
+    pub fn flush_policy(mut self, policy: crate::FlushPolicy) -> Self {
+        self.flush_policy = policy;
         self
     }
 

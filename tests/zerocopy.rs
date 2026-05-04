@@ -100,7 +100,10 @@ fn value_ref_survives_writer_growth() -> Result<()> {
 
     // The original reference must still read its bytes — the
     // `Arc<Mmap>` inside the ValueRef pinned the original mapping.
-    assert_eq!(anchor.as_slice(), b"I should still be readable after growth");
+    assert_eq!(
+        anchor.as_slice(),
+        b"I should still be readable after growth"
+    );
 
     drop(anchor);
     drop(db);
@@ -108,6 +111,7 @@ fn value_ref_survives_writer_growth() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ttl")]
 #[test]
 fn get_zerocopy_filters_expired_records() -> Result<()> {
     use std::time::Duration;
@@ -177,7 +181,8 @@ fn range_iter_early_exit_works() -> Result<()> {
     // decode the remaining 995 records. We can't easily assert
     // "no work was done" but we can at least assert the take(5)
     // shape produces sorted, contiguous keys.
-    let first_five: Vec<_> = db.range_iter(b"user:".to_vec()..b"user;".to_vec())?
+    let first_five: Vec<_> = db
+        .range_iter(b"user:".to_vec()..b"user;".to_vec())?
         .take(5)
         .collect();
     assert_eq!(first_five.len(), 5);

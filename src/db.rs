@@ -155,6 +155,7 @@ impl Emdb {
             path: path.clone(),
             flags: 0,
             enable_range_scans: builder.enable_range_scans,
+            flush_policy: builder.flush_policy,
             #[cfg(feature = "encrypt")]
             encryption_key: builder.encryption_key,
             #[cfg(feature = "encrypt")]
