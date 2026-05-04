@@ -149,6 +149,19 @@
 //! # Ok::<(), emdb::Error>(())
 //! ```
 //!
+//! ## Operational APIs
+//!
+//! - [`Emdb::stats`] — point-in-time database introspection
+//!   (record counts, file size, namespace count). Cheap to call
+//!   from a per-second health-check loop.
+//! - [`Emdb::backup_to`] — atomic snapshot to a sibling file. The
+//!   result is a normal openable database, not a dump format.
+//! - [`Emdb::lock_holder`] / [`Emdb::break_lock`] — diagnose and
+//!   recover from stuck advisory lockfiles when a holder dies
+//!   without releasing.
+//! - [`Emdb::checkpoint`] — explicit fast-reopen checkpoint that
+//!   persists the file header's `tail_hint`.
+//!
 //! ## Cargo features
 //!
 //! - `ttl` *(default)* — per-record expiration and `default_ttl`.
@@ -199,6 +212,7 @@ mod lockfile;
 mod namespace;
 #[cfg(feature = "nested")]
 mod nested;
+mod stats;
 mod storage;
 mod transaction;
 mod ttl;
@@ -209,9 +223,11 @@ pub use db::{Emdb, EmdbIter, EmdbKeyIter, EmdbRangeIter};
 #[cfg(feature = "encrypt")]
 pub use encryption::{Cipher, EncryptionInput};
 pub use error::{Error, Result};
+pub use lockfile::LockHolder;
 pub use namespace::{Namespace, NamespaceIter, NamespaceKeyIter, NamespaceRangeIter};
 #[cfg(feature = "nested")]
 pub use nested::Focus;
+pub use stats::EmdbStats;
 pub use storage::FlushPolicy;
 pub use transaction::Transaction;
 pub use ttl::Ttl;

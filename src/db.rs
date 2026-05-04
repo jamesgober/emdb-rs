@@ -313,6 +313,29 @@ impl Emdb {
         self.inner.engine.flush()
     }
 
+    /// Snapshot a point-in-time [`crate::EmdbStats`] for monitoring,
+    /// dashboards, or compaction-decision logic.
+    ///
+    /// O(namespaces) plus one filesystem `metadata` call. Cheap
+    /// enough to call from a per-second health-check loop. Returns
+    /// a `Copy` value type, so the result can be passed across
+    /// thread boundaries without lifetime concerns.
+    ///
+    /// In an async context, prefer calling this directly rather
+    /// than wrapping in `spawn_blocking` — the work is dominated by
+    /// a fast filesystem stat and a few atomic loads, neither of
+    /// which can stall the executor meaningfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::LockPoisoned`] on a poisoned namespace
+    /// or header lock. I/O errors from the metadata call are
+    /// silently absorbed — the file size falls back to the in-memory
+    /// `logical_size_bytes`, which is a strict lower bound.
+    pub fn stats(&self) -> Result<crate::EmdbStats> {
+        self.inner.engine.stats()
+    }
+
     /// Persist a fast-reopen checkpoint: rewrites the file header with
     /// the current tail offset and `fdatasync`s.
     ///
@@ -450,6 +473,36 @@ impl Emdb {
         }
     }
 
+    /// Streaming iterator over keys at or after `start`, in
+    /// lexicographic order. Requires the database to have been
+    /// opened with [`crate::EmdbBuilder::enable_range_scans`]`(true)`.
+    ///
+    /// Useful for paginated APIs: pass the last-seen key as `start`
+    /// on the next call to resume iteration. The iterator is lazy
+    /// (decodes one record per `next()` call), so consumers paying
+    /// for only the first N elements get O(N) work, not O(total).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::range_iter`].
+    pub fn iter_from(&self, start: impl AsRef<[u8]>) -> Result<EmdbRangeIter> {
+        self.range_iter(start.as_ref().to_vec()..)
+    }
+
+    /// Streaming iterator over keys strictly after `start`, in
+    /// lexicographic order. Same as [`Self::iter_from`] but skips
+    /// any record with a key equal to `start`. Useful for
+    /// "give me the next page after this cursor" patterns where
+    /// the cursor is the last key already seen.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::range_iter`].
+    pub fn iter_after(&self, start: impl AsRef<[u8]>) -> Result<EmdbRangeIter> {
+        let start = start.as_ref().to_vec();
+        self.range_iter((std::ops::Bound::Excluded(start), std::ops::Bound::Unbounded))
+    }
+
     // ---- TTL operations ----
 
     /// Insert with an explicit TTL.
@@ -529,6 +582,118 @@ impl Emdb {
             }
         }
         evicted
+    }
+
+    /// Read the metadata of whoever currently holds the advisory
+    /// lock on `path`, without trying to acquire the lock.
+    ///
+    /// Returns `Ok(None)` when no `.lock` sidecar exists at
+    /// `<path>.lock` (the database is unlocked). Returns
+    /// `Ok(Some(holder))` when the sidecar is present and its body
+    /// is well-formed — typically because some emdb instance is
+    /// either currently using the database or died with the lock
+    /// held.
+    ///
+    /// This is the diagnostic precondition for [`Self::break_lock`]:
+    /// read the holder, confirm via OS tooling (`ps`, `Get-Process`,
+    /// container inspection, etc.) that the PID is gone, then break
+    /// the lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::LockfileError`] for I/O failures, or
+    /// [`crate::Error::Corrupted`] when the sidecar exists but its
+    /// body is malformed.
+    pub fn lock_holder(path: impl AsRef<Path>) -> Result<Option<crate::LockHolder>> {
+        crate::lockfile::LockFile::read_holder(path.as_ref())
+    }
+
+    /// Forcibly remove a stuck `<path>.lock` sidecar so a fresh
+    /// [`Self::open`] can succeed.
+    ///
+    /// # Safety contract (read carefully)
+    ///
+    /// emdb is single-writer per file. The lockfile exists to stop
+    /// two concurrent processes from corrupting the database. If
+    /// you call `break_lock` while a live process is still holding
+    /// the lock, that process and the next opener will both write
+    /// to the same file and produce undefined results — torn
+    /// records, lost updates, possibly an unrecoverable file.
+    ///
+    /// **Before calling this, you MUST confirm the holder is
+    /// dead.** Use [`Self::lock_holder`] to read the PID, then
+    /// confirm via OS tooling appropriate to your environment:
+    ///
+    /// - Linux/macOS: `ps -p <pid>` (silent exit code 1 means dead)
+    /// - Windows: `Get-Process -Id <pid>` (errors mean dead)
+    /// - Containers: confirm the container/pod is no longer
+    ///   running before calling.
+    ///
+    /// emdb deliberately does not perform this check itself —
+    /// portable PID-liveness on Windows + Unix would require
+    /// adding an OS-FFI dependency, and a check based on stale
+    /// timestamps is too easily wrong.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::LockfileError`] for I/O failures.
+    /// Treats "lockfile already gone" as success — the operation
+    /// is idempotent.
+    pub fn break_lock(path: impl AsRef<Path>) -> Result<()> {
+        crate::lockfile::LockFile::break_lock(path.as_ref())
+    }
+
+    /// Atomically snapshot the live record set into a self-contained
+    /// backup file at `target`. The resulting file is a normal emdb
+    /// database that can be opened with [`Self::open`] — it is not a
+    /// dump format, archive, or proprietary blob.
+    ///
+    /// Implementation: writes to `<target>.backup.tmp`, `fdatasync`s,
+    /// then `rename`s into place. Failure at any step leaves `target`
+    /// untouched and the temp file is best-effort cleaned up.
+    ///
+    /// `target` must differ from the live database's own path. If
+    /// `target` already exists, it is overwritten — emdb does not
+    /// keep historical backups for you; callers wanting timestamped
+    /// snapshots should incorporate the timestamp into `target`.
+    ///
+    /// This is a heavier operation than [`Self::flush`] — it walks
+    /// every record in every namespace, encodes them, and writes
+    /// the result. In an async context, call this via
+    /// `tokio::task::spawn_blocking` (or your runtime's equivalent)
+    /// to avoid stalling the executor; the work is bounded but
+    /// proportional to the database size.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use emdb::Emdb;
+    ///
+    /// let db = Emdb::open_in_memory();
+    /// db.insert("user:1", "alice")?;
+    /// db.insert("user:2", "bob")?;
+    ///
+    /// let backup = std::env::temp_dir().join("emdb-backup-example.emdb");
+    /// db.backup_to(&backup)?;
+    ///
+    /// // The backup is a fully-formed emdb database.
+    /// let restored = Emdb::open(&backup)?;
+    /// assert_eq!(restored.get("user:1")?, Some(b"alice".to_vec()));
+    /// assert_eq!(restored.get("user:2")?, Some(b"bob".to_vec()));
+    ///
+    /// # drop(restored);
+    /// # let _ = std::fs::remove_file(&backup);
+    /// # let _ = std::fs::remove_file(format!("{}.lock", backup.display()));
+    /// # Ok::<(), emdb::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidConfig`] if `target` equals the
+    /// live database's path. Returns I/O errors from the rewrite,
+    /// sync, or rename phases.
+    pub fn backup_to(&self, target: impl AsRef<Path>) -> Result<()> {
+        self.inner.engine.backup_to(target.as_ref())
     }
 
     /// Compact the on-disk file by rewriting only live records and

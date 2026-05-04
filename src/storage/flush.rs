@@ -87,6 +87,32 @@ pub enum FlushPolicy {
         /// and syncs immediately.
         max_batch: usize,
     },
+    /// Open the file with platform-native synchronous-write flags
+    /// (`FILE_FLAG_WRITE_THROUGH` on Windows, `O_SYNC` on Unix), so
+    /// every `pwrite` is durable on return and `flush()` becomes a
+    /// no-op fast path.
+    ///
+    /// Pick this for single-thread per-record-durability workloads
+    /// where the dominant cost is `flush()`-after-every-record. On
+    /// Windows that path normally pays one `FlushFileBuffers` per
+    /// call (~27 ms on consumer NVMe); `WriteThrough` lets the OS
+    /// commit each record synchronously inside `pwrite` instead,
+    /// often giving lower per-op latency at the cost of higher
+    /// per-op base cost (every write waits for disk, not just
+    /// every flush).
+    ///
+    /// **Trade-off.** Bulk loads under this policy are slower than
+    /// under `OnEachFlush` because every individual `pwrite` waits
+    /// for the disk; the bulk-load path no longer benefits from
+    /// the OS's write-back cache. For mixed workloads, prefer
+    /// `Group` (multi-threaded per-record durability) or stick
+    /// with the default and batch via `transaction()` /
+    /// `insert_many()`.
+    ///
+    /// Behaviourally, `flush()` under this policy still calls
+    /// `sync_data` (which is fast — most data is already durable),
+    /// so callers who flip between policies see no semantic change.
+    WriteThrough,
 }
 
 /// Coordinator state. One per Store; constructed only when the

@@ -37,9 +37,55 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 #[cfg(unix)]
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt as _};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt as _;
 
 use memmap2::Mmap;
+
+/// Windows `FILE_FLAG_WRITE_THROUGH` — causes `WriteFile` to wait
+/// for the data to reach non-volatile storage before returning,
+/// bypassing the lazy write-behind cache. Hardcoded to avoid a
+/// `windows-sys` dep for one constant. Source:
+/// `winnt.h` in the Windows SDK.
+#[cfg(windows)]
+const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+
+/// Unix `O_SYNC` — POSIX flag that makes every write block until
+/// the data plus its metadata is durable on disk. Hardcoded
+/// per-platform because `std::os::unix::fs::OpenOptionsExt::custom_flags`
+/// takes an `i32` and we'd otherwise pull in `libc` for one
+/// constant.
+///
+/// Linux defines `O_SYNC` as `O_DSYNC | __O_SYNC = 0x101000`; the
+/// BSD family uses `0x80`. `target_os` checks dispatch to the
+/// right value.
+#[cfg(target_os = "linux")]
+const O_SYNC_FLAG: i32 = 0x101000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const O_SYNC_FLAG: i32 = 0x80;
+// Other unix targets we don't have a vetted constant for fall back
+// to 0 (no synchronous-write flag) and rely on explicit
+// `sync_data` calls. This keeps the build green on tier-2/3
+// targets we haven't certified.
+#[cfg(all(
+    unix,
+    not(target_os = "linux"),
+    not(target_os = "macos"),
+    not(target_os = "ios"),
+    not(target_os = "freebsd"),
+    not(target_os = "dragonfly"),
+    not(target_os = "openbsd"),
+    not(target_os = "netbsd")
+))]
+const O_SYNC_FLAG: i32 = 0;
 
 /// Positional write at `offset`. On Unix this uses `pwrite` so the
 /// file pointer is not moved. On Windows we fall back to the
@@ -290,9 +336,11 @@ impl Store {
 
     /// Same as [`Self::open`] but with an explicit [`FlushPolicy`].
     /// `Group` policies attach a coordinator that fuses concurrent
-    /// `flush()` calls into one `sync_data`.
+    /// `flush()` calls into one `sync_data`. `WriteThrough` opens
+    /// the file with platform-native synchronous-write flags so
+    /// every `pwrite` is durable on return.
     pub(crate) fn open_with_policy(path: PathBuf, flags: u32, policy: FlushPolicy) -> Result<Self> {
-        let mut file = OpenOptions::new()
+        let mut file = open_options_for(&policy)
             .read(true)
             .write(true)
             .create(true)
@@ -333,7 +381,7 @@ impl Store {
         let mmap = unsafe { Mmap::map(&file)? };
 
         let coord = match policy {
-            FlushPolicy::OnEachFlush => None,
+            FlushPolicy::OnEachFlush | FlushPolicy::WriteThrough => None,
             FlushPolicy::Group {
                 max_wait,
                 max_batch,
@@ -631,6 +679,20 @@ impl Store {
                 sync_handle.sync_data()?;
                 Ok(())
             }
+            (FlushPolicy::WriteThrough, _) => {
+                // Under `WriteThrough` the OS commits each `pwrite`
+                // synchronously, so most of what `sync_data` would
+                // flush is already durable. We still call it as a
+                // belt-and-braces guarantee — on Windows
+                // `FILE_FLAG_WRITE_THROUGH` only covers the data
+                // pages, not the FAT/MFT metadata; on Unix `O_SYNC`
+                // covers both but the syscall is cheap if there's
+                // nothing left dirty. The cost shifts: bulk loads
+                // are slower (every `pwrite` waits), per-record
+                // flushes are near-free.
+                sync_handle.sync_data()?;
+                Ok(())
+            }
             (FlushPolicy::Group { .. }, Some(coord)) => {
                 // The tail we want durable is whatever the writer
                 // has appended up to right now. The coordinator
@@ -734,8 +796,14 @@ impl Store {
         // Atomic rename: replacement → original path.
         std::fs::rename(replacement_path, &self.path)?;
 
-        // Reopen the writer's File handle on the (now new) original path.
-        let new_file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        // Reopen the writer's File handle on the (now new) original
+        // path. Preserve the original `FlushPolicy` so a database
+        // opened with `WriteThrough` keeps the synchronous-write
+        // semantics across an atomic swap (e.g. compaction).
+        let new_file = open_options_for(&self.policy)
+            .read(true)
+            .write(true)
+            .open(&self.path)?;
         writer.file = new_file;
 
         // Re-read the new header to get its tail_hint and capacity.
@@ -798,6 +866,43 @@ fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis().min(u64::MAX as u128) as u64)
+}
+
+/// Build an [`OpenOptions`] with the platform-specific
+/// synchronous-write flag set when the active policy is
+/// [`FlushPolicy::WriteThrough`].
+///
+/// Centralised so every code path that opens the data file (initial
+/// open, post-`swap_underlying` reopen) agrees on which flags are
+/// needed for which policy. Tier-1 platforms — Linux, macOS,
+/// Windows — apply a real synchronous-write flag here; other Unix
+/// targets fall back to a flag value of 0 and rely on explicit
+/// `sync_data` calls (the `WriteThrough` semantics degrade to
+/// `OnEachFlush` on uncertified targets, which is correct but
+/// loses the perf win — documented in the policy's doc comment).
+fn open_options_for(policy: &FlushPolicy) -> OpenOptions {
+    let mut options = OpenOptions::new();
+    if matches!(policy, FlushPolicy::WriteThrough) {
+        #[cfg(windows)]
+        {
+            // SAFETY: `custom_flags` accepts arbitrary `u32` flag
+            // values; FILE_FLAG_WRITE_THROUGH is documented in
+            // CreateFile docs as a valid combination with all other
+            // flags we use (read/write/create/no-truncate). The
+            // value `0x80000000` is the documented constant.
+            let _ = options.custom_flags(FILE_FLAG_WRITE_THROUGH);
+        }
+        #[cfg(unix)]
+        {
+            // On uncertified Unix targets `O_SYNC_FLAG` is `0`,
+            // which `custom_flags(0)` is documented to mean "no
+            // additional flags" — same as `OpenOptions::new()`
+            // would produce. So we still call it unconditionally
+            // and let the platform constant decide.
+            let _ = options.custom_flags(O_SYNC_FLAG);
+        }
+    }
+    options
 }
 
 #[cfg(test)]
