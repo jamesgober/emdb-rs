@@ -197,6 +197,14 @@ impl Store {
         Ok(*guard)
     }
 
+    /// Logical end-of-data byte offset within the journal file.
+    /// Equivalent to "the size of the file at the moment of this
+    /// call", since fsys's journal is append-only and never
+    /// pre-allocates past the actual data.
+    pub(crate) fn tail(&self) -> u64 {
+        self.journal.next_lsn().as_u64()
+    }
+
     /// Borrow a snapshot of the current read mapping. Cheap —
     /// returns an `Arc` clone.
     ///
@@ -250,6 +258,35 @@ impl Store {
         }
 
         Ok(payload_start)
+    }
+
+    /// Closure-style append. Allocates a small `Vec<u8>` per
+    /// call, hands it to `fill_payload` so the caller can encode
+    /// the tag byte + body in place, then routes through
+    /// [`Self::append`]. Convenience for engine call sites that
+    /// want the v0.7-v0.8 closure shape.
+    pub(crate) fn append_with<F>(&self, fill_payload: F) -> Result<u64>
+    where
+        F: FnOnce(&mut Vec<u8>) -> Result<()>,
+    {
+        let mut buf = Vec::with_capacity(64);
+        fill_payload(&mut buf)?;
+        self.append(&buf)
+    }
+
+    /// Closure-style batch append. The closure is given a
+    /// `&mut Vec<Vec<u8>>` it can fill with one entry per
+    /// record. After the closure returns, every entry is
+    /// appended via [`Self::append`] in order; the per-record
+    /// payload-start offsets are returned in the same order.
+    pub(crate) fn append_batch_with<F>(&self, fill: F) -> Result<Vec<u64>>
+    where
+        F: FnOnce(&mut Vec<Vec<u8>>) -> Result<()>,
+    {
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        fill(&mut payloads)?;
+        let slices: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
+        self.append_batch(slices)
     }
 
     /// Append a batch of payloads under a single concurrent-safe

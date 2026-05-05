@@ -78,10 +78,7 @@ fn group_policy_single_thread_does_not_deadlock() -> Result<()> {
 
     let db = Emdb::builder()
         .path(path.clone())
-        .flush_policy(FlushPolicy::Group {
-            max_wait: Duration::from_millis(50),
-            max_batch: 8,
-        })
+        .flush_policy(FlushPolicy::Group)
         .build()?;
 
     let started = Instant::now();
@@ -113,10 +110,7 @@ fn group_policy_concurrent_flushers_all_succeed() -> Result<()> {
     let db = Arc::new(
         Emdb::builder()
             .path(path.clone())
-            .flush_policy(FlushPolicy::Group {
-                max_wait: Duration::from_millis(2),
-                max_batch: 16,
-            })
+            .flush_policy(FlushPolicy::Group)
             .build()?,
     );
 
@@ -176,10 +170,7 @@ fn group_policy_max_batch_one_does_not_drop_requests() -> Result<()> {
 
     let db = Emdb::builder()
         .path(path.clone())
-        .flush_policy(FlushPolicy::Group {
-            max_wait: Duration::from_millis(1),
-            max_batch: 1,
-        })
+        .flush_policy(FlushPolicy::Group)
         .build()?;
 
     for i in 0..20 {
@@ -211,10 +202,7 @@ fn flush_policy_round_trips_through_builder() -> Result<()> {
         .flush_policy(FlushPolicy::OnEachFlush)
         .build()?;
     let _ = Emdb::builder()
-        .flush_policy(FlushPolicy::Group {
-            max_wait: Duration::from_micros(500),
-            max_batch: 32,
-        })
+        .flush_policy(FlushPolicy::Group)
         .build()?;
     // Default constructor variant.
     let _ = Emdb::builder()
