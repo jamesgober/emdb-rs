@@ -15,6 +15,8 @@ pub(crate) mod format;
 #[allow(dead_code)]
 pub(crate) mod index;
 #[allow(dead_code)]
+pub(crate) mod meta;
+#[allow(dead_code)]
 pub(crate) mod store;
 
 pub(crate) use engine::{Engine, EngineConfig, DEFAULT_NAMESPACE_ID};
