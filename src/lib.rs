@@ -10,19 +10,28 @@
 //!
 //! ## Architecture
 //!
-//! emdb is an **mmap-backed append-only KV** with a sharded in-memory
-//! hash index. Writes go through `pwrite` at a single tail offset;
-//! reads slice directly into the kernel-managed memory map (zero-copy).
-//! Crash safety comes from per-record CRC32 framing — recovery scan
-//! truncates at the first bad CRC. This is the Bitcask family of
-//! storage engines, the same shape used by Riak, HaloDB, and others.
+//! emdb is an **fsys-journal-backed append-only KV** with a sharded
+//! in-memory hash index. Writes go through `fsys::JournalHandle`'s
+//! lock-free LSN reservation + group-commit fsync; reads slice
+//! directly into a kernel-managed memory map of the same file
+//! (zero-copy). Crash safety is delegated to fsys's CRC-32C frame
+//! validation and five-state tail-truncation taxonomy.
 //!
-//! Single-writer, multi-reader. The 64-shard primary index plus the
-//! lock-free `Arc<Mmap>` read path make multi-threaded reads scale to
-//! many millions of operations per second on a single open handle.
-//! Writes serialise on one mutex covering the encode-and-pwrite step;
-//! producers should batch through [`Emdb::insert_many`] or
-//! [`Emdb::transaction`] when latency matters.
+//! This is the Bitcask family of storage engines (one append-only
+//! log + an in-memory index), built on top of fsys for the
+//! filesystem substrate. fsys handles platform-specific durability
+//! (NVMe passthrough flush on Linux + Windows, io_uring on Linux,
+//! `WRITE_THROUGH` where appropriate); emdb handles the
+//! engine-level concerns (per-namespace sharded indices,
+//! encryption, range scans, TTL).
+//!
+//! **Reads** are lock-free — the 64-shard primary index plus the
+//! `Arc<Mmap>` zero-copy read path scale to many millions of
+//! operations per second on a single open handle. **Writes** are
+//! lock-free via fsys's atomic LSN reservation; no writer mutex
+//! on the hot append path. Producers can still batch through
+//! [`Emdb::insert_many`] or [`Emdb::transaction`] when group
+//! semantics matter.
 //!
 //! ## Quick start
 //!
@@ -112,15 +121,10 @@
 //! calls share a single `fdatasync`:
 //!
 //! ```no_run
-//! use std::time::Duration;
-//!
 //! use emdb::{Emdb, FlushPolicy};
 //!
 //! let db = Emdb::builder()
-//!     .flush_policy(FlushPolicy::Group {
-//!         max_wait: Duration::from_micros(500),
-//!         max_batch: 32,
-//!     })
+//!     .flush_policy(FlushPolicy::Group)
 //!     .build()?;
 //! # Ok::<(), emdb::Error>(())
 //! ```

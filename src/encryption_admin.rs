@@ -192,8 +192,8 @@ pub(crate) fn rewrite_database(
 pub fn enable_encryption(path: impl AsRef<Path>, target: EncryptionInput) -> Result<()> {
     let path = path.as_ref();
     // Pre-flight: the source must be unencrypted.
-    if let Some(header) = crate::storage::store::Store::peek_header_path(path)? {
-        if header.flags & crate::storage::format::FLAG_ENCRYPTED != 0 {
+    if let Some(header) = crate::storage::meta::read(path)? {
+        if header.flags & crate::storage::meta::FLAG_ENCRYPTED != 0 {
             return Err(Error::InvalidConfig(
                 "enable_encryption: file is already encrypted",
             ));
@@ -221,8 +221,8 @@ pub fn enable_encryption(path: impl AsRef<Path>, target: EncryptionInput) -> Res
 /// - [`Error::Io`] from the rename / write path.
 pub fn disable_encryption(path: impl AsRef<Path>, current: EncryptionInput) -> Result<()> {
     let path = path.as_ref();
-    if let Some(header) = crate::storage::store::Store::peek_header_path(path)? {
-        if header.flags & crate::storage::format::FLAG_ENCRYPTED == 0 {
+    if let Some(header) = crate::storage::meta::read(path)? {
+        if header.flags & crate::storage::meta::FLAG_ENCRYPTED == 0 {
             return Err(Error::InvalidConfig(
                 "disable_encryption: file is already unencrypted",
             ));
@@ -255,8 +255,8 @@ pub fn rotate_encryption_key(
     to: EncryptionInput,
 ) -> Result<()> {
     let path = path.as_ref();
-    if let Some(header) = crate::storage::store::Store::peek_header_path(path)? {
-        if header.flags & crate::storage::format::FLAG_ENCRYPTED == 0 {
+    if let Some(header) = crate::storage::meta::read(path)? {
+        if header.flags & crate::storage::meta::FLAG_ENCRYPTED == 0 {
             return Err(Error::InvalidConfig(
                 "rotate_encryption_key: file is not encrypted; use enable_encryption \
                  to add encryption to an unencrypted database",

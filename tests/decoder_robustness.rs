@@ -141,37 +141,26 @@ fn valid_prefix_then_garbage_recovers_only_the_prefix() -> Result<()> {
         db.checkpoint()?;
     }
 
-    // Append random garbage to the file's tail.
-    let prev_len = std::fs::metadata(&path)?.len();
+    // In v0.9 the journal file has no pre-allocated tail; the
+    // file size after `flush()` equals the last frame's end LSN.
+    // To exercise the "valid prefix then garbage" recovery path
+    // we append random bytes to the journal's tail. fsys's
+    // JournalReader walks frames forward; the moment it hits a
+    // bad magic / bad CRC / truncated frame, it stops cleanly
+    // and reports the tail state — and that's exactly what we
+    // want recovery to detect.
+    let tail_offset = std::fs::metadata(&path)?.len();
     {
-        let file = OpenOptions::new().write(true).open(&path)?;
-        // Seek to the actual tail. The file has a pre-allocated
-        // padding region after the logical tail; the recovery
-        // scan stops at the padding's first all-zero bytes
-        // (length-prefix 0 → "no more records"). To exercise
-        // the random-garbage path we need to write into the
-        // padding region, which lives between `tail_hint` and
-        // `prev_len`. We don't have direct access to tail_hint
-        // from public API, so we read it via header bytes 32..40.
-        use std::io::Read;
-        let mut reader = OpenOptions::new().read(true).open(&path)?;
-        let _seek = reader.seek(SeekFrom::Start(32))?;
-        let mut tail_hint_bytes = [0_u8; 8];
-        reader.read_exact(&mut tail_hint_bytes)?;
-        let tail_hint = u64::from_le_bytes(tail_hint_bytes);
-        drop(reader);
-
-        let mut writer = file;
-        let _seek = writer.seek(SeekFrom::Start(tail_hint))?;
+        let mut file = OpenOptions::new().append(true).open(&path)?;
         let mut rng = Rng::new();
         rng.seed(42);
         let mut garbage = vec![0_u8; 256];
         for byte in &mut garbage {
             *byte = rng.u8(..);
         }
-        writer.write_all(&garbage)?;
-        writer.sync_data()?;
-        let _ = prev_len;
+        file.write_all(&garbage)?;
+        file.sync_data()?;
+        let _ = tail_offset;
     }
 
     // Reopen — the garbage must be discarded by the recovery scan.

@@ -108,15 +108,10 @@ fn main() {
 
     // Run each policy on a fresh DB so they don't share state. Same
     // workload shape on both for a clean apples-to-apples comparison.
+    let _ = (max_wait_us, max_batch); // tuning knobs are advisory in v0.9
     let policies: &[(&str, FlushPolicy)] = &[
         ("OnEachFlush", FlushPolicy::OnEachFlush),
-        (
-            "Group",
-            FlushPolicy::Group {
-                max_wait: Duration::from_micros(max_wait_us),
-                max_batch,
-            },
-        ),
+        ("Group", FlushPolicy::Group),
     ];
 
     println!(

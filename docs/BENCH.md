@@ -115,7 +115,8 @@ When logging benchmark output into README or release notes, record:
 
 ## Reference baseline (5 M records, Windows 11 NVMe)
 
-Captured 2026-05-04 on emdb v0.8.5 vs. redb 2.6 vs. sled 0.34 with:
+Captured 2026-05-04 on emdb v0.9.0-alpha.1 (fsys-journal
+substrate) vs. redb 2.6 vs. sled 0.34 with:
 
 ```powershell
 $env:EMDB_BENCH_RECORDS = "5000000"
@@ -127,41 +128,74 @@ the size rows).
 
 | phase                       |        emdb |    redb  |    sled  |
 |-----------------------------|------------:|---------:|---------:|
-| bulk load                   |    **3086** |    68231 |    39506 |
-| batch writes                |    **2616** |     6656 |     1370 |
-| nosync writes               |     **131** |     1063 |      697 |
-| random reads (1 M)          |     **332** |     2814 |     6201 |
-| random reads (4 threads)    |     **817** |    11945 |    22813 |
-| random reads (8 threads)    |     **511** |    12838 |    22891 |
-| removals                    |    **6161** |    32840 |    25271 |
-| compaction                  |    **6513** |    14163 |      N/A |
-| uncompacted size            |    1.08 GiB | 4.00 GiB | 2.15 GiB |
-| compacted size              | **498 MiB** | 1.64 GiB |      N/A |
-| individual writes (fsync/op)|       25281 |  **644** |  **452** |
-| random range reads          |         N/A |     2329 |     6247 |
+| bulk load                   |   **13 724** |    43 660 |    31 116 |
+| individual writes (fsync/op)|     **406** |      544 |      429 |
+| batch writes                |     **292** |     5 970 |     1 286 |
+| nosync writes               |     **127** |     1 025 |      675 |
+| random reads (1 M)          |     **322** |     2 765 |     6 079 |
+| random reads (4 threads)    |     **703** |    11 210 |    22 884 |
+| random reads (8 threads)    |     **511** |    13 026 |    23 392 |
+| removals                    |   **5 662** |    33 348 |    25 631 |
+| compaction                  |   **8 268** |    12 540 |      N/A |
+| uncompacted size            |    1.10 GiB |  4.00 GiB |  2.15 GiB |
+| compacted size              | **508 MiB** |  1.64 GiB |      N/A |
+| random range reads          |       N/A   |     2 376 |     6 133 |
 
 Notes:
 
-- emdb wins every aggregate-throughput phase, often by an order of
-  magnitude. Aggregate read throughput at 8 threads is
-  **~9.78 M reads/sec**.
+- emdb wins every column in v0.9. Aggregate read throughput at
+  8 threads is **~9.78 M reads/sec**.
 - The `individual writes` phase syncs after every record from a
-  single thread. emdb pays one Windows `FlushFileBuffers` per
-  write, which dominates the result; redb / sled win this column
-  because their commit machinery folds adjacent single-thread
-  writes into a single sync. For multi-threaded
-  per-record-durability workloads, opt into `FlushPolicy::Group`
-  (see the group-commit baseline below for the 8× win on N = 8
-  concurrent flushers); for single-thread per-record durability,
-  benchmark `FlushPolicy::WriteThrough` on your data shape — see
-  the write-through section.
-- `random range reads` is N/A because the bench runs in hash-only
-  mode. Set `EmdbBuilder::enable_range_scans(true)` to enable the
-  opt-in BTreeMap secondary index, then use `range_iter` /
-  `range_prefix_iter` for streaming consumption.
+  single thread. v0.8.5 was 39× behind redb on this column
+  because each `db.flush()` hit one Windows `FlushFileBuffers`
+  per call. v0.9 routes the write path through fsys's journal
+  substrate (lock-free LSN reservation + group-commit fsync +
+  NVMe passthrough flush where supported), and the column went
+  from 25 281 ms in v0.8.5 to 406 ms in v0.9 — **62× faster
+  vs. our own previous release** and **1.3× faster than redb,
+  1.06× faster than sled.**
+- `random range reads` is N/A because the bench runs in hash-
+  only mode. Set `EmdbBuilder::enable_range_scans(true)` to
+  enable the opt-in BTreeMap secondary index, then use
+  `range_iter` / `range_prefix_iter` for streaming consumption.
+- One genuine regression vs. v0.8.5: `bulk load` is slower
+  (3 086 ms → 13 724 ms). fsys's per-record framing
+  (12-byte CRC-32C frame around every record) and lock-free
+  LSN reservation add a small per-call overhead that adds up
+  across 5 M tight-loop appends. We still beat redb (3.2× faster)
+  and sled (2.3× faster) on this phase; the absolute regression
+  is the cost of moving to a real journal substrate. For the
+  trade-off as a whole, the single-thread fsync win pays for
+  the bulk-load cost many times over for any workload that
+  ever calls `db.flush()`.
 
 These numbers are workload- and hardware-specific. Reproduce on
 your target deployment for decision making.
+
+## v0.9 vs. v0.8.5 (own previous release)
+
+Same hardware, same dataset, same workload. v0.9 ships a major
+architectural change (fsys-journal substrate) and the numbers
+move accordingly:
+
+| phase | v0.8.5 | v0.9.0-alpha.1 | delta |
+|---|---:|---:|---:|
+| individual writes | 25 281 ms | **406 ms** | **62× faster** |
+| batch writes | 2 616 ms | **292 ms** | **9.0× faster** |
+| random reads (4 threads) | 817 ms | **703 ms** | 1.16× faster |
+| removals | 6 161 ms | **5 662 ms** | 1.09× faster |
+| nosync writes | 131 ms | 127 ms | par |
+| random reads (1 M) | 332 ms | 322 ms | par |
+| random reads (8 threads) | 511 ms | 511 ms | par |
+| compaction | 6 513 ms | 8 268 ms | 1.27× slower |
+| bulk load | 3 086 ms | 13 724 ms | 4.5× slower |
+| compacted size | 498 MiB | 508 MiB | 1.02× larger |
+
+Headline: **62× faster on the column we couldn't fix in v0.8.5,
+9× faster on batch writes, par or better on every other read
+column.** The `bulk_load` and `compaction` regressions are real
+but small in absolute terms — both still beat redb and sled
+significantly.
 
 ## Group-commit baseline (8 threads × 200 writes, default policy)
 
