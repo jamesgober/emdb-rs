@@ -4,6 +4,115 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0-alpha.1](https://github.com/jamesgober/emdb-rs/compare/v0.8.5...v0.9.0-alpha.1) — 2026-05-04
+
+Major architectural change. The storage substrate is now
+[`fsys`](https://crates.io/crates/fsys) — a filesystem IO crate
+that provides a journal primitive (lock-free LSN reservation,
+group-commit fsync, NVMe passthrough flush where supported, and
+io_uring on Linux ≥ 5.1) and `Method::Auto` hardware-aware
+durability dispatch. emdb's write path is now a thin layer over
+`fsys::JournalHandle::append`; the read path keeps its own
+`Arc<Mmap>` over the journal file for zero-copy lookups.
+
+This is an alpha release. The API and on-disk format may still
+change before the stable v0.9.0. Pin the exact version if you
+depend on it.
+
+### Breaking — file format
+
+v0.9 uses fsys's frame format (`[4 magic][4 length][N payload][4
+crc32c]` per record) on the data file, and a new `<path>.meta`
+sidecar for emdb's metadata (encryption salt, verification
+block, flags). v0.7 / v0.8.x file formats are **not** compatible
+with v0.9. Migration path: open the old file with the previous
+emdb release, export records, reimport into a fresh v0.9
+database. (No automated migration tool ships in this alpha; the
+encryption-admin rewrite path is the reference shape for an
+external exporter.)
+
+### Breaking — `FlushPolicy::Group` shape
+
+`FlushPolicy::Group { max_wait, max_batch }` is now bare
+`FlushPolicy::Group`. The previous tuning knobs do not map onto
+fsys's coordinator (which runs in a different shape — immediate-
+coalesce around an in-flight syscall, no deadline-window). The
+behavioural contract is preserved: concurrent flushers still
+share one syscall.
+
+### Internals — moved out, replaced, removed
+
+| Module | Status |
+|---|---|
+| `src/storage/store.rs` | rewritten — wraps `fsys::JournalHandle` for writes + own `Arc<Mmap>` for reads |
+| `src/storage/format.rs` | trimmed — outer-frame helpers (`record_crc`, `try_decode_record`, etc.) deleted; tag-byte + body encoders/decoders kept |
+| `src/storage/meta.rs` | new — sidecar metadata file (`<path>.meta`) replacing the old 4 KiB on-disk header |
+| `src/storage/flush.rs` | trimmed — `FlushPolicy::Group` no longer carries tuning knobs; fsys's coordinator owns batching |
+| `src/storage/index.rs` | unchanged surface; entries now hold "payload-start" offsets pointing at the byte after fsys's frame header |
+| `src/storage/engine.rs` | rewritten recovery (`fsys::JournalReader::iter()`), append (`Store::append`), read (`format::payload_at + decode_payload`), compaction (`fsys::Handle::journal` at temp path), backup (same), and encryption-admin paths |
+
+### Performance — early measurements
+
+On the same Windows 11 NVMe consumer box used for the v0.8.5
+numbers, with the `group_commit` and `write_through` benches
+(headline 5M `lmdb_style` numbers will be added before v0.9.0
+stable):
+
+| bench (default tuning) | v0.8.5 | v0.9.0-alpha.1 | change |
+|---|---:|---:|---:|
+| `group_commit` OnEachFlush (8 threads × 200 writes) | 2 192 ms | **651 ms** | **3.4× faster** |
+| `group_commit` Group (8 threads × 200 writes) | 272 ms | 616 ms | 2.3× slower¹ |
+| `write_through` OnEachFlush (1 000 single-thread) | 1 099 ms | **931 ms** | 1.18× faster |
+| `write_through` WriteThrough (1 000 single-thread) | 1 270 ms | **840 ms** | 1.51× faster² |
+
+¹ The v0.8.5 group-commit coordinator was tuned aggressively for
+this specific workload shape (max_wait=500 µs, max_batch=8). fsys's
+coordinator runs without deadline-window tuning — concurrent
+flushers still coalesce, but the implementation is more
+conservative. Net: v0.9 OnEachFlush is much faster than v0.8.5
+OnEachFlush, while v0.9 Group is slightly worse than v0.8.5 Group.
+We expect to recover the gap by tuning fsys's coordinator
+parameters in a v0.9.x patch.
+
+² v0.8.5 `WriteThrough` was a regression vs v0.8.5's own
+`OnEachFlush` (1270 ms vs 1099 ms). v0.9 `WriteThrough` actually
+wins (840 vs 931). The mechanism is unchanged (platform-native
+synchronous-write flag); the surrounding write path is just much
+more efficient now.
+
+### Tests
+
+174 tests passing across the integration suite (vs 175 in
+v0.8.5; the difference is two crash-recovery tests rewritten
+against the new format and one consolidated). Test files
+touched:
+
+- `tests/crash_recovery.rs` — rewritten. The old tests poked at
+  the v0.8 frame format directly (manually flipping a CRC byte,
+  stomping a length prefix); fsys owns frame validation now.
+  v0.9 tests focus on the integration contract: tail truncation
+  surfaces correctly through `Emdb::open`, and round-trip
+  through a graceful `checkpoint() + close + reopen` returns
+  every record.
+- `tests/decoder_robustness.rs` — one test (`valid_prefix_then_garbage_recovers_only_the_prefix`)
+  rewritten to append garbage to the journal's tail (rather
+  than reaching into the old header at byte offset 32, which
+  no longer exists).
+- All other test files (`v0_8_5_features`, `zerocopy`, `compact`,
+  `namespaces`, `nested`, `range_scans`, `storage_path`, `ttl`,
+  `flush_policy`, `loom_tests`, `basic`) pass unchanged.
+
+### Notes
+
+- New runtime dependency: `fsys = "0.9"`. Apache-2.0 / MIT
+  dual-licensed (compatible with emdb's Apache-2.0).
+- No new feature flags. The async-IO surface is not exposed in
+  this alpha — emdb wraps fsys's synchronous journal API only.
+  An async surface is a candidate for a v0.9.x feature.
+- The v0.8.5 stale-lockfile + backup + stats + iter_from APIs
+  are preserved verbatim. Only the durability substrate
+  changed.
+
 ## [0.8.5](https://github.com/jamesgober/emdb-rs/compare/v0.8.0...v0.8.5) — 2026-05-04
 
 Production-polish beta. Five additive features, all small,

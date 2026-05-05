@@ -205,15 +205,38 @@ impl Store {
         self.journal.next_lsn().as_u64()
     }
 
-    /// Borrow a snapshot of the current read mapping. Cheap —
-    /// returns an `Arc` clone.
+    /// Borrow a snapshot of the current read mapping.
     ///
-    /// The returned mapping covers all records appended *up to
-    /// the most recent post-append remap*. Records appended
-    /// after the current mapping was issued may not be visible
-    /// until the next remap fires (writers detect growth past
-    /// the current mapping and remap before returning the LSN).
+    /// Always returns the existing mapping without re-mmapping —
+    /// the cost of `Mmap::map` per call would blow up read-heavy
+    /// workloads that interleave with writes (each write extends
+    /// the journal; an aggressive refresh would re-map per call).
+    ///
+    /// Callers that need bytes past the current mapping (because
+    /// the journal grew since the mapping was last refreshed)
+    /// should call [`Self::mmap_covering`] with the byte offset
+    /// they need to read past — that path triggers a refresh
+    /// only when the requested offset is past the current
+    /// mapping's end.
     pub(crate) fn mmap(&self) -> Result<Arc<Mmap>> {
+        let guard = self.mmap.read().map_err(|_| Error::LockPoisoned)?;
+        Ok(Arc::clone(&guard))
+    }
+
+    /// Borrow a read mapping that covers at least up to byte
+    /// `end_offset`. If the current mapping already covers it,
+    /// returns immediately. Otherwise refreshes the mmap once,
+    /// then returns.
+    ///
+    /// This is the read API for callers that know the byte
+    /// offset they want to access: pass `offset + 1` (or
+    /// `offset + record_size`) and the call refreshes on demand
+    /// rather than on every write.
+    pub(crate) fn mmap_covering(&self, end_offset: u64) -> Result<Arc<Mmap>> {
+        let cur_len = self.mmap_len.load(Ordering::Acquire);
+        if end_offset > cur_len {
+            self.refresh_mmap()?;
+        }
         let guard = self.mmap.read().map_err(|_| Error::LockPoisoned)?;
         Ok(Arc::clone(&guard))
     }
@@ -240,14 +263,11 @@ impl Store {
             .as_u64();
         let payload_start = end_lsn - FSYS_POST_PAYLOAD_BYTES - payload_len;
 
-        // Refresh the mmap if the journal grew past the current
-        // mapping. This happens after the FIRST append on a
-        // freshly-opened journal (initial_mmap was empty), and
-        // periodically as the file extends past prior capacity.
-        let cur_len = self.mmap_len.load(Ordering::Acquire);
-        if end_lsn > cur_len {
-            self.refresh_mmap()?;
-        }
+        // The mmap is *not* refreshed here. Writes stay on the
+        // hot lock-free path; the read-side `mmap()` accessor
+        // detects when the journal has grown past the current
+        // mapping and refreshes lazily (one remap per "read
+        // after a write burst" instead of one per append).
 
         // Under WriteThrough policy, sync immediately so the
         // bytes are durable before this call returns.
@@ -318,10 +338,8 @@ impl Store {
             last_end_lsn = end_lsn;
         }
 
-        let cur_len = self.mmap_len.load(Ordering::Acquire);
-        if last_end_lsn > cur_len {
-            self.refresh_mmap()?;
-        }
+        // mmap refresh is lazy — see [`Self::mmap`] for the
+        // strategy. We do not refresh on the write path.
 
         if matches!(self.policy, FlushPolicy::WriteThrough) && last_end_lsn > 0 {
             self.journal
