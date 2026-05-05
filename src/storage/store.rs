@@ -123,11 +123,7 @@ impl Store {
     /// opens an empty journal. On an existing path: reads the
     /// meta sidecar (validates magic + version + CRC) and opens
     /// the journal in append mode.
-    pub(crate) fn open_with_policy(
-        path: PathBuf,
-        flags: u32,
-        policy: FlushPolicy,
-    ) -> Result<Self> {
+    pub(crate) fn open_with_policy(path: PathBuf, flags: u32, policy: FlushPolicy) -> Result<Self> {
         // Resolve or create the meta sidecar.
         let meta = match meta::read(&path)? {
             Some(existing) => existing,

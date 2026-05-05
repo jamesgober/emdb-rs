@@ -176,11 +176,6 @@ enum RecoveryAction {
     NamespaceName { ns_id: u32, name: Vec<u8> },
 }
 
-/// Decoded record tuple emitted by [`Engine::decode_plaintext_at`] /
-/// [`Engine::decode_encrypted_at`] during recovery scan:
-/// `(action, next_cursor)`.
-type RecoveryDecoded = (RecoveryAction, u64);
-
 impl Engine {
     /// Open or create a database at `config.path`.
     pub(crate) fn open(config: EngineConfig) -> Result<Self> {
@@ -401,12 +396,12 @@ impl Engine {
         // Hint the kernel about the access pattern. Best-effort —
         // some platforms ignore the hint.
         let _ = reader.advise_sequential();
-        let mut iter = reader.iter();
-        while let Some(record_result) = iter.next() {
-            let record = record_result.map_err(|err| {
-                Error::Io(std::io::Error::other(format!("fsys reader: {err}")))
-            })?;
-            let payload_start = record.lsn.as_u64() + crate::storage::store::Store::pre_payload_bytes();
+        let iter = reader.iter();
+        for record_result in iter {
+            let record = record_result
+                .map_err(|err| Error::Io(std::io::Error::other(format!("fsys reader: {err}"))))?;
+            let payload_start =
+                record.lsn.as_u64() + crate::storage::store::Store::pre_payload_bytes();
             self.apply_recovered_payload(&record.payload, payload_start)?;
         }
         // The iterator's tail state could be inspected here for
@@ -440,17 +435,14 @@ impl Engine {
                         ));
                     }
                 };
-                let owned =
-                    format::decode_payload_encrypted(payload, |nonce, ct| {
-                        let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
-                        input.extend_from_slice(nonce);
-                        input.extend_from_slice(ct);
-                        ctx.decrypt(&input)
-                    })?;
+                let owned = format::decode_payload_encrypted(payload, |nonce, ct| {
+                    let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
+                    input.extend_from_slice(nonce);
+                    input.extend_from_slice(ct);
+                    ctx.decrypt(&input)
+                })?;
                 match owned {
-                    OwnedRecord::Insert { ns_id, key, .. } => {
-                        RecoveryAction::Insert { ns_id, key }
-                    }
+                    OwnedRecord::Insert { ns_id, key, .. } => RecoveryAction::Insert { ns_id, key },
                     OwnedRecord::Remove { ns_id, key } => RecoveryAction::Remove { ns_id, key },
                     OwnedRecord::NamespaceName { ns_id, name } => {
                         RecoveryAction::NamespaceName { ns_id, name }
@@ -483,21 +475,6 @@ impl Engine {
 
         self.apply_recovered_action(action, payload_start)
     }
-
-    /// Stub helpers from the v0.7-v0.8 era. Kept as compile-time
-    /// shims so callers that still reference them get a clear
-    /// error during compilation. v0.9 routes recovery exclusively
-    /// through [`Self::recovery_scan`].
-    #[allow(dead_code)]
-    fn _decode_plaintext_at_legacy(&self, _bytes: &[u8], _cursor: u64) -> Result<Option<RecoveryDecoded>> {
-        unreachable!("v0.9 recovery uses fsys::JournalReader; see recovery_scan");
-    }
-    #[allow(dead_code)]
-    #[cfg(feature = "encrypt")]
-    fn _decode_encrypted_at_legacy(&self, _bytes: &[u8], _cursor: u64) -> Result<Option<RecoveryDecoded>> {
-        unreachable!("v0.9 recovery uses fsys::JournalReader; see recovery_scan");
-    }
-
 
     fn apply_recovered_action(&self, action: RecoveryAction, offset: u64) -> Result<()> {
         match action {

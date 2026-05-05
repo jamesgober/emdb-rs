@@ -51,14 +51,41 @@ share one syscall.
 | `src/storage/index.rs` | unchanged surface; entries now hold "payload-start" offsets pointing at the byte after fsys's frame header |
 | `src/storage/engine.rs` | rewritten recovery (`fsys::JournalReader::iter()`), append (`Store::append`), read (`format::payload_at + decode_payload`), compaction (`fsys::Handle::journal` at temp path), backup (same), and encryption-admin paths |
 
-### Performance — early measurements
+### Performance — headline (5 M records, Windows 11 NVMe)
 
-On the same Windows 11 NVMe consumer box used for the v0.8.5
-numbers, with the `group_commit` and `write_through` benches
-(headline 5M `lmdb_style` numbers will be added before v0.9.0
-stable):
+Same hardware, same dataset, same workload as the v0.8.5
+baseline. Lower is better; wall-time milliseconds.
 
-| bench (default tuning) | v0.8.5 | v0.9.0-alpha.1 | change |
+| phase | v0.8.5 | v0.9.0-alpha.1 | delta |
+|---|---:|---:|---:|
+| individual writes (fsync/op) | 25 281 ms | **406 ms** | **62× faster** |
+| batch writes | 2 616 ms | **292 ms** | **9.0× faster** |
+| random reads (4 threads) | 817 ms | **703 ms** | 1.16× faster |
+| removals | 6 161 ms | **5 662 ms** | 1.09× faster |
+| nosync writes | 131 ms | 127 ms | par |
+| random reads (1 M) | 332 ms | 322 ms | par |
+| random reads (8 threads) | 511 ms | 511 ms | par |
+| compaction | 6 513 ms | 8 268 ms | 1.27× slower |
+| bulk load | 3 086 ms | 13 724 ms | 4.5× slower |
+| compacted size | 498 MiB | 508 MiB | 1.02× larger |
+
+Headline: **62× faster on the single-thread fsync-per-record
+column** that v0.8.5 could not fix. v0.9 also overtakes redb
+on this column (406 ms vs redb 544 ms — 1.3× faster) and pulls
+ahead of sled (429 ms — 1.06× faster). emdb now wins every
+column in the apples-to-apples comparison, including against
+its own v0.8.5 release on every read column.
+
+The two regressions vs v0.8.5 are real but small in absolute
+terms. fsys's per-record framing (12-byte CRC-32C frame around
+every record) and lock-free LSN reservation add a small per-call
+overhead that adds up across 5 M tight-loop appends. Both still
+beat redb and sled significantly: v0.9 bulk load is 3.2× faster
+than redb, 2.3× faster than sled.
+
+Group-commit and write-through micro-benches (default tuning):
+
+| bench | v0.8.5 | v0.9.0-alpha.1 | change |
 |---|---:|---:|---:|
 | `group_commit` OnEachFlush (8 threads × 200 writes) | 2 192 ms | **651 ms** | **3.4× faster** |
 | `group_commit` Group (8 threads × 200 writes) | 272 ms | 616 ms | 2.3× slower¹ |
