@@ -201,9 +201,7 @@ fn flush_policy_round_trips_through_builder() -> Result<()> {
     let _ = Emdb::builder()
         .flush_policy(FlushPolicy::OnEachFlush)
         .build()?;
-    let _ = Emdb::builder()
-        .flush_policy(FlushPolicy::Group)
-        .build()?;
+    let _ = Emdb::builder().flush_policy(FlushPolicy::Group).build()?;
     // Default constructor variant.
     let _ = Emdb::builder()
         .flush_policy(FlushPolicy::default())

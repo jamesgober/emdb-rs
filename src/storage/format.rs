@@ -369,14 +369,12 @@ pub(crate) fn payload_len_at(bytes: &[u8], payload_start: usize) -> Result<usize
 
 /// Slice a record's payload out of a buffer (typically the
 /// journal mmap), using fsys's length field to bound the range.
-pub(crate) fn payload_at<'a>(bytes: &'a [u8], payload_start: usize) -> Result<&'a [u8]> {
+pub(crate) fn payload_at(bytes: &[u8], payload_start: usize) -> Result<&[u8]> {
     let len = payload_len_at(bytes, payload_start)?;
-    let end = payload_start
-        .checked_add(len)
-        .ok_or(Error::Corrupted {
-            offset: payload_start as u64,
-            reason: "payload_start + length overflowed",
-        })?;
+    let end = payload_start.checked_add(len).ok_or(Error::Corrupted {
+        offset: payload_start as u64,
+        reason: "payload_start + length overflowed",
+    })?;
     if end > bytes.len() {
         return Err(Error::Corrupted {
             offset: payload_start as u64,

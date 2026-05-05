@@ -240,7 +240,10 @@ mod tests {
     fn rejects_bad_magic() {
         let mut buf = MetaHeader::fresh(0).encode();
         buf[0] ^= 0x01;
-        assert!(matches!(MetaHeader::decode(&buf), Err(Error::MagicMismatch)));
+        assert!(matches!(
+            MetaHeader::decode(&buf),
+            Err(Error::MagicMismatch)
+        ));
     }
 
     #[test]

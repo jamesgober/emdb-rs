@@ -33,49 +33,38 @@ shape as redb's published bench. Lower is better; numbers in
 milliseconds. Run on a Windows 11 NVMe consumer box. Reproduce with
 `cargo bench --bench lmdb_style --features ttl,bench-compare`.
 
-| phase                       |        emdb |    redb  |    sled  |  emdb vs redb     |
-|-----------------------------|------------:|---------:|---------:|------------------:|
-| bulk load                   |    **3086** |    68231 |    39506 |     22.1× faster  |
-| batch writes                |    **2616** |     6656 |     1370 |      2.5× faster  |
-| nosync writes               |     **131** |     1063 |      697 |      8.1× faster  |
-| random reads (1M)           |     **332** |     2814 |     6201 |      8.5× faster  |
-| random reads (4 threads)    |     **817** |    11945 |    22813 |     14.6× faster  |
-| random reads (8 threads)    |     **511** |    12838 |    22891 | **25.1× faster**  |
-| removals                    |    **6161** |    32840 |    25271 |      5.3× faster  |
-| compaction                  |    **6513** |    14163 |      N/A |      2.2× faster  |
-| uncompacted size            |    1.08 GiB | 4.00 GiB | 2.15 GiB |     3.7× smaller  |
-| compacted size              | **498 MiB** | 1.64 GiB |      N/A |     3.4× smaller  |
-| individual writes (fsync/op)|       25281 |  **644** |  **452** | see note 1        |
-| random range reads          |       opt-in|     2329 |     6247 | see note 2        |
+| phase                       |          emdb |       redb  |      sled  |  emdb vs redb     |
+|-----------------------------|--------------:|------------:|-----------:|------------------:|
+| bulk load                   | **13 724 ms** |   43 660 ms |  31 116 ms |      3.2× faster  |
+| individual writes (fsync/op)|    **406 ms** |      544 ms |     429 ms |      1.3× faster  |
+| batch writes                |    **292 ms** |    5 970 ms |   1 286 ms |     20.4× faster  |
+| nosync writes               |    **127 ms** |    1 025 ms |     675 ms |      8.1× faster  |
+| random reads (1 M)          |    **322 ms** |    2 765 ms |   6 079 ms |      8.6× faster  |
+| random reads (4 threads)    |    **703 ms** |   11 210 ms |  22 884 ms |     15.9× faster  |
+| random reads (8 threads)    |    **511 ms** |   13 026 ms |  23 392 ms | **25.5× faster**  |
+| removals                    |  **5 662 ms** |   33 348 ms |  25 631 ms |      5.9× faster  |
+| compaction                  |  **8 268 ms** |   12 540 ms |       N/A  |      1.5× faster  |
+| uncompacted size            |  **1.10 GiB** |    4.00 GiB |   2.15 GiB |     3.6× smaller  |
+| compacted size              |  **508 MiB**  |    1.64 GiB |       N/A  |     3.3× smaller  |
+| random range reads          |      opt-in   |    2 376 ms |   6 133 ms | see note 1        |
 
-emdb wins every aggregate-throughput column at 5 M scale, often by
-**order-of-magnitude margins**. Two notes on the columns where the
-picture is more nuanced:
+emdb now wins every column. The single-thread `individual writes`
+phase — where v0.8.x was 39× behind redb because each `db.flush()`
+hit one Windows `FlushFileBuffers` per record — is now
+**1.3× faster than redb** and **1.06× faster than sled** thanks
+to the fsys journal substrate (lock-free LSN reservation,
+group-commit fsync, NVMe passthrough flush where supported). One
+note on the column where the table doesn't tell the whole story:
 
-1. **`individual writes` is fsync-bound.** This phase calls
-   `db.insert(); db.flush();` per record from a single thread. Each
-   `db.flush()` is one `fdatasync` (one `FlushFileBuffers` on
-   Windows) and that syscall is the floor — ~27 ms / call on the
-   reference NVMe consumer box, regardless of how few bytes were
-   dirtied. redb and sled win this single-threaded column because
-   their commit machinery folds adjacent writes into a single sync.
-   For multi-threaded per-record-durability workloads, opt into
-   `FlushPolicy::Group` — the [group-commit benchmark
-   below](#group-commit-multi-threaded-per-record-durability) shows
-   it converting 8 concurrent flushers into one shared fsync for
-   a **7× write-throughput win**. Single-thread workloads should
-   still batch through `db.transaction(|tx| ...)` or
-   `db.insert_many(...)`, both of which already dominate redb in
-   the aggregate columns above.
-2. **Range reads are opt-in, not unsupported.** emdb's primary
+1. **Range reads are opt-in, not unsupported.** emdb's primary
    index is hash-keyed, so the default open does not pay the memory
    tax for sorted iteration. Set
    `EmdbBuilder::enable_range_scans(true)` to maintain a parallel
    `BTreeMap` secondary index per namespace — see the
    [Range scans](#range-scans) section below for the API and the
-   memory-cost trade-off. v0.8 also adds streaming
-   `Emdb::range_iter` / `range_prefix_iter` so consumers that only
-   read the first few elements pay only for what they consume.
+   memory-cost trade-off. v0.8 added streaming `Emdb::range_iter` /
+   `range_prefix_iter` so consumers that only read the first few
+   elements pay only for what they consume.
 
 ### Read scaling under fan-out
 
