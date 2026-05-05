@@ -147,43 +147,42 @@ tuning notes.
 
 ## Status
 
-**v0.9.0-alpha.1 (alpha).** Major architectural change from v0.8.5
-— the storage substrate is now a [`fsys`](https://crates.io/crates/fsys)
-journal (lock-free LSN reservation, group-commit fsync, NVMe
-passthrough flush, io_uring on Linux). emdb's read path keeps its
-own `Arc<Mmap>` over the journal file for zero-copy lookups; the
+**v0.9.0.** Major architectural change from v0.8.5 — the storage
+substrate is now a [`fsys`](https://crates.io/crates/fsys) journal
+(lock-free LSN reservation, group-commit fsync, NVMe passthrough
+flush, io_uring on Linux). emdb's read path keeps its own
+`Arc<Mmap>` over the journal file for zero-copy lookups; the
 write path delegates entirely to fsys. Existing v0.7 / v0.8.x
 file formats are not compatible — v0.9 uses fsys's frame format
 on the data file and a new `<path>.meta` sidecar for emdb's
 metadata.
 
-Otherwise the API surface from v0.8.5 carries over: optional
-at-rest encryption (AES-256-GCM or ChaCha20-Poly1305, raw key or
+The API surface from v0.8.5 carries over: optional at-rest
+encryption (AES-256-GCM or ChaCha20-Poly1305, raw key or
 Argon2id passphrase); optional sorted-iteration secondary index
 via `EmdbBuilder::enable_range_scans(true)`; three flush-policy
 variants (`OnEachFlush`, `Group`, `WriteThrough`); streaming
 `iter` / `keys` / `range`; cursor-style `iter_from` / `iter_after`;
 zero-copy `get_zerocopy`; atomic `backup_to(path)`; point-in-time
 `stats()`; stale-lockfile recovery (`lock_holder` + `break_lock`).
-Pre-1.0; the alpha tag means the fsys integration is still
-under stabilisation work — the API and the on-disk format may
-move once more before v0.9.0 (stable).
 
-The remaining work for v1.0 is API stabilisation: an audit pass
-for `pub` vs `pub(crate)`, full doc coverage on every public item,
-a `cargo-fuzz` target for the record decoder, and a
-`docs/stability.md` SemVer commitment. No further architectural
-changes are planned before 1.0.
+Pre-1.0. The remaining work before v1.0 is API stabilisation:
+an audit pass for `pub` vs `pub(crate)`, a `cargo-fuzz` target
+for the record decoder, and a `docs/stability.md` SemVer
+commitment. No further architectural changes are planned before
+1.0.
 
 ## Installation
 
 ```toml
 [dependencies]
-emdb = "0.9.0-alpha.1"
+emdb = "0.9.0"
+
+# All optional features
+emdb = { version = "0.9.0", features = ["ttl", "nested", "encrypt"] }
 ```
 
-(Alpha release. The API and on-disk format may still move before
-the stable v0.9.0. Pin the exact version if you depend on it.)
+MSRV: Rust 1.75.
 
 ## Quick start
 
