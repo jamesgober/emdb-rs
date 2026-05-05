@@ -28,13 +28,14 @@ use std::sync::{Arc, RwLock};
 use memmap2::Mmap;
 
 use crate::storage::flush::FlushPolicy;
-#[cfg(feature = "encrypt")]
-use crate::storage::format::FLAG_CIPHER_CHACHA20;
-use crate::storage::format::{self, RecordView, FLAG_ENCRYPTED};
+use crate::storage::format::{self, RecordView};
 #[cfg(feature = "encrypt")]
 use crate::storage::format::{OwnedRecord, NONCE_LEN};
 use crate::storage::index::Index;
-use crate::storage::store::{Header, Store};
+#[cfg(feature = "encrypt")]
+use crate::storage::meta::FLAG_CIPHER_CHACHA20;
+use crate::storage::meta::{self, MetaHeader, FLAG_ENCRYPTED};
+use crate::storage::store::Store;
 use crate::{Error, Result};
 
 /// Default namespace id (the implicit unnamed namespace).
@@ -162,7 +163,7 @@ pub(crate) type RecordSnapshot = (Vec<u8>, Vec<u8>, u64);
 #[cfg(feature = "encrypt")]
 type ResolvedEncryption = (
     Option<crate::encryption::KeyBytes>,
-    Option<[u8; format::ENCRYPTION_SALT_LEN]>,
+    Option<[u8; meta::META_SALT_LEN]>,
     Option<crate::encryption::Cipher>,
 );
 
@@ -301,7 +302,7 @@ impl Engine {
         if let Some(passphrase) = config.encryption_passphrase.as_ref() {
             let (salt, fresh) = match peeked {
                 Some(header) => {
-                    if header.encryption_salt == [0_u8; format::ENCRYPTION_SALT_LEN] {
+                    if header.encryption_salt == [0_u8; meta::META_SALT_LEN] {
                         return Err(Error::InvalidConfig(
                             "this database was created with a raw encryption_key; supply via encryption_key, not encryption_passphrase",
                         ));
@@ -319,7 +320,7 @@ impl Engine {
 
         if let Some(key) = config.encryption_key.as_ref() {
             if let Some(header) = peeked {
-                if header.encryption_salt != [0_u8; format::ENCRYPTION_SALT_LEN] {
+                if header.encryption_salt != [0_u8; meta::META_SALT_LEN] {
                     return Err(Error::InvalidConfig(
                         "this database was created with an encryption_passphrase; supply via encryption_passphrase, not encryption_key",
                     ));
@@ -359,18 +360,18 @@ impl Engine {
     fn handle_verification(
         store: &Store,
         ctx: &Arc<crate::encryption::EncryptionContext>,
-        fresh_salt: Option<[u8; format::ENCRYPTION_SALT_LEN]>,
-        existing_header: &Header,
+        fresh_salt: Option<[u8; meta::META_SALT_LEN]>,
+        existing_header: &MetaHeader,
     ) -> Result<()> {
         // If the on-disk verify block is all-zero, we treat this as a
         // fresh file and write a new verification block + salt.
-        if existing_header.encryption_verify == [0_u8; format::ENCRYPTION_VERIFY_LEN] {
-            let salt = fresh_salt.unwrap_or([0_u8; format::ENCRYPTION_SALT_LEN]);
+        if existing_header.encryption_verify == [0_u8; meta::META_VERIFY_LEN] {
+            let salt = fresh_salt.unwrap_or([0_u8; meta::META_SALT_LEN]);
             // Encrypt the well-known verification plaintext.
-            let nonce_then_ct = ctx.encrypt(format::VERIFICATION_PLAINTEXT)?;
+            let nonce_then_ct = ctx.encrypt(crate::encryption::VERIFICATION_PLAINTEXT)?;
             // nonce_then_ct = [nonce(12) | ciphertext(32) + tag(16)] = 60 bytes
-            debug_assert_eq!(nonce_then_ct.len(), format::ENCRYPTION_VERIFY_LEN);
-            let mut verify = [0_u8; format::ENCRYPTION_VERIFY_LEN];
+            debug_assert_eq!(nonce_then_ct.len(), meta::META_VERIFY_LEN);
+            let mut verify = [0_u8; meta::META_VERIFY_LEN];
             verify.copy_from_slice(&nonce_then_ct);
             store.set_encryption_metadata(salt, verify)?;
             return Ok(());
@@ -378,121 +379,125 @@ impl Engine {
 
         // Existing encrypted file: decrypt and compare.
         let plaintext = ctx.decrypt(&existing_header.encryption_verify)?;
-        if plaintext.as_slice() != format::VERIFICATION_PLAINTEXT {
+        if plaintext.as_slice() != crate::encryption::VERIFICATION_PLAINTEXT {
             return Err(Error::EncryptionKeyMismatch);
         }
         Ok(())
     }
 
-    /// Walk every record from the data region into the index.
+    /// Walk every record in the journal and rebuild the in-memory
+    /// index. Delegates frame iteration + CRC validation + tail-
+    /// truncation detection to `fsys::JournalReader`; emdb's job
+    /// here is just to decode each record's payload (`tag + body`)
+    /// and route it to the right namespace runtime.
+    ///
+    /// `JournalReader::lsn` is the byte offset of the FRAME's
+    /// first byte (the magic). emdb's index stores the
+    /// `payload_start` — the byte offset of the first byte of
+    /// the tag-prefixed payload, which sits 8 bytes past the
+    /// frame start (4 magic + 4 length).
     fn recovery_scan(&self) -> Result<()> {
-        let mmap = self.store.mmap()?;
-        let mut cursor = format::HEADER_LEN as u64;
-        let tail_hint = self.store.tail();
-        let bytes: &[u8] = &mmap;
-
-        loop {
-            if cursor as usize >= bytes.len() {
-                break;
-            }
-            // Stop at the recorded tail unless we're going to find more
-            // records past it (post-crash).
-            #[cfg(feature = "encrypt")]
-            let encrypted = self.encryption.is_some();
-            #[cfg(not(feature = "encrypt"))]
-            let encrypted = false;
-            let result = if encrypted {
-                self.decode_encrypted_at(bytes, cursor)?
-            } else {
-                self.decode_plaintext_at(bytes, cursor)?
-            };
-            match result {
-                Some((action, next)) => {
-                    self.apply_recovered_action(action, cursor)?;
-                    cursor = next;
-                }
-                None => break,
-            }
-            // Defensive: if hint says we're done and we've already walked
-            // a full record past it, stop. Otherwise keep going to catch
-            // post-crash entries the hint didn't track.
-            if cursor > tail_hint && cursor >= bytes.len() as u64 {
-                break;
-            }
+        let mut reader = self.store.open_reader()?;
+        // Hint the kernel about the access pattern. Best-effort —
+        // some platforms ignore the hint.
+        let _ = reader.advise_sequential();
+        let mut iter = reader.iter();
+        while let Some(record_result) = iter.next() {
+            let record = record_result.map_err(|err| {
+                Error::Io(std::io::Error::other(format!("fsys reader: {err}")))
+            })?;
+            let payload_start = record.lsn.as_u64() + crate::storage::store::Store::pre_payload_bytes();
+            self.apply_recovered_payload(&record.payload, payload_start)?;
         }
-
-        // Update the writer's tail to where we actually stopped.
-        self.store.set_tail_after_recovery(cursor)?;
+        // The iterator's tail state could be inspected here for
+        // diagnostic logging (CleanEnd vs TruncatedHeader vs
+        // ChecksumMismatch); we do not currently surface it but
+        // the data is available via `iter.into_reader().tail_state()`.
         Ok(())
     }
 
-    /// Decode a plaintext record at `bytes[cursor..]`. Returns the
-    /// decoded action plus the next cursor to resume from.
-    fn decode_plaintext_at(&self, bytes: &[u8], cursor: u64) -> Result<Option<RecoveryDecoded>> {
-        let start = cursor as usize;
-        let decoded = format::try_decode_record(bytes, start, cursor)?;
-        match decoded {
-            None => Ok(None),
-            Some(d) => {
-                let action = match d.view {
-                    RecordView::Insert { ns_id, key, .. } => RecoveryAction::Insert {
-                        ns_id,
-                        key: key.to_vec(),
-                    },
-                    RecordView::Remove { ns_id, key } => RecoveryAction::Remove {
-                        ns_id,
-                        key: key.to_vec(),
-                    },
-                    RecordView::NamespaceName { ns_id, name } => RecoveryAction::NamespaceName {
-                        ns_id,
-                        name: name.to_vec(),
-                    },
-                };
-                Ok(Some((action, d.next_offset)))
-            }
+    /// Decode a single recovered payload (`[tag][body]`) and apply
+    /// it to the in-memory index. Used exclusively by
+    /// [`Self::recovery_scan`].
+    fn apply_recovered_payload(&self, payload: &[u8], payload_start: u64) -> Result<()> {
+        if payload.is_empty() {
+            return Err(Error::Corrupted {
+                offset: payload_start,
+                reason: "empty record payload during recovery",
+            });
         }
-    }
+        let tag = payload[0];
+        let encrypted = (tag & format::TAG_ENCRYPTED_FLAG) != 0;
 
-    /// Decode an encrypted record at `bytes[cursor..]` via the engine's
-    /// AEAD context.
-    #[cfg(feature = "encrypt")]
-    fn decode_encrypted_at(&self, bytes: &[u8], cursor: u64) -> Result<Option<RecoveryDecoded>> {
-        let ctx = match self.encryption.as_ref() {
-            Some(c) => Arc::clone(c),
-            None => {
-                // Mixed mode: encrypted scan called with no context.
-                // Fall through to plaintext scan.
-                return self.decode_plaintext_at(bytes, cursor);
-            }
-        };
-        let start = cursor as usize;
-        let result = format::try_decode_encrypted_record(bytes, start, cursor, |nonce, ct| {
-            let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
-            input.extend_from_slice(nonce);
-            input.extend_from_slice(ct);
-            ctx.decrypt(&input)
-        })?;
-        match result {
-            None => Ok(None),
-            Some((owned, next)) => {
-                let action = match owned {
-                    OwnedRecord::Insert { ns_id, key, .. } => RecoveryAction::Insert { ns_id, key },
+        let action = if encrypted {
+            #[cfg(feature = "encrypt")]
+            {
+                let ctx = match self.encryption.as_ref() {
+                    Some(c) => Arc::clone(c),
+                    None => {
+                        return Err(Error::InvalidConfig(
+                            "encrypted record encountered while opening unencrypted database",
+                        ));
+                    }
+                };
+                let owned =
+                    format::decode_payload_encrypted(payload, |nonce, ct| {
+                        let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
+                        input.extend_from_slice(nonce);
+                        input.extend_from_slice(ct);
+                        ctx.decrypt(&input)
+                    })?;
+                match owned {
+                    OwnedRecord::Insert { ns_id, key, .. } => {
+                        RecoveryAction::Insert { ns_id, key }
+                    }
                     OwnedRecord::Remove { ns_id, key } => RecoveryAction::Remove { ns_id, key },
                     OwnedRecord::NamespaceName { ns_id, name } => {
                         RecoveryAction::NamespaceName { ns_id, name }
                     }
-                };
-                Ok(Some((action, next)))
+                }
             }
-        }
+            #[cfg(not(feature = "encrypt"))]
+            {
+                let _ = payload_start;
+                return Err(Error::InvalidConfig(
+                    "encrypted record present but the `encrypt` feature is not compiled in",
+                ));
+            }
+        } else {
+            match format::decode_payload(payload)? {
+                RecordView::Insert { ns_id, key, .. } => RecoveryAction::Insert {
+                    ns_id,
+                    key: key.to_vec(),
+                },
+                RecordView::Remove { ns_id, key } => RecoveryAction::Remove {
+                    ns_id,
+                    key: key.to_vec(),
+                },
+                RecordView::NamespaceName { ns_id, name } => RecoveryAction::NamespaceName {
+                    ns_id,
+                    name: name.to_vec(),
+                },
+            }
+        };
+
+        self.apply_recovered_action(action, payload_start)
     }
 
-    #[cfg(not(feature = "encrypt"))]
-    fn decode_encrypted_at(&self, bytes: &[u8], cursor: u64) -> Result<Option<RecoveryDecoded>> {
-        // No encryption support compiled in; this path should be
-        // unreachable, but stay defensive.
-        self.decode_plaintext_at(bytes, cursor)
+    /// Stub helpers from the v0.7-v0.8 era. Kept as compile-time
+    /// shims so callers that still reference them get a clear
+    /// error during compilation. v0.9 routes recovery exclusively
+    /// through [`Self::recovery_scan`].
+    #[allow(dead_code)]
+    fn _decode_plaintext_at_legacy(&self, _bytes: &[u8], _cursor: u64) -> Result<Option<RecoveryDecoded>> {
+        unreachable!("v0.9 recovery uses fsys::JournalReader; see recovery_scan");
     }
+    #[allow(dead_code)]
+    #[cfg(feature = "encrypt")]
+    fn _decode_encrypted_at_legacy(&self, _bytes: &[u8], _cursor: u64) -> Result<Option<RecoveryDecoded>> {
+        unreachable!("v0.9 recovery uses fsys::JournalReader; see recovery_scan");
+    }
+
 
     fn apply_recovered_action(&self, action: RecoveryAction, offset: u64) -> Result<()> {
         match action {
@@ -569,33 +574,29 @@ impl Engine {
     fn key_at_offset(&self, offset: u64) -> Result<Option<Vec<u8>>> {
         let mmap = self.store.mmap()?;
         let bytes: &[u8] = &mmap;
+        let payload = match format::payload_at(bytes, offset as usize) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
 
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
             let ctx = Arc::clone(ctx);
-            return match format::try_decode_encrypted_record(
-                bytes,
-                offset as usize,
-                offset,
-                |nonce, ct| {
-                    let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
-                    input.extend_from_slice(nonce);
-                    input.extend_from_slice(ct);
-                    ctx.decrypt(&input)
-                },
-            )? {
-                Some((OwnedRecord::Insert { key, .. }, _)) => Ok(Some(key)),
-                _ => Ok(None),
-            };
+            let owned = format::decode_payload_encrypted(payload, |nonce, ct| {
+                let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
+                input.extend_from_slice(nonce);
+                input.extend_from_slice(ct);
+                ctx.decrypt(&input)
+            })?;
+            return Ok(match owned {
+                OwnedRecord::Insert { key, .. } => Some(key),
+                _ => None,
+            });
         }
 
-        let decoded = format::try_decode_record(bytes, offset as usize, offset)?;
-        Ok(match decoded {
-            Some(d) => match d.view {
-                RecordView::Insert { key, .. } => Some(key.to_vec()),
-                _ => None,
-            },
-            None => None,
+        Ok(match format::decode_payload(payload)? {
+            RecordView::Insert { key, .. } => Some(key.to_vec()),
+            _ => None,
         })
     }
 
@@ -674,50 +675,44 @@ impl Engine {
         #[cfg(not(feature = "encrypt"))]
         let encryption: Option<()> = None;
 
-        // Write all records in a single batched I/O, collecting offsets.
-        let offsets = self.store.append_batch_with(|enc| {
-            let mut offs = Vec::with_capacity(items.len());
-            for (key, value, expires_at) in &items {
-                let off = {
-                    #[cfg(feature = "encrypt")]
-                    {
-                        if let Some(ctx) = encryption.as_ref() {
-                            let mut payload = Vec::with_capacity(20 + key.len() + value.len());
-                            format::encode_insert_body(
-                                &mut payload,
-                                ns_id,
-                                key,
-                                value,
-                                *expires_at,
-                            );
-                            let nonce_then_ct = ctx.encrypt(&payload)?;
-                            enc.push_record(|buf| {
-                                buf.push(format::TAG_INSERT | format::TAG_ENCRYPTED_FLAG);
-                                buf.extend_from_slice(&nonce_then_ct);
-                                Ok(())
-                            })?
-                        } else {
-                            enc.push_record(|buf| {
-                                buf.push(format::TAG_INSERT);
-                                format::encode_insert_body(buf, ns_id, key, value, *expires_at);
-                                Ok(())
-                            })?
-                        }
-                    }
-                    #[cfg(not(feature = "encrypt"))]
-                    {
-                        let _ = encryption;
-                        enc.push_record(|buf| {
+        // Sequentially append every record via fsys's lock-free
+        // journal. Per-call overhead is the fsys frame header
+        // (12 bytes); fsync cost is amortised by group-commit
+        // when the engine flushes at the end of the batch.
+        let mut offsets: Vec<u64> = Vec::with_capacity(items.len());
+        for (key, value, expires_at) in &items {
+            let off = {
+                #[cfg(feature = "encrypt")]
+                {
+                    if let Some(ctx) = encryption.as_ref() {
+                        let mut payload = Vec::with_capacity(20 + key.len() + value.len());
+                        format::encode_insert_body(&mut payload, ns_id, key, value, *expires_at);
+                        let nonce_then_ct = ctx.encrypt(&payload)?;
+                        self.store.append_with(|buf| {
+                            buf.push(format::TAG_INSERT | format::TAG_ENCRYPTED_FLAG);
+                            buf.extend_from_slice(&nonce_then_ct);
+                            Ok(())
+                        })?
+                    } else {
+                        self.store.append_with(|buf| {
                             buf.push(format::TAG_INSERT);
                             format::encode_insert_body(buf, ns_id, key, value, *expires_at);
                             Ok(())
                         })?
                     }
-                };
-                offs.push(off);
-            }
-            Ok(offs)
-        })?;
+                }
+                #[cfg(not(feature = "encrypt"))]
+                {
+                    let _ = encryption;
+                    self.store.append_with(|buf| {
+                        buf.push(format::TAG_INSERT);
+                        format::encode_insert_body(buf, ns_id, key, value, *expires_at);
+                        Ok(())
+                    })?
+                }
+            };
+            offsets.push(off);
+        }
 
         // Now update the index. Records are already on disk; this just
         // bumps the in-memory map.
@@ -820,31 +815,27 @@ impl Engine {
     ) -> Result<Option<(crate::ValueRef, u64)>> {
         let mmap = self.store.mmap()?;
         let bytes: &[u8] = &mmap;
+        let payload = match format::payload_at(bytes, offset as usize) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
 
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
             let ctx = Arc::clone(ctx);
-            let result = format::try_decode_encrypted_record(
-                bytes,
-                offset as usize,
-                offset,
-                |nonce, ct| {
-                    let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
-                    input.extend_from_slice(nonce);
-                    input.extend_from_slice(ct);
-                    ctx.decrypt(&input)
-                },
-            )?;
-            return Ok(match result {
-                Some((
-                    OwnedRecord::Insert {
-                        key,
-                        value,
-                        expires_at,
-                        ..
-                    },
-                    _,
-                )) => {
+            let owned = format::decode_payload_encrypted(payload, |nonce, ct| {
+                let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
+                input.extend_from_slice(nonce);
+                input.extend_from_slice(ct);
+                ctx.decrypt(&input)
+            })?;
+            return Ok(match owned {
+                OwnedRecord::Insert {
+                    key,
+                    value,
+                    expires_at,
+                    ..
+                } => {
                     if key.as_slice() == expected_key {
                         Some((crate::ValueRef::from_owned(value), expires_at))
                     } else {
@@ -855,38 +846,29 @@ impl Engine {
             });
         }
 
-        // Plaintext path: figure out the byte range of the value
-        // inside the mmap, then construct an mmap-backed ValueRef.
-        let decoded = format::try_decode_record(bytes, offset as usize, offset)?;
-        let (value_range, expires_at) = match decoded {
-            Some(d) => match d.view {
-                RecordView::Insert {
-                    key,
-                    value,
-                    expires_at,
-                    ..
-                } => {
-                    if key != expected_key {
-                        return Ok(None);
-                    }
-                    // Compute the absolute byte range of `value`
-                    // inside `mmap` via pointer arithmetic. The
-                    // slice `value` was borrowed directly from
-                    // `bytes` (== `&mmap`), so subtracting base
-                    // pointers is the right way to recover the
-                    // offset without re-parsing the framing.
-                    let base = bytes.as_ptr() as usize;
-                    let val_start = value.as_ptr() as usize - base;
-                    let val_end = val_start + value.len();
-                    (val_start..val_end, expires_at)
+        // Plaintext fast path: derive the value's mmap byte range
+        // from the borrowed `value` slice and build an mmap-backed
+        // ValueRef so reads are zero-copy.
+        let (value_range, expires_at) = match format::decode_payload(payload)? {
+            RecordView::Insert {
+                key,
+                value,
+                expires_at,
+                ..
+            } => {
+                if key != expected_key {
+                    return Ok(None);
                 }
-                _ => return Ok(None),
-            },
-            None => return Ok(None),
+                // Subtract base pointers to recover the absolute
+                // byte offset of `value` inside the mmap.
+                let base = bytes.as_ptr() as usize;
+                let val_start = value.as_ptr() as usize - base;
+                let val_end = val_start + value.len();
+                (val_start..val_end, expires_at)
+            }
+            _ => return Ok(None),
         };
 
-        // The `bytes`/`decoded` borrows of `mmap` end here under NLL,
-        // so moving `mmap` into `ValueRef` is fine.
         Ok(Some((
             crate::ValueRef::from_mmap(mmap, value_range),
             expires_at,
@@ -911,57 +893,53 @@ impl Engine {
 
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
-            let ctx = Arc::clone(ctx);
-            let result = format::try_decode_encrypted_record(
-                bytes,
-                offset as usize,
-                offset,
-                |nonce, ct| {
-                    let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
-                    input.extend_from_slice(nonce);
-                    input.extend_from_slice(ct);
-                    ctx.decrypt(&input)
-                },
-            )?;
-            return match result {
-                Some((
-                    OwnedRecord::Insert {
-                        key,
-                        value,
-                        expires_at,
-                        ..
-                    },
-                    _,
-                )) => {
-                    if key.as_slice() == expected_key {
-                        Ok(Some((value, expires_at)))
-                    } else {
-                        Ok(None)
-                    }
-                }
-                _ => Ok(None),
+            let payload = match format::payload_at(bytes, offset as usize) {
+                Ok(p) => p,
+                Err(_) => return Ok(None),
             };
-        }
-
-        let decoded = format::try_decode_record(bytes, offset as usize, offset)?;
-        match decoded {
-            Some(d) => match d.view {
-                RecordView::Insert {
+            let ctx = Arc::clone(ctx);
+            let owned = format::decode_payload_encrypted(payload, |nonce, ct| {
+                let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
+                input.extend_from_slice(nonce);
+                input.extend_from_slice(ct);
+                ctx.decrypt(&input)
+            })?;
+            return Ok(match owned {
+                OwnedRecord::Insert {
                     key,
                     value,
                     expires_at,
                     ..
                 } => {
-                    if key == expected_key {
-                        Ok(Some((value.to_vec(), expires_at)))
+                    if key.as_slice() == expected_key {
+                        Some((value, expires_at))
                     } else {
-                        Ok(None)
+                        None
                     }
                 }
-                _ => Ok(None),
-            },
-            None => Ok(None),
+                _ => None,
+            });
         }
+
+        let payload = match format::payload_at(bytes, offset as usize) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        Ok(match format::decode_payload(payload)? {
+            RecordView::Insert {
+                key,
+                value,
+                expires_at,
+                ..
+            } => {
+                if key == expected_key {
+                    Some((value.to_vec(), expires_at))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
     }
 
     /// Remove a key. Returns the previously-associated value, if any.
@@ -997,7 +975,7 @@ impl Engine {
     /// Implements the fast-reopen checkpoint exposed via
     /// [`crate::Emdb::checkpoint`].
     pub(crate) fn checkpoint(&self) -> Result<()> {
-        self.store.persist_header()
+        self.store.persist_meta()
     }
 
     /// Compute a [`crate::EmdbStats`] snapshot. O(namespaces) plus
@@ -1023,7 +1001,7 @@ impl Engine {
         let preallocated_bytes = file_size_bytes.saturating_sub(logical_size_bytes);
 
         let header = self.store.header()?;
-        let encrypted = (header.flags & format::FLAG_ENCRYPTED) != 0;
+        let encrypted = (header.flags & meta::FLAG_ENCRYPTED) != 0;
 
         Ok(crate::EmdbStats {
             live_records,
@@ -1193,130 +1171,122 @@ impl Engine {
         Ok(())
     }
 
-    /// Write a fully-formed, sealed database file at `path` containing
-    /// just the supplied namespace snapshots. The file is sized exactly
-    /// to fit (4 KiB header + framed records, no pre-allocated tail),
-    /// then `fdatasync`'d before return. Used by compaction; the file
-    /// is then renamed over the canonical path by [`Store::swap_underlying`].
+    /// Write a fresh fsys journal at `path` carrying every record
+    /// from `snapshots`. Also writes the matching `<path>.meta`
+    /// sidecar so the resulting file pair is a self-contained,
+    /// openable database. Used by compaction (renames the result
+    /// over the live database) and by [`Self::backup_to`] (the
+    /// result is the backup).
+    ///
+    /// Encrypted databases preserve their encryption metadata
+    /// (salt + verification block) verbatim from `header_template`
+    /// so the rewritten file decrypts under the same key.
     fn write_compacted_file(
         &self,
         path: &std::path::Path,
-        header_template: &Header,
+        header_template: &MetaHeader,
         snapshots: &[(u32, String, Vec<RecordSnapshot>)],
     ) -> Result<()> {
-        use std::fs::OpenOptions;
-        use std::io::{Seek, SeekFrom, Write};
+        // Open a fresh fsys journal at `path`. Removing any stale
+        // file at `path` first so we always start with an empty
+        // journal — fsys's `journal()` is "open or create" but a
+        // pre-existing journal would be appended to, not
+        // overwritten.
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(meta::meta_path_for(path));
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+        // Write the meta sidecar first. The reader on the
+        // recovery scan does not need the sidecar to walk the
+        // journal, but `Store::open` does, and a missing sidecar
+        // would cause `open` to synthesise a fresh one with
+        // default flags — destroying any encryption metadata.
+        meta::write(path, header_template)?;
 
-        // Write header at offset 0. We'll overwrite it at the end with
-        // the correct tail_hint.
-        let mut header_buf = [0_u8; format::HEADER_LEN];
-        header_template.encode_into(&mut header_buf);
-        file.write_all(&header_buf)?;
-
-        // Write records sequentially with framing. We frame manually
-        // here because we don't want to go through `BatchEncoder` (it's
-        // bound to a `Store`).
-        let mut tail = format::HEADER_LEN as u64;
-        let mut frame_buf: Vec<u8> = Vec::with_capacity(512);
+        let fs = fsys::builder()
+            .build()
+            .map_err(|err| Error::Io(std::io::Error::other(format!("fsys init: {err}"))))?;
+        let journal = fs
+            .journal(path)
+            .map_err(|err| Error::Io(std::io::Error::other(format!("fsys journal: {err}"))))?;
 
         // First emit name-binding records for every non-default
-        // namespace so a reopen of the compacted file restores the
-        // `name → id` map before it walks the data records.
+        // namespace so a reopen of the compacted file restores
+        // the `name → id` map before it walks the data records.
         for (ns_id, name, _) in snapshots {
             if *ns_id == DEFAULT_NAMESPACE_ID || name.is_empty() {
                 continue;
             }
-            frame_buf.clear();
-            frame_buf.extend_from_slice(&[0_u8; 4]);
-            let body_start = frame_buf.len();
-
-            #[cfg(feature = "encrypt")]
-            {
-                if let Some(ctx) = self.encryption.as_ref() {
-                    let mut payload = Vec::with_capacity(8 + name.len());
-                    format::encode_namespace_name_body(&mut payload, *ns_id, name.as_bytes());
-                    let nonce_then_ct = ctx.encrypt(&payload)?;
-                    frame_buf.push(format::TAG_NAMESPACE_NAME | format::TAG_ENCRYPTED_FLAG);
-                    frame_buf.extend_from_slice(&nonce_then_ct);
-                } else {
-                    frame_buf.push(format::TAG_NAMESPACE_NAME);
-                    format::encode_namespace_name_body(&mut frame_buf, *ns_id, name.as_bytes());
-                }
-            }
-            #[cfg(not(feature = "encrypt"))]
-            {
-                frame_buf.push(format::TAG_NAMESPACE_NAME);
-                format::encode_namespace_name_body(&mut frame_buf, *ns_id, name.as_bytes());
-            }
-
-            let body_end = frame_buf.len();
-            let body_len = (body_end - body_start) as u32;
-            frame_buf[0..4].copy_from_slice(&body_len.to_le_bytes());
-            let crc = format::record_crc(&frame_buf[body_start..body_end]);
-            frame_buf.extend_from_slice(&crc.to_le_bytes());
-
-            file.write_all(&frame_buf)?;
-            tail += frame_buf.len() as u64;
+            let payload = self.encode_namespace_name_payload(*ns_id, name.as_bytes())?;
+            let _lsn = journal
+                .append(&payload)
+                .map_err(|err| Error::Io(std::io::Error::other(format!("fsys append: {err}"))))?;
         }
 
-        // Then emit the data records (insert frames) for every namespace.
+        // Then emit the data (insert) records for every namespace.
         for (ns_id, _, records) in snapshots {
             for (key, value, expires_at) in records {
-                frame_buf.clear();
-                // 4-byte length prefix placeholder.
-                frame_buf.extend_from_slice(&[0_u8; 4]);
-                let body_start = frame_buf.len();
-
-                #[cfg(feature = "encrypt")]
-                {
-                    if let Some(ctx) = self.encryption.as_ref() {
-                        let mut payload = Vec::with_capacity(20 + key.len() + value.len());
-                        format::encode_insert_body(&mut payload, *ns_id, key, value, *expires_at);
-                        let nonce_then_ct = ctx.encrypt(&payload)?;
-                        frame_buf.push(format::TAG_INSERT | format::TAG_ENCRYPTED_FLAG);
-                        frame_buf.extend_from_slice(&nonce_then_ct);
-                    } else {
-                        frame_buf.push(format::TAG_INSERT);
-                        format::encode_insert_body(&mut frame_buf, *ns_id, key, value, *expires_at);
-                    }
-                }
-                #[cfg(not(feature = "encrypt"))]
-                {
-                    frame_buf.push(format::TAG_INSERT);
-                    format::encode_insert_body(&mut frame_buf, *ns_id, key, value, *expires_at);
-                }
-
-                let body_end = frame_buf.len();
-                let body_len = (body_end - body_start) as u32;
-                frame_buf[0..4].copy_from_slice(&body_len.to_le_bytes());
-                let crc = format::record_crc(&frame_buf[body_start..body_end]);
-                frame_buf.extend_from_slice(&crc.to_le_bytes());
-
-                file.write_all(&frame_buf)?;
-                tail += frame_buf.len() as u64;
+                let payload = self.encode_insert_payload(*ns_id, key, value, *expires_at)?;
+                let _lsn = journal.append(&payload).map_err(|err| {
+                    Error::Io(std::io::Error::other(format!("fsys append: {err}")))
+                })?;
             }
         }
 
-        // Finalise: rewrite the header with the correct tail_hint and
-        // truncate the file to exactly `tail` bytes (no pre-allocated
-        // tail; the next `Store::open` will pad on demand if writes
-        // come in after the swap).
-        let mut final_header = *header_template;
-        final_header.tail_hint = tail;
-        let mut header_buf = [0_u8; format::HEADER_LEN];
-        final_header.encode_into(&mut header_buf);
-        let _seek = file.seek(SeekFrom::Start(0))?;
-        file.write_all(&header_buf)?;
-        file.set_len(tail)?;
-        file.sync_data()?;
+        // Force-sync everything we just wrote. fsys's
+        // `sync_through(next_lsn)` lands the whole journal on
+        // stable storage in one syscall (or one NVMe passthrough
+        // flush where supported).
+        let target = journal.next_lsn();
+        journal
+            .sync_through(target)
+            .map_err(|err| Error::Io(std::io::Error::other(format!("fsys sync: {err}"))))?;
         Ok(())
+    }
+
+    /// Encode a `[tag][body]` payload for a namespace-name binding
+    /// record. Encrypted databases route the body through the
+    /// AEAD path; the resulting payload is `[tag | 0x80][nonce][ct]`.
+    fn encode_namespace_name_payload(&self, ns_id: u32, name: &[u8]) -> Result<Vec<u8>> {
+        #[cfg(feature = "encrypt")]
+        if let Some(ctx) = self.encryption.as_ref() {
+            let mut body = Vec::with_capacity(8 + name.len());
+            format::encode_namespace_name_body(&mut body, ns_id, name);
+            let nonce_then_ct = ctx.encrypt(&body)?;
+            let mut payload = Vec::with_capacity(1 + nonce_then_ct.len());
+            payload.push(format::TAG_NAMESPACE_NAME | format::TAG_ENCRYPTED_FLAG);
+            payload.extend_from_slice(&nonce_then_ct);
+            return Ok(payload);
+        }
+
+        let mut payload = Vec::with_capacity(1 + 8 + name.len());
+        payload.push(format::TAG_NAMESPACE_NAME);
+        format::encode_namespace_name_body(&mut payload, ns_id, name);
+        Ok(payload)
+    }
+
+    /// Encode a `[tag][body]` payload for an insert record.
+    fn encode_insert_payload(
+        &self,
+        ns_id: u32,
+        key: &[u8],
+        value: &[u8],
+        expires_at: u64,
+    ) -> Result<Vec<u8>> {
+        #[cfg(feature = "encrypt")]
+        if let Some(ctx) = self.encryption.as_ref() {
+            let mut body = Vec::with_capacity(20 + key.len() + value.len());
+            format::encode_insert_body(&mut body, ns_id, key, value, expires_at);
+            let nonce_then_ct = ctx.encrypt(&body)?;
+            let mut payload = Vec::with_capacity(1 + nonce_then_ct.len());
+            payload.push(format::TAG_INSERT | format::TAG_ENCRYPTED_FLAG);
+            payload.extend_from_slice(&nonce_then_ct);
+            return Ok(payload);
+        }
+
+        let mut payload = Vec::with_capacity(1 + 20 + key.len() + value.len());
+        payload.push(format::TAG_INSERT);
+        format::encode_insert_body(&mut payload, ns_id, key, value, expires_at);
+        Ok(payload)
     }
 
     /// On-disk path of the database file.
@@ -1442,36 +1412,32 @@ impl Engine {
     pub(crate) fn decode_owned_at(&self, offset: u64) -> Result<Option<RecordSnapshot>> {
         let mmap = self.store.mmap()?;
         let bytes: &[u8] = &mmap;
+        let payload = match format::payload_at(bytes, offset as usize) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
 
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
             let ctx = Arc::clone(ctx);
-            let result = format::try_decode_encrypted_record(
-                bytes,
-                offset as usize,
-                offset,
-                |nonce, ct| {
-                    let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
-                    input.extend_from_slice(nonce);
-                    input.extend_from_slice(ct);
-                    ctx.decrypt(&input)
-                },
-            )?;
-            return Ok(match result {
-                Some((
-                    OwnedRecord::Insert {
-                        key,
-                        value,
-                        expires_at,
-                        ..
-                    },
-                    _,
-                )) => Some((key, value, expires_at)),
+            let owned = format::decode_payload_encrypted(payload, |nonce, ct| {
+                let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
+                input.extend_from_slice(nonce);
+                input.extend_from_slice(ct);
+                ctx.decrypt(&input)
+            })?;
+            return Ok(match owned {
+                OwnedRecord::Insert {
+                    key,
+                    value,
+                    expires_at,
+                    ..
+                } => Some((key, value, expires_at)),
                 _ => None,
             });
         }
 
-        Self::decode_plaintext_into_triple(bytes, offset)
+        Self::decode_plaintext_into_triple(payload)
     }
 
     /// Read just the value at `offset`, validating the on-disk key
@@ -1498,36 +1464,33 @@ impl Engine {
         let bytes: &[u8] = &mmap;
 
         for offset in offsets {
+            let payload = match format::payload_at(bytes, offset as usize) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
             #[cfg(feature = "encrypt")]
             let triple = if let Some(ctx) = self.encryption.as_ref() {
                 let ctx = Arc::clone(ctx);
-                match format::try_decode_encrypted_record(
-                    bytes,
-                    offset as usize,
-                    offset,
-                    |nonce, ct| {
-                        let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
-                        input.extend_from_slice(nonce);
-                        input.extend_from_slice(ct);
-                        ctx.decrypt(&input)
-                    },
-                )? {
-                    Some((
-                        OwnedRecord::Insert {
-                            key,
-                            value,
-                            expires_at,
-                            ..
-                        },
-                        _,
-                    )) => Some((key, value, expires_at)),
+                match format::decode_payload_encrypted(payload, |nonce, ct| {
+                    let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
+                    input.extend_from_slice(nonce);
+                    input.extend_from_slice(ct);
+                    ctx.decrypt(&input)
+                })? {
+                    OwnedRecord::Insert {
+                        key,
+                        value,
+                        expires_at,
+                        ..
+                    } => Some((key, value, expires_at)),
                     _ => None,
                 }
             } else {
-                Self::decode_plaintext_into_triple(bytes, offset)?
+                Self::decode_plaintext_into_triple(payload)?
             };
             #[cfg(not(feature = "encrypt"))]
-            let triple = Self::decode_plaintext_into_triple(bytes, offset)?;
+            let triple = Self::decode_plaintext_into_triple(payload)?;
 
             if let Some(t) = triple {
                 out.push(t);
@@ -1536,19 +1499,15 @@ impl Engine {
         Ok(out)
     }
 
-    fn decode_plaintext_into_triple(bytes: &[u8], offset: u64) -> Result<Option<RecordSnapshot>> {
-        let decoded = format::try_decode_record(bytes, offset as usize, offset)?;
-        Ok(match decoded {
-            Some(d) => match d.view {
-                RecordView::Insert {
-                    key,
-                    value,
-                    expires_at,
-                    ..
-                } => Some((key.to_vec(), value.to_vec(), expires_at)),
-                _ => None,
-            },
-            None => None,
+    fn decode_plaintext_into_triple(payload: &[u8]) -> Result<Option<RecordSnapshot>> {
+        Ok(match format::decode_payload(payload)? {
+            RecordView::Insert {
+                key,
+                value,
+                expires_at,
+                ..
+            } => Some((key.to_vec(), value.to_vec(), expires_at)),
+            _ => None,
         })
     }
 
@@ -1652,26 +1611,11 @@ impl Engine {
     }
 }
 
-/// Read-only header peek without opening a full Store. Used by the
-/// engine to extract the encryption salt before opening the file with
-/// the right key.
-fn peek_header(path: &std::path::Path) -> Result<Option<Header>> {
-    use std::fs::OpenOptions;
-    use std::io::{Read, Seek, SeekFrom};
-
-    match OpenOptions::new().read(true).open(path) {
-        Ok(mut file) => {
-            if file.metadata()?.len() < format::HEADER_LEN as u64 {
-                return Ok(None);
-            }
-            let mut buf = [0_u8; format::HEADER_LEN];
-            let _seek = file.seek(SeekFrom::Start(0))?;
-            file.read_exact(&mut buf)?;
-            Ok(Some(Header::decode_from(&buf)?))
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(Error::from(err)),
-    }
+/// Read-only meta-sidecar peek without opening a full Store.
+/// Used by the engine to extract the encryption salt before
+/// opening the file with the right key.
+fn peek_header(path: &std::path::Path) -> Result<Option<MetaHeader>> {
+    meta::read(path)
 }
 
 /// Sibling-file path used by [`Engine::compact_in_place`] as the

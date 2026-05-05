@@ -112,15 +112,10 @@
 //! calls share a single `fdatasync`:
 //!
 //! ```no_run
-//! use std::time::Duration;
-//!
 //! use emdb::{Emdb, FlushPolicy};
 //!
 //! let db = Emdb::builder()
-//!     .flush_policy(FlushPolicy::Group {
-//!         max_wait: Duration::from_micros(500),
-//!         max_batch: 32,
-//!     })
+//!     .flush_policy(FlushPolicy::Group)
 //!     .build()?;
 //! # Ok::<(), emdb::Error>(())
 //! ```
