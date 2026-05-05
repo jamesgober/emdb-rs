@@ -572,7 +572,7 @@ impl Engine {
     /// or already tombstoned in some way) — the index treats that as
     /// "the existing entry is stale; overwrite in place."
     fn key_at_offset(&self, offset: u64) -> Result<Option<Vec<u8>>> {
-        let mmap = self.store.mmap()?;
+        let mmap = self.store.mmap_covering(offset + 1)?;
         let bytes: &[u8] = &mmap;
         let payload = match format::payload_at(bytes, offset as usize) {
             Ok(p) => p,
@@ -813,7 +813,7 @@ impl Engine {
         offset: u64,
         expected_key: &[u8],
     ) -> Result<Option<(crate::ValueRef, u64)>> {
-        let mmap = self.store.mmap()?;
+        let mmap = self.store.mmap_covering(offset + 1)?;
         let bytes: &[u8] = &mmap;
         let payload = match format::payload_at(bytes, offset as usize) {
             Ok(p) => p,
@@ -888,7 +888,7 @@ impl Engine {
     }
 
     fn read_value_at(&self, offset: u64, expected_key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
-        let mmap = self.store.mmap()?;
+        let mmap = self.store.mmap_covering(offset + 1)?;
         let bytes: &[u8] = &mmap;
 
         #[cfg(feature = "encrypt")]
@@ -1410,7 +1410,7 @@ impl Engine {
     /// record is no longer a live `Insert` (overwritten in place,
     /// tombstoned, or unrelated record kind at the offset).
     pub(crate) fn decode_owned_at(&self, offset: u64) -> Result<Option<RecordSnapshot>> {
-        let mmap = self.store.mmap()?;
+        let mmap = self.store.mmap_covering(offset + 1)?;
         let bytes: &[u8] = &mmap;
         let payload = match format::payload_at(bytes, offset as usize) {
             Ok(p) => p,
@@ -1460,7 +1460,10 @@ impl Engine {
         let mut offsets = ns.index.collect_offsets()?;
         offsets.sort_unstable();
         let mut out = Vec::with_capacity(offsets.len());
-        let mmap = self.store.mmap()?;
+        // collect_records walks every record; pass the journal's
+        // current tail so the mmap covers all of them after a
+        // single (worst-case) refresh.
+        let mmap = self.store.mmap_covering(self.store.tail())?;
         let bytes: &[u8] = &mmap;
 
         for offset in offsets {

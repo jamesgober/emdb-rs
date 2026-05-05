@@ -19,9 +19,12 @@
 
 ## Why emdb
 
-Bitcask-style architecture: one mmap-backed append-only file, sharded
-in-memory hash index, single-writer with multi-reader. Same shape that
-LMDB and redb use for reads; same shape that Riak/HaloDB use for writes.
+Bitcask-style architecture on top of [`fsys`](https://crates.io/crates/fsys):
+one fsys-journal-backed append-only log, sharded in-memory hash
+index, lock-free reads + lock-free writes via fsys's atomic LSN
+reservation. fsys handles the platform-specific durability layer
+(NVMe passthrough flush, io_uring on Linux, `WRITE_THROUGH` on
+Windows where appropriate); emdb handles the engine-level concerns.
 
 ### Performance vs. peers
 
@@ -155,19 +158,27 @@ tuning notes.
 
 ## Status
 
-**v0.8.5 (beta).** The storage engine is a Bitcask-style mmap-backed
-append-only log with a sharded in-memory hash index. Single-writer,
-multi-reader. Optional at-rest encryption (AES-256-GCM or
-ChaCha20-Poly1305, raw key or Argon2id passphrase). Optional
-sorted-iteration secondary index via
-`EmdbBuilder::enable_range_scans(true)`. Three flush-policy
-variants (`OnEachFlush`, `Group`, `WriteThrough`) for picking the
-right durability cost model for the workload. Streaming `iter` /
-`keys` / `range` plus cursor-style `iter_from` / `iter_after`. A
-zero-copy `get_zerocopy` read API. Atomic `backup_to(path)`
-snapshots, point-in-time `stats()` introspection, and stale-
-lockfile recovery via `lock_holder` + `break_lock`. Pre-1.0; the
-API may still change before 1.0.
+**v0.9.0-alpha.1 (alpha).** Major architectural change from v0.8.5
+— the storage substrate is now a [`fsys`](https://crates.io/crates/fsys)
+journal (lock-free LSN reservation, group-commit fsync, NVMe
+passthrough flush, io_uring on Linux). emdb's read path keeps its
+own `Arc<Mmap>` over the journal file for zero-copy lookups; the
+write path delegates entirely to fsys. Existing v0.7 / v0.8.x
+file formats are not compatible — v0.9 uses fsys's frame format
+on the data file and a new `<path>.meta` sidecar for emdb's
+metadata.
+
+Otherwise the API surface from v0.8.5 carries over: optional
+at-rest encryption (AES-256-GCM or ChaCha20-Poly1305, raw key or
+Argon2id passphrase); optional sorted-iteration secondary index
+via `EmdbBuilder::enable_range_scans(true)`; three flush-policy
+variants (`OnEachFlush`, `Group`, `WriteThrough`); streaming
+`iter` / `keys` / `range`; cursor-style `iter_from` / `iter_after`;
+zero-copy `get_zerocopy`; atomic `backup_to(path)`; point-in-time
+`stats()`; stale-lockfile recovery (`lock_holder` + `break_lock`).
+Pre-1.0; the alpha tag means the fsys integration is still
+under stabilisation work — the API and the on-disk format may
+move once more before v0.9.0 (stable).
 
 The remaining work for v1.0 is API stabilisation: an audit pass
 for `pub` vs `pub(crate)`, full doc coverage on every public item,
@@ -179,8 +190,11 @@ changes are planned before 1.0.
 
 ```toml
 [dependencies]
-emdb = "0.8.5"
+emdb = "0.9.0-alpha.1"
 ```
+
+(Alpha release. The API and on-disk format may still move before
+the stable v0.9.0. Pin the exact version if you depend on it.)
 
 ## Quick start
 
