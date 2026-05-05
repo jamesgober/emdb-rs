@@ -1,6 +1,6 @@
 [package]
 name = "emdb"
-version = "0.9.0-alpha.1"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"

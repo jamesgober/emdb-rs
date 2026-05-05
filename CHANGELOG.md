@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.0-alpha.1](https://github.com/jamesgober/emdb-rs/compare/v0.8.5...v0.9.0-alpha.1) — 2026-05-04
+## [0.9.0](https://github.com/jamesgober/emdb-rs/compare/v0.8.5...v0.9.0) — 2026-05-05
 
 Major architectural change. The storage substrate is now
 [`fsys`](https://crates.io/crates/fsys) — a filesystem IO crate
@@ -15,10 +15,6 @@ durability dispatch. emdb's write path is now a thin layer over
 `fsys::JournalHandle::append`; the read path keeps its own
 `Arc<Mmap>` over the journal file for zero-copy lookups.
 
-This is an alpha release. The API and on-disk format may still
-change before the stable v0.9.0. Pin the exact version if you
-depend on it.
-
 ### Breaking — file format
 
 v0.9 uses fsys's frame format (`[4 magic][4 length][N payload][4
@@ -27,7 +23,7 @@ sidecar for emdb's metadata (encryption salt, verification
 block, flags). v0.7 / v0.8.x file formats are **not** compatible
 with v0.9. Migration path: open the old file with the previous
 emdb release, export records, reimport into a fresh v0.9
-database. (No automated migration tool ships in this alpha; the
+database. (No automated migration tool ships in v0.9.0; the
 encryption-admin rewrite path is the reference shape for an
 external exporter.)
 
@@ -56,7 +52,7 @@ share one syscall.
 Same hardware, same dataset, same workload as the v0.8.5
 baseline. Lower is better; wall-time milliseconds.
 
-| phase | v0.8.5 | v0.9.0-alpha.1 | delta |
+| phase | v0.8.5 | v0.9.0 | delta |
 |---|---:|---:|---:|
 | individual writes (fsync/op) | 25 281 ms | **406 ms** | **62× faster** |
 | batch writes | 2 616 ms | **292 ms** | **9.0× faster** |
@@ -85,7 +81,7 @@ than redb, 2.3× faster than sled.
 
 Group-commit and write-through micro-benches (default tuning):
 
-| bench | v0.8.5 | v0.9.0-alpha.1 | change |
+| bench | v0.8.5 | v0.9.0 | change |
 |---|---:|---:|---:|
 | `group_commit` OnEachFlush (8 threads × 200 writes) | 2 192 ms | **651 ms** | **3.4× faster** |
 | `group_commit` Group (8 threads × 200 writes) | 272 ms | 616 ms | 2.3× slower¹ |
@@ -133,9 +129,9 @@ touched:
 
 - New runtime dependency: `fsys = "0.9"`. Apache-2.0 / MIT
   dual-licensed (compatible with emdb's Apache-2.0).
-- No new feature flags. The async-IO surface is not exposed in
-  this alpha — emdb wraps fsys's synchronous journal API only.
-  An async surface is a candidate for a v0.9.x feature.
+- No new feature flags. The async-IO surface is not exposed
+  yet — emdb wraps fsys's synchronous journal API only. An
+  async surface is a candidate for a v0.9.x feature.
 - The v0.8.5 stale-lockfile + backup + stats + iter_from APIs
   are preserved verbatim. Only the durability substrate
   changed.

@@ -115,7 +115,7 @@ When logging benchmark output into README or release notes, record:
 
 ## Reference baseline (5 M records, Windows 11 NVMe)
 
-Captured 2026-05-04 on emdb v0.9.0-alpha.1 (fsys-journal
+Captured 2026-05-04 on emdb v0.9.0 (fsys-journal
 substrate) vs. redb 2.6 vs. sled 0.34 with:
 
 ```powershell
@@ -178,7 +178,7 @@ Same hardware, same dataset, same workload. v0.9 ships a major
 architectural change (fsys-journal substrate) and the numbers
 move accordingly:
 
-| phase | v0.8.5 | v0.9.0-alpha.1 | delta |
+| phase | v0.8.5 | v0.9.0 | delta |
 |---|---:|---:|---:|
 | individual writes | 25 281 ms | **406 ms** | **62× faster** |
 | batch writes | 2 616 ms | **292 ms** | **9.0× faster** |
