@@ -1,134 +1,60 @@
 // Copyright 2026 James Gober. Licensed under Apache-2.0.
 
-//! On-disk record format for the mmap+append storage engine.
+//! On-disk record body format.
 //!
-//! Every record on disk has the shape:
+//! v0.9 delegates outer framing (length prefix + CRC) to fsys's
+//! journal. emdb's "record" is the *payload* fsys carries inside
+//! a frame: a single tag byte plus a body. The body's shape
+//! depends on the tag kind (insert / remove / namespace-name).
+//!
+//! ## Payload layout
 //!
 //! ```text
-//!   [record_len: u32 LE]   — bytes following, excluding self and trailing crc
-//!   [tag: u8]              — bit 0..6: kind (0=Insert, 1=Remove); bit 7: encrypted
-//!   [body: record_len-1 bytes]
-//!   [crc: u32 LE]          — CRC32 over [tag .. body]
+//!   bytes  field    notes
+//!   -----  -----    -----
+//!     0    tag      bit 0..6: kind (0=Insert, 1=Remove, 2=NamespaceName)
+//!                   bit 7   : encrypted flag
+//!     1+   body     payload-kind-specific bytes (see below);
+//!                   for encrypted records this is `[nonce][ciphertext]`
 //! ```
 //!
-//! For unencrypted Insert records, the body is the plaintext payload:
-//! `[ns_id: u32][key_len: u32][key][value_len: u32][value][expires_at: u64]`.
+//! Body for `TAG_INSERT` (plaintext):
+//! `[ns_id u32][key_len u32][key][value_len u32][value][expires_at u64]`
 //!
-//! For unencrypted Remove records, the body is just the lookup key:
-//! `[ns_id: u32][key_len: u32][key]`.
+//! Body for `TAG_REMOVE` (plaintext):
+//! `[ns_id u32][key_len u32][key]`
 //!
-//! For encrypted records (`tag & 0x80`), the body is:
-//! `[nonce: 12][ciphertext+tag]`. The plaintext that gets encrypted is the
-//! same payload that appears in the unencrypted form (everything except
-//! the leading `tag` byte).
+//! Body for `TAG_NAMESPACE_NAME` (plaintext):
+//! `[ns_id u32][name_len u32][name]`
 //!
-//! The CRC is computed over the bytes between `[record_len]` and `[crc]`
-//! (exclusive of both). It catches torn writes on recovery scan and bit
-//! rot in long-term storage. AEAD tampering is caught separately by the
-//! GCM/Poly1305 tag inside the ciphertext.
+//! For encrypted records the body is `[nonce 12][ciphertext + AEAD tag]`.
+//! The plaintext under the ciphertext has the same shape as an
+//! unencrypted body of the same kind.
 
 use crate::{Error, Result};
 
-/// On-disk magic at the start of every file. 16 bytes, padded with zero.
-pub(crate) const MAGIC: [u8; 16] = *b"EMDB\0\0\0\0\0\0\0\0\0\0\0\0";
-/// File-format version. Bumped on every breaking format change.
-pub(crate) const FORMAT_VERSION: u32 = 1;
-/// Header occupies a single 4 KB block at the start of the file.
-pub(crate) const HEADER_LEN: usize = 4096;
-
-/// Byte offsets within the header block.
-pub(crate) const MAGIC_OFFSET: usize = 0;
-pub(crate) const VERSION_OFFSET: usize = 16;
-pub(crate) const FLAGS_OFFSET: usize = 20;
-pub(crate) const CREATED_AT_OFFSET: usize = 24;
-pub(crate) const TAIL_HINT_OFFSET: usize = 32;
-pub(crate) const ENCRYPTION_SALT_OFFSET: usize = 40;
-pub(crate) const ENCRYPTION_VERIFY_OFFSET: usize = 56;
-pub(crate) const HEADER_CRC_OFFSET: usize = 116;
-pub(crate) const HEADER_CRC_RANGE: usize = HEADER_CRC_OFFSET;
-
-/// Size of the encryption verification block: 12-byte nonce + 32-byte
-/// plaintext + 16-byte AEAD tag = 60 bytes.
-pub(crate) const ENCRYPTION_VERIFY_LEN: usize = 60;
-/// Size of the Argon2id salt persisted in the header.
-pub(crate) const ENCRYPTION_SALT_LEN: usize = 16;
-/// Fixed plaintext encrypted into the verification block. On open, the
-/// engine decrypts this and confirms it matches; mismatch ⇒ wrong key.
-pub(crate) const VERIFICATION_PLAINTEXT: &[u8; 32] =
-    b"EMDB-ENCRYPT-OK\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-
-/// Header flag bit set on databases created with at-rest encryption.
-pub(crate) const FLAG_ENCRYPTED: u32 = 1 << 0;
-/// Header flag bit selecting ChaCha20-Poly1305 instead of AES-256-GCM.
-pub(crate) const FLAG_CIPHER_CHACHA20: u32 = 1 << 1;
-
-/// Record tag bytes.
+/// Record tag byte constants.
 pub(crate) const TAG_INSERT: u8 = 0;
 pub(crate) const TAG_REMOVE: u8 = 1;
-/// Namespace name → ID binding. Body: `[ns_id: u32][name_len: u32][name]`.
-/// Emitted by the engine on first creation of a named namespace; replayed
-/// on open to rebuild the in-memory `name → id` map. The default
-/// namespace (`ns_id = 0`, `name = ""`) is implicit and never gets a
-/// record of this kind.
+/// Namespace-name binding. Body is
+/// `[ns_id: u32][name_len: u32][name]`. Replayed on open to
+/// rebuild the in-memory `name → id` map. The default
+/// namespace (`ns_id = 0`, empty name) is implicit and never
+/// emits a record of this kind.
 pub(crate) const TAG_NAMESPACE_NAME: u8 = 2;
+/// Set on the high bit of the tag byte for AEAD-encrypted
+/// records.
 pub(crate) const TAG_ENCRYPTED_FLAG: u8 = 0x80;
+/// Mask for the tag's kind portion (bits 0..6).
 pub(crate) const TAG_KIND_MASK: u8 = 0x7F;
 
-/// Length of the AEAD nonce in bytes.
+/// AEAD nonce length in bytes (12-byte / 96-bit nonce).
 pub(crate) const NONCE_LEN: usize = 12;
-/// Length of the AEAD authentication tag in bytes.
+/// AEAD authentication tag length in bytes (16-byte / 128-bit tag).
 pub(crate) const TAG_LEN: usize = 16;
 
-/// Encode a u32 little-endian into `buf` and advance the cursor.
-#[inline]
-pub(crate) fn write_u32(buf: &mut Vec<u8>, value: u32) {
-    buf.extend_from_slice(&value.to_le_bytes());
-}
-
-/// Encode a u64 little-endian into `buf` and advance the cursor.
-#[inline]
-pub(crate) fn write_u64(buf: &mut Vec<u8>, value: u64) {
-    buf.extend_from_slice(&value.to_le_bytes());
-}
-
-/// Read a u32 little-endian from `bytes[offset..offset+4]`.
-///
-/// # Errors
-///
-/// Returns [`Error::Corrupted`] if the slice is too short.
-#[inline]
-pub(crate) fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    if offset + 4 > bytes.len() {
-        return Err(Error::Corrupted {
-            offset: offset as u64,
-            reason: "u32 read past end of buffer",
-        });
-    }
-    let mut buf = [0_u8; 4];
-    buf.copy_from_slice(&bytes[offset..offset + 4]);
-    Ok(u32::from_le_bytes(buf))
-}
-
-/// Read a u64 little-endian from `bytes[offset..offset+8]`.
-///
-/// # Errors
-///
-/// Returns [`Error::Corrupted`] if the slice is too short.
-#[inline]
-pub(crate) fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
-    if offset + 8 > bytes.len() {
-        return Err(Error::Corrupted {
-            offset: offset as u64,
-            reason: "u64 read past end of buffer",
-        });
-    }
-    let mut buf = [0_u8; 8];
-    buf.copy_from_slice(&bytes[offset..offset + 8]);
-    Ok(u64::from_le_bytes(buf))
-}
-
-/// Borrowed view of a decoded record body. Lifetime is tied to the
-/// underlying buffer (mmap slice or in-memory Vec).
+/// Borrowed view of a decoded record body. Lifetime is tied to
+/// the underlying buffer (mmap slice or in-memory Vec).
 #[derive(Debug)]
 pub(crate) enum RecordView<'a> {
     Insert {
@@ -141,16 +67,15 @@ pub(crate) enum RecordView<'a> {
         ns_id: u32,
         key: &'a [u8],
     },
-    /// Namespace name → ID binding. Replayed on open to rebuild the
-    /// in-memory `name → id` map. The default namespace is implicit.
     NamespaceName {
         ns_id: u32,
         name: &'a [u8],
     },
 }
 
-/// Owned record (used when the source bytes are not directly addressable
-/// — e.g., after AEAD decryption produces a fresh Vec<u8>).
+/// Owned record (used when the source bytes are not directly
+/// addressable — e.g. after AEAD decryption produces a fresh
+/// `Vec<u8>`).
 #[derive(Debug)]
 pub(crate) enum OwnedRecord {
     Insert {
@@ -177,20 +102,55 @@ impl OwnedRecord {
             | Self::NamespaceName { ns_id, .. } => *ns_id,
         }
     }
-
-    pub(crate) fn key(&self) -> &[u8] {
-        match self {
-            Self::Insert { key, .. } | Self::Remove { key, .. } => key,
-            // NamespaceName isn't keyed in the index; callers asking for
-            // a key on this variant get an empty slice. The recovery
-            // path special-cases this variant.
-            Self::NamespaceName { .. } => &[],
-        }
-    }
 }
 
-/// Encode an Insert record body (the plaintext payload, excluding the
-/// outer length, tag, and trailing CRC) into `out`.
+// ─────────────────────────────────────────────────────────────────
+// Primitive read/write helpers.
+// ─────────────────────────────────────────────────────────────────
+
+#[inline]
+pub(crate) fn write_u32(buf: &mut Vec<u8>, value: u32) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+#[inline]
+pub(crate) fn write_u64(buf: &mut Vec<u8>, value: u64) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+#[inline]
+pub(crate) fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    if offset + 4 > bytes.len() {
+        return Err(Error::Corrupted {
+            offset: offset as u64,
+            reason: "u32 read past end of buffer",
+        });
+    }
+    let mut buf = [0_u8; 4];
+    buf.copy_from_slice(&bytes[offset..offset + 4]);
+    Ok(u32::from_le_bytes(buf))
+}
+
+#[inline]
+pub(crate) fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
+    if offset + 8 > bytes.len() {
+        return Err(Error::Corrupted {
+            offset: offset as u64,
+            reason: "u64 read past end of buffer",
+        });
+    }
+    let mut buf = [0_u8; 8];
+    buf.copy_from_slice(&bytes[offset..offset + 8]);
+    Ok(u64::from_le_bytes(buf))
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Body encoders (used by Engine to produce payloads for `Store::append`).
+// ─────────────────────────────────────────────────────────────────
+
+/// Encode an `Insert` record body (plaintext payload, no tag byte
+/// or framing). Caller prepends the tag byte before passing the
+/// payload to [`crate::storage::store::Store::append`].
 pub(crate) fn encode_insert_body(
     out: &mut Vec<u8>,
     ns_id: u32,
@@ -206,36 +166,25 @@ pub(crate) fn encode_insert_body(
     write_u64(out, expires_at);
 }
 
-/// Encode a Remove record body.
+/// Encode a `Remove` record body.
 pub(crate) fn encode_remove_body(out: &mut Vec<u8>, ns_id: u32, key: &[u8]) {
     write_u32(out, ns_id);
     write_u32(out, key.len() as u32);
     out.extend_from_slice(key);
 }
 
-/// Encode a NamespaceName record body.
+/// Encode a `NamespaceName` record body.
 pub(crate) fn encode_namespace_name_body(out: &mut Vec<u8>, ns_id: u32, name: &[u8]) {
     write_u32(out, ns_id);
     write_u32(out, name.len() as u32);
     out.extend_from_slice(name);
 }
 
-/// Decode a NamespaceName body.
-pub(crate) fn decode_namespace_name_body(body: &[u8]) -> Result<RecordView<'_>> {
-    let ns_id = read_u32(body, 0)?;
-    let name_len = read_u32(body, 4)? as usize;
-    let name_end = 8 + name_len;
-    if name_end > body.len() {
-        return Err(Error::Corrupted {
-            offset: 8,
-            reason: "namespace-name body truncated mid-name",
-        });
-    }
-    let name = &body[8..name_end];
-    Ok(RecordView::NamespaceName { ns_id, name })
-}
+// ─────────────────────────────────────────────────────────────────
+// Body decoders.
+// ─────────────────────────────────────────────────────────────────
 
-/// Decode an Insert body from raw bytes (already plaintext).
+/// Decode a plaintext `Insert` record body.
 pub(crate) fn decode_insert_body(body: &[u8]) -> Result<RecordView<'_>> {
     let ns_id = read_u32(body, 0)?;
     let key_len = read_u32(body, 4)? as usize;
@@ -266,7 +215,7 @@ pub(crate) fn decode_insert_body(body: &[u8]) -> Result<RecordView<'_>> {
     })
 }
 
-/// Decode a Remove body.
+/// Decode a plaintext `Remove` record body.
 pub(crate) fn decode_remove_body(body: &[u8]) -> Result<RecordView<'_>> {
     let ns_id = read_u32(body, 0)?;
     let key_len = read_u32(body, 4)? as usize;
@@ -281,241 +230,196 @@ pub(crate) fn decode_remove_body(body: &[u8]) -> Result<RecordView<'_>> {
     Ok(RecordView::Remove { ns_id, key })
 }
 
-/// Compute the CRC32 over a record's `[tag .. body]` span (i.e., everything
-/// between the leading `record_len` u32 and the trailing `crc` u32).
-#[inline]
-pub(crate) fn record_crc(span: &[u8]) -> u32 {
-    crc32fast::hash(span)
-}
-
-/// Outcome of decoding a single on-disk record at `offset`.
-#[derive(Debug)]
-pub(crate) struct DecodedRecord<'a> {
-    /// The decoded record contents (borrowed from the underlying buffer
-    /// for unencrypted records; not used here for encrypted ones — the
-    /// caller is expected to use `decode_record_owned` for those).
-    pub(crate) view: RecordView<'a>,
-    /// File offset immediately past the trailing CRC. Caller resumes
-    /// scanning from here.
-    pub(crate) next_offset: u64,
-}
-
-/// Try to decode a single unencrypted record at `bytes[start..]`.
-///
-/// `file_start` is the absolute offset of `bytes[start..]` inside the
-/// file (only used for error reporting and `next_offset` calculation).
-///
-/// Returns `Ok(None)` when the buffer is too short to contain a full
-/// record (i.e., we have hit the recovery truncation point cleanly).
-/// Returns [`Error::Corrupted`] when a length prefix advertises bytes
-/// beyond the buffer or when the trailing CRC fails — both of which
-/// the caller treats as the recovery truncation point and stops.
-pub(crate) fn try_decode_record<'a>(
-    bytes: &'a [u8],
-    start: usize,
-    file_start: u64,
-) -> Result<Option<DecodedRecord<'a>>> {
-    // Need at least the length prefix to even look at this slot.
-    if start + 4 > bytes.len() {
-        return Ok(None);
-    }
-    let record_len = read_u32(bytes, start)? as usize;
-    if record_len == 0 {
-        // Length-zero records are not valid; they signal the end of the
-        // useful prefix of the file (pre-zeroed pages, for example).
-        return Ok(None);
-    }
-    let tag_offset = start + 4;
-    let crc_offset = tag_offset + record_len;
-    let end = crc_offset + 4;
-    if end > bytes.len() {
-        // Length prefix says the record extends past the buffer — torn
-        // write at the tail of the file. Treat as truncation point.
-        return Ok(None);
-    }
-    let stored_crc = read_u32(bytes, crc_offset)?;
-    let actual_crc = record_crc(&bytes[tag_offset..crc_offset]);
-    if stored_crc != actual_crc {
-        // CRC mismatch ⇒ torn or rotted write. Treat as truncation point.
-        return Ok(None);
-    }
-
-    let tag_byte = bytes[tag_offset];
-    let kind = tag_byte & TAG_KIND_MASK;
-    let encrypted = tag_byte & TAG_ENCRYPTED_FLAG != 0;
-    if encrypted {
-        // Encrypted records are not decodable by this fast path — the
-        // caller (recovery scanner) handles decryption separately.
+/// Decode a plaintext `NamespaceName` record body.
+pub(crate) fn decode_namespace_name_body(body: &[u8]) -> Result<RecordView<'_>> {
+    let ns_id = read_u32(body, 0)?;
+    let name_len = read_u32(body, 4)? as usize;
+    let name_end = 8 + name_len;
+    if name_end > body.len() {
         return Err(Error::Corrupted {
-            offset: file_start + tag_offset as u64,
-            reason: "encrypted record encountered in plaintext decoder",
+            offset: 8,
+            reason: "namespace-name body truncated mid-name",
         });
     }
-
-    let body = &bytes[tag_offset + 1..crc_offset];
-    let view = match kind {
-        TAG_INSERT => decode_insert_body(body)?,
-        TAG_REMOVE => decode_remove_body(body)?,
-        TAG_NAMESPACE_NAME => decode_namespace_name_body(body)?,
-        _ => {
-            return Err(Error::Corrupted {
-                offset: file_start + tag_offset as u64,
-                reason: "unknown record tag",
-            });
-        }
-    };
-
-    // `end` is the absolute index into `bytes` of the byte just after
-    // this record (since we passed `start` as the absolute cursor).
-    // Do not re-add `file_start`.
-    let _ = file_start;
-    Ok(Some(DecodedRecord {
-        view,
-        next_offset: end as u64,
-    }))
+    let name = &body[8..name_end];
+    Ok(RecordView::NamespaceName { ns_id, name })
 }
 
-/// Same as [`try_decode_record`] but for encrypted records: takes a
-/// decryption callback that turns ciphertext bytes into plaintext.
-///
-/// The caller (engine) supplies the AEAD decryption closure so this
-/// module stays cipher-agnostic.
-///
-/// Returns:
-/// - `Ok(Some(decoded))` when a record was decoded successfully.
-/// - `Ok(None)` when the bytes are too short / length-prefix is past
-///   the buffer / CRC mismatches (i.e., recovery truncation point).
-/// - `Err(_)` for AEAD failures or decode errors after decryption
-///   (these are real corruption, not torn writes).
-pub(crate) fn try_decode_encrypted_record<F>(
-    bytes: &[u8],
-    start: usize,
-    file_start: u64,
-    decrypt: F,
-) -> Result<Option<(OwnedRecord, u64)>>
+// ─────────────────────────────────────────────────────────────────
+// Payload-level decoders (tag byte + body, no outer framing).
+// ─────────────────────────────────────────────────────────────────
+
+/// Decode a v0.9 plaintext payload (tag byte + body bytes,
+/// stripped of fsys's outer frame).
+pub(crate) fn decode_payload(payload: &[u8]) -> Result<RecordView<'_>> {
+    if payload.is_empty() {
+        return Err(Error::Corrupted {
+            offset: 0,
+            reason: "empty record payload",
+        });
+    }
+    let tag = payload[0];
+    if (tag & TAG_ENCRYPTED_FLAG) != 0 {
+        return Err(Error::Corrupted {
+            offset: 0,
+            reason: "encrypted record passed to plaintext decoder",
+        });
+    }
+    let body = &payload[1..];
+    match tag & TAG_KIND_MASK {
+        TAG_INSERT => decode_insert_body(body),
+        TAG_REMOVE => decode_remove_body(body),
+        TAG_NAMESPACE_NAME => decode_namespace_name_body(body),
+        unknown => Err(Error::Corrupted {
+            offset: 0,
+            reason: kind_error_for(unknown),
+        }),
+    }
+}
+
+/// Decode a v0.9 encrypted payload via an AEAD callback. Returns
+/// an `OwnedRecord` because the plaintext needs to outlive the
+/// local decrypt buffer.
+pub(crate) fn decode_payload_encrypted<F>(payload: &[u8], decrypt: F) -> Result<OwnedRecord>
 where
     F: FnOnce(&[u8; NONCE_LEN], &[u8]) -> Result<Vec<u8>>,
 {
-    if start + 4 > bytes.len() {
-        return Ok(None);
-    }
-    let record_len = read_u32(bytes, start)? as usize;
-    if record_len == 0 {
-        return Ok(None);
-    }
-    let tag_offset = start + 4;
-    let crc_offset = tag_offset + record_len;
-    let end = crc_offset + 4;
-    if end > bytes.len() {
-        return Ok(None);
-    }
-    let stored_crc = read_u32(bytes, crc_offset)?;
-    let actual_crc = record_crc(&bytes[tag_offset..crc_offset]);
-    if stored_crc != actual_crc {
-        return Ok(None);
-    }
-
-    let tag_byte = bytes[tag_offset];
-    if tag_byte & TAG_ENCRYPTED_FLAG == 0 {
+    if payload.len() < 1 + NONCE_LEN + TAG_LEN {
         return Err(Error::Corrupted {
-            offset: file_start + tag_offset as u64,
-            reason: "plaintext record encountered in encrypted decoder",
+            offset: 0,
+            reason: "encrypted payload shorter than nonce + AEAD tag",
         });
     }
-    let kind = tag_byte & TAG_KIND_MASK;
-
-    let nonce_offset = tag_offset + 1;
-    if nonce_offset + NONCE_LEN > crc_offset {
+    let tag = payload[0];
+    if (tag & TAG_ENCRYPTED_FLAG) == 0 {
         return Err(Error::Corrupted {
-            offset: file_start + nonce_offset as u64,
-            reason: "encrypted record body too short for nonce",
+            offset: 0,
+            reason: "plaintext record passed to encrypted decoder",
         });
     }
+    let kind = tag & TAG_KIND_MASK;
     let mut nonce = [0_u8; NONCE_LEN];
-    nonce.copy_from_slice(&bytes[nonce_offset..nonce_offset + NONCE_LEN]);
-    let ciphertext = &bytes[nonce_offset + NONCE_LEN..crc_offset];
-
+    nonce.copy_from_slice(&payload[1..1 + NONCE_LEN]);
+    let ciphertext = &payload[1 + NONCE_LEN..];
     let plaintext = decrypt(&nonce, ciphertext)?;
-    let owned = match kind {
+
+    match kind {
         TAG_INSERT => match decode_insert_body(&plaintext)? {
             RecordView::Insert {
                 ns_id,
                 key,
                 value,
                 expires_at,
-            } => OwnedRecord::Insert {
+            } => Ok(OwnedRecord::Insert {
                 ns_id,
                 key: key.to_vec(),
                 value: value.to_vec(),
                 expires_at,
-            },
-            _ => {
-                return Err(Error::Corrupted {
-                    offset: file_start + tag_offset as u64,
-                    reason: "encrypted record body shape did not match its tag",
-                });
-            }
+            }),
+            _ => Err(Error::Corrupted {
+                offset: 0,
+                reason: "encrypted body shape mismatched its tag",
+            }),
         },
         TAG_REMOVE => match decode_remove_body(&plaintext)? {
-            RecordView::Remove { ns_id, key } => OwnedRecord::Remove {
+            RecordView::Remove { ns_id, key } => Ok(OwnedRecord::Remove {
                 ns_id,
                 key: key.to_vec(),
-            },
-            _ => {
-                return Err(Error::Corrupted {
-                    offset: file_start + tag_offset as u64,
-                    reason: "encrypted record body shape did not match its tag",
-                });
-            }
+            }),
+            _ => Err(Error::Corrupted {
+                offset: 0,
+                reason: "encrypted body shape mismatched its tag",
+            }),
         },
         TAG_NAMESPACE_NAME => match decode_namespace_name_body(&plaintext)? {
-            RecordView::NamespaceName { ns_id, name } => OwnedRecord::NamespaceName {
+            RecordView::NamespaceName { ns_id, name } => Ok(OwnedRecord::NamespaceName {
                 ns_id,
                 name: name.to_vec(),
-            },
-            _ => {
-                return Err(Error::Corrupted {
-                    offset: file_start + tag_offset as u64,
-                    reason: "encrypted record body shape did not match its tag",
-                });
-            }
+            }),
+            _ => Err(Error::Corrupted {
+                offset: 0,
+                reason: "encrypted body shape mismatched its tag",
+            }),
         },
-        _ => {
-            return Err(Error::Corrupted {
-                offset: file_start + tag_offset as u64,
-                reason: "unknown record tag (encrypted)",
-            });
-        }
-    };
+        unknown => Err(Error::Corrupted {
+            offset: 0,
+            reason: kind_error_for(unknown),
+        }),
+    }
+}
 
-    let _ = file_start;
-    Ok(Some((owned, end as u64)))
+/// Read a record's payload-byte length from fsys's frame length
+/// field. The length field lives 4 bytes before the payload,
+/// and is little-endian u32.
+pub(crate) fn payload_len_at(bytes: &[u8], payload_start: usize) -> Result<usize> {
+    if payload_start < 4 {
+        return Err(Error::Corrupted {
+            offset: payload_start as u64,
+            reason: "payload_start within frame header",
+        });
+    }
+    if payload_start > bytes.len() {
+        return Err(Error::Corrupted {
+            offset: payload_start as u64,
+            reason: "payload_start past buffer end",
+        });
+    }
+    Ok(read_u32(bytes, payload_start - 4)? as usize)
+}
+
+/// Slice a record's payload out of a buffer (typically the
+/// journal mmap), using fsys's length field to bound the range.
+pub(crate) fn payload_at(bytes: &[u8], payload_start: usize) -> Result<&[u8]> {
+    let len = payload_len_at(bytes, payload_start)?;
+    let end = payload_start.checked_add(len).ok_or(Error::Corrupted {
+        offset: payload_start as u64,
+        reason: "payload_start + length overflowed",
+    })?;
+    if end > bytes.len() {
+        return Err(Error::Corrupted {
+            offset: payload_start as u64,
+            reason: "payload extends past buffer end",
+        });
+    }
+    Ok(&bytes[payload_start..end])
+}
+
+#[inline]
+fn kind_error_for(_kind: u8) -> &'static str {
+    "unknown record tag kind"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn build_unencrypted_insert(ns_id: u32, key: &[u8], value: &[u8], expires_at: u64) -> Vec<u8> {
+    #[test]
+    fn insert_body_round_trips() {
         let mut body = Vec::new();
-        encode_insert_body(&mut body, ns_id, key, value, expires_at);
-        let record_len = (1 + body.len()) as u32; // tag + body
-        let mut out = Vec::with_capacity(4 + record_len as usize + 4);
-        write_u32(&mut out, record_len);
-        out.push(TAG_INSERT);
-        out.extend_from_slice(&body);
-        let crc = record_crc(&out[4..]);
-        write_u32(&mut out, crc);
-        out
+        encode_insert_body(&mut body, 7, b"key-bytes", b"value-bytes", 12345);
+        match decode_insert_body(&body).expect("decode") {
+            RecordView::Insert {
+                ns_id,
+                key,
+                value,
+                expires_at,
+            } => {
+                assert_eq!(ns_id, 7);
+                assert_eq!(key, b"key-bytes");
+                assert_eq!(value, b"value-bytes");
+                assert_eq!(expires_at, 12345);
+            }
+            _ => panic!("expected Insert"),
+        }
     }
 
     #[test]
-    fn round_trip_insert_record() {
-        let bytes = build_unencrypted_insert(0, b"alpha", b"one", 0);
-        let decoded = try_decode_record(&bytes, 0, 0)
-            .expect("decode ok")
-            .expect("some");
-        match decoded.view {
+    fn payload_round_trips_via_decode_payload() {
+        // Build a payload exactly the way Engine::append_insert
+        // would: tag byte + body bytes.
+        let mut payload = vec![TAG_INSERT];
+        encode_insert_body(&mut payload, 0, b"k", b"v", 0);
+        match decode_payload(&payload).expect("decode") {
             RecordView::Insert {
                 ns_id,
                 key,
@@ -523,59 +427,46 @@ mod tests {
                 expires_at,
             } => {
                 assert_eq!(ns_id, 0);
-                assert_eq!(key, b"alpha");
-                assert_eq!(value, b"one");
+                assert_eq!(key, b"k");
+                assert_eq!(value, b"v");
                 assert_eq!(expires_at, 0);
             }
             _ => panic!("expected Insert"),
         }
-        assert_eq!(decoded.next_offset, bytes.len() as u64);
     }
 
     #[test]
-    fn truncated_record_returns_none() {
-        let bytes = build_unencrypted_insert(0, b"k", b"v", 0);
-        // Drop the last byte to simulate a torn write.
-        let truncated = &bytes[..bytes.len() - 1];
-        let decoded = try_decode_record(truncated, 0, 0).expect("decode ok");
-        assert!(decoded.is_none());
-    }
-
-    #[test]
-    fn bit_flip_in_body_fails_crc() {
-        let mut bytes = build_unencrypted_insert(0, b"k", b"v", 0);
-        // Flip a bit in the value field.
-        bytes[12] ^= 1;
-        let decoded = try_decode_record(&bytes, 0, 0).expect("decode ok");
-        assert!(
-            decoded.is_none(),
-            "CRC mismatch must surface as truncation point"
-        );
-    }
-
-    #[test]
-    fn empty_buffer_decodes_to_none() {
-        let decoded = try_decode_record(&[], 0, 0).expect("decode ok");
-        assert!(decoded.is_none());
-    }
-
-    #[test]
-    fn zero_length_prefix_decodes_to_none() {
-        let bytes = vec![0_u8; 8];
-        let decoded = try_decode_record(&bytes, 0, 0).expect("decode ok");
-        assert!(decoded.is_none());
-    }
-
-    #[test]
-    fn unknown_tag_reports_corruption() {
-        let mut bytes = build_unencrypted_insert(0, b"k", b"v", 0);
-        bytes[4] = 0x42; // unknown tag, but legal flags
-                         // recompute CRC so the only error is the unknown tag
-        let len = read_u32(&bytes, 0).unwrap() as usize;
-        let crc = record_crc(&bytes[4..4 + len]);
-        let crc_offset = 4 + len;
-        bytes[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
-        let result = try_decode_record(&bytes, 0, 0);
+    fn empty_payload_errors() {
+        let result = decode_payload(&[]);
         assert!(matches!(result, Err(Error::Corrupted { .. })));
+    }
+
+    #[test]
+    fn unknown_tag_errors() {
+        let result = decode_payload(&[0x42_u8, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(matches!(result, Err(Error::Corrupted { .. })));
+    }
+
+    #[test]
+    fn encrypted_tag_to_plaintext_decoder_errors() {
+        let payload = vec![TAG_INSERT | TAG_ENCRYPTED_FLAG];
+        let result = decode_payload(&payload);
+        assert!(matches!(result, Err(Error::Corrupted { .. })));
+    }
+
+    #[test]
+    fn payload_at_handles_basic_geometry() {
+        // Build a buffer that mimics fsys's framed layout around
+        // a 5-byte payload: [4 magic][4 length][5 payload][4 crc]
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&0x4653_5901_u32.to_be_bytes()); // magic
+        frame.extend_from_slice(&5_u32.to_le_bytes()); // length
+        frame.extend_from_slice(b"hello"); // payload
+        frame.extend_from_slice(&0_u32.to_le_bytes()); // crc placeholder
+
+        let payload_start = 8;
+        let payload = payload_at(&frame, payload_start).expect("payload_at");
+        assert_eq!(payload, b"hello");
+        assert_eq!(payload_len_at(&frame, payload_start).expect("len"), 5);
     }
 }
