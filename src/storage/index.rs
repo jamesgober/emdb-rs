@@ -15,9 +15,10 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::RwLock;
 
-use crate::{Error, Result};
+use parking_lot::RwLock;
+
+use crate::Result;
 
 /// Number of shards. Power of two so the shard selector is a bitmask.
 const SHARDS: usize = 64;
@@ -133,13 +134,11 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::LockPoisoned`] when a shard's `RwLock` was
-    /// poisoned.
+    /// Result-typed for API stability; the parking_lot `RwLock` backing
+    /// the shards cannot be poisoned, so this never returns `Err`.
     pub(crate) fn get(&self, hash: KeyHash, key: &[u8]) -> Result<Option<u64>> {
         let shard_idx = (hash & SHARD_MASK) as usize;
-        let shard = self.shards[shard_idx]
-            .read()
-            .map_err(|_poisoned| Error::LockPoisoned)?;
+        let shard = self.shards[shard_idx].read();
         match shard.get(&hash) {
             None => Ok(None),
             Some(Slot::Single(offset)) => Ok(Some(*offset)),
@@ -173,8 +172,8 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::LockPoisoned`] on poisoned shard lock, or any
-    /// error returned by `resolve_existing`.
+    /// Returns any error produced by `resolve_existing`. The shard
+    /// lock cannot be poisoned (parking_lot).
     pub(crate) fn replace<F>(
         &self,
         hash: KeyHash,
@@ -186,9 +185,7 @@ impl Index {
         F: FnMut(u64) -> Result<Option<Vec<u8>>>,
     {
         let shard_idx = (hash & SHARD_MASK) as usize;
-        let mut shard = self.shards[shard_idx]
-            .write()
-            .map_err(|_poisoned| Error::LockPoisoned)?;
+        let mut shard = self.shards[shard_idx].write();
         match shard.get_mut(&hash) {
             None => {
                 let _prev = shard.insert(hash, Slot::Single(offset));
@@ -235,12 +232,10 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::LockPoisoned`] on poisoned shard lock.
+    /// Result-typed for API stability; parking_lot locks cannot poison.
     pub(crate) fn remove(&self, hash: KeyHash, key: &[u8]) -> Result<Option<u64>> {
         let shard_idx = (hash & SHARD_MASK) as usize;
-        let mut shard = self.shards[shard_idx]
-            .write()
-            .map_err(|_poisoned| Error::LockPoisoned)?;
+        let mut shard = self.shards[shard_idx].write();
         match shard.get_mut(&hash) {
             None => Ok(None),
             Some(slot) => match slot {
@@ -275,11 +270,11 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::LockPoisoned`] on poisoned shard lock.
+    /// Result-typed for API stability; parking_lot locks cannot poison.
     pub(crate) fn len(&self) -> Result<usize> {
         let mut total = 0;
         for shard in self.shards.iter() {
-            let guard = shard.read().map_err(|_poisoned| Error::LockPoisoned)?;
+            let guard = shard.read();
             for slot in guard.values() {
                 total += match slot {
                     Slot::Single(_) => 1,
@@ -294,10 +289,10 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::LockPoisoned`] on poisoned shard lock.
+    /// Result-typed for API stability; parking_lot locks cannot poison.
     pub(crate) fn clear(&self) -> Result<()> {
         for shard in self.shards.iter() {
-            let mut guard = shard.write().map_err(|_poisoned| Error::LockPoisoned)?;
+            let mut guard = shard.write();
             guard.clear();
         }
         Ok(())
@@ -309,11 +304,11 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::LockPoisoned`] on poisoned shard lock.
+    /// Result-typed for API stability; parking_lot locks cannot poison.
     pub(crate) fn collect_offsets(&self) -> Result<Vec<u64>> {
         let mut out = Vec::new();
         for shard in self.shards.iter() {
-            let guard = shard.read().map_err(|_poisoned| Error::LockPoisoned)?;
+            let guard = shard.read();
             for slot in guard.values() {
                 match slot {
                     Slot::Single(off) => out.push(*off),

@@ -1,6 +1,6 @@
 [package]
 name = "emdb"
-version = "0.9.0"
+version = "0.9.2"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -44,12 +44,28 @@ rustdoc-args = ["--cfg", "docsrs"]
 # emdb's storage layer wraps fsys's `JournalHandle` for the write
 # path; the read path keeps its own mmap over the journal file for
 # zero-copy lookups.
-fsys = "0.9"
+fsys = "0.9.8"
 crc32fast = "1.4"
 fs4 = "0.8"
 # Memory-mapped reads on every platform. mmap is the foundation of the
 # storage engine — no longer feature-gated.
 memmap2 = "0.9"
+# parking_lot — adaptive-spin + futex-backed `RwLock` / `Mutex` with no
+# poisoning and substantially lower acquire/release cost than the
+# `std::sync` equivalents. Replaces every `std::sync::{RwLock, Mutex}`
+# in the hot index + storage paths. Already pulled in transitively
+# through fsys; declared directly so emdb can pin it independently.
+parking_lot = "0.12"
+# crossbeam-skiplist — lock-free concurrent ordered map. Backs the
+# optional `range_index` (sorted secondary index for `Emdb::range`).
+# Replaces `RwLock<BTreeMap>`, which globally serialised every range
+# scan against every insert; SkipMap allows concurrent inserts and
+# concurrent range iteration with no lock contention.
+crossbeam-skiplist = "0.1"
+# crossbeam-utils — `CachePadded<T>` for false-sharing elimination on
+# the hot atomics (per-namespace `record_count`, `Store::mmap_len`).
+# Already pulled in transitively through fsys.
+crossbeam-utils = { version = "0.8", default-features = false }
 # Optional at-rest AES-256-GCM encryption.
 aes-gcm = { version = "0.10", optional = true, default-features = false, features = ["aes", "alloc"] }
 # ChaCha20-Poly1305 AEAD as an alternative to AES-GCM.

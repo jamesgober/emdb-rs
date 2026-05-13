@@ -40,9 +40,11 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
+use crossbeam_utils::CachePadded;
 use memmap2::Mmap;
+use parking_lot::{Mutex, RwLock};
 
 use crate::storage::flush::FlushPolicy;
 use crate::storage::meta::{self, MetaHeader};
@@ -84,8 +86,10 @@ pub(crate) struct Store {
     /// Tracks the byte length covered by the active mapping.
     /// Updated under the mmap write-lock when remapping. Read
     /// lock-free on the writer's append fast path to decide
-    /// whether to trigger a remap.
-    mmap_len: AtomicU64,
+    /// whether to trigger a remap. `CachePadded` so the high-
+    /// frequency atomic load on every write doesn't false-share
+    /// with the surrounding fields' cache line.
+    mmap_len: CachePadded<AtomicU64>,
     /// Active flush policy. Drives `flush()` semantics:
     /// `OnEachFlush` and `Group` both call `sync_through(latest)`;
     /// `WriteThrough` syncs after every append.
@@ -114,7 +118,7 @@ impl Store {
     /// meta sidecar on a fresh database; ignored on reopen
     /// (existing meta wins).
     pub(crate) fn open(path: PathBuf, flags: u32) -> Result<Self> {
-        Self::open_with_policy(path, flags, FlushPolicy::default())
+        Self::open_with_policy(path, flags, FlushPolicy::default(), None)
     }
 
     /// Open or create a database with explicit flush policy.
@@ -123,31 +127,59 @@ impl Store {
     /// opens an empty journal. On an existing path: reads the
     /// meta sidecar (validates magic + version + CRC) and opens
     /// the journal in append mode.
-    pub(crate) fn open_with_policy(path: PathBuf, flags: u32, policy: FlushPolicy) -> Result<Self> {
-        // Resolve or create the meta sidecar.
+    ///
+    /// `iouring_sqpoll_idle_ms`, when `Some`, opts the journal's
+    /// per-handle io_uring ring into Linux kernel-side `SQPOLL`
+    /// submission polling with the given idle window. `None`
+    /// uses the conservative non-SQPOLL path. Ignored on macOS /
+    /// Windows.
+    pub(crate) fn open_with_policy(
+        path: PathBuf,
+        flags: u32,
+        policy: FlushPolicy,
+        iouring_sqpoll_idle_ms: Option<u32>,
+    ) -> Result<Self> {
+        // Build a top-level fsys handle tuned for storage-engine
+        // workloads (the preset fsys ships for this exact use:
+        // 8 MiB resident buffer pool, 256-deep io_uring ring,
+        // 4 K-deep batch queue). `Method::Auto` picks the best
+        // primitive for the host (NVMe passthrough flush /
+        // io_uring on Linux / `WRITE_THROUGH` on Windows).
+        // If the caller opted into SQPOLL, propagate it to the
+        // builder so the per-handle ring is set up with
+        // `IORING_SETUP_SQPOLL` at construction time.
+        let mut fs_builder = fsys::builder().tune_for(fsys::Workload::Database);
+        if let Some(idle_ms) = iouring_sqpoll_idle_ms {
+            fs_builder = fs_builder.sqpoll(idle_ms);
+        }
+        let fs = fs_builder
+            .build()
+            .map_err(|err| Error::Io(std::io::Error::other(format!("fsys init: {err}"))))?;
+
+        // Resolve or create the meta sidecar. Reuse the cached
+        // fsys handle so we don't pay the builder-init cost
+        // (hardware probe, capability detection) again.
         let meta = match meta::read(&path)? {
             Some(existing) => existing,
             None => {
                 let fresh = MetaHeader::fresh(flags);
-                meta::write(&path, &fresh)?;
+                meta::write_with(&fs, &path, &fresh)?;
                 fresh
             }
         };
 
-        // Build a top-level fsys handle. `Method::Auto` picks the
-        // best primitive for the host (NVMe passthrough flush /
-        // io_uring on Linux / `WRITE_THROUGH` on Windows where
-        // appropriate); we let fsys decide.
-        let fs = fsys::builder()
-            .build()
-            .map_err(|err| Error::Io(std::io::Error::other(format!("fsys init: {err}"))))?;
-
-        // Open the journal. Buffered mode (default) keeps the
-        // mmap-visibility invariant: once `append` returns, the
-        // bytes are in the OS page cache and any subsequent mmap
-        // covering that offset will see them.
+        // Open the journal with a long write-lifetime hint
+        // (Linux NVMe `F_SET_RW_HINT`) so the SSD groups journal
+        // data into long-lived NAND blocks, reducing GC write
+        // amplification. No-op on macOS / Windows. Buffered mode
+        // (default) keeps the mmap-visibility invariant: once
+        // `append` returns, the bytes are in the OS page cache
+        // and any subsequent mmap covering that offset will see
+        // them.
+        let journal_opts = fsys::JournalOptions::new()
+            .write_lifetime_hint(Some(fsys::WriteLifetimeHint::Long));
         let journal = fs
-            .journal(&path)
+            .journal_with(&path, journal_opts)
             .map_err(|err| Error::Io(std::io::Error::other(format!("fsys journal: {err}"))))?;
         let journal = Arc::new(journal);
 
@@ -176,7 +208,7 @@ impl Store {
             fs,
             read_file: Mutex::new(read_file),
             mmap: RwLock::new(Arc::new(initial_mmap)),
-            mmap_len: AtomicU64::new(mmap_len),
+            mmap_len: CachePadded::new(AtomicU64::new(mmap_len)),
             policy,
             meta: Arc::new(RwLock::new(meta)),
         })
@@ -189,8 +221,7 @@ impl Store {
 
     /// Read a snapshot of the meta sidecar.
     pub(crate) fn header(&self) -> Result<MetaHeader> {
-        let guard = self.meta.read().map_err(|_| Error::LockPoisoned)?;
-        Ok(*guard)
+        Ok(*self.meta.read())
     }
 
     /// Logical end-of-data byte offset within the journal file.
@@ -215,8 +246,7 @@ impl Store {
     /// only when the requested offset is past the current
     /// mapping's end.
     pub(crate) fn mmap(&self) -> Result<Arc<Mmap>> {
-        let guard = self.mmap.read().map_err(|_| Error::LockPoisoned)?;
-        Ok(Arc::clone(&guard))
+        Ok(Arc::clone(&self.mmap.read()))
     }
 
     /// Borrow a read mapping that covers at least up to byte
@@ -233,8 +263,7 @@ impl Store {
         if end_offset > cur_len {
             self.refresh_mmap()?;
         }
-        let guard = self.mmap.read().map_err(|_| Error::LockPoisoned)?;
-        Ok(Arc::clone(&guard))
+        Ok(Arc::clone(&self.mmap.read()))
     }
 
     /// Append a payload to the journal. Returns the byte offset
@@ -269,7 +298,7 @@ impl Store {
         // bytes are durable before this call returns.
         if matches!(self.policy, FlushPolicy::WriteThrough) {
             self.journal
-                .sync_through(fsys::Lsn(end_lsn))
+                .sync_through(fsys::Lsn::new(end_lsn))
                 .map_err(|err| Error::Io(std::io::Error::other(format!("fsys sync: {err}"))))?;
         }
 
@@ -305,41 +334,61 @@ impl Store {
         self.append_batch(slices)
     }
 
-    /// Append a batch of payloads under a single concurrent-safe
-    /// pass. Returns the per-payload start offsets in the same
-    /// order, matching the input.
+    /// Append a batch of payloads under a single vectored
+    /// submission. Returns the per-payload start offsets in the
+    /// same order, matching the input.
     ///
-    /// fsys's lock-free LSN reservation makes a "batch" no
-    /// faster than N independent `append` calls under no
-    /// contention — the writer mutex was already gone in fsys
-    /// 0.8 — but batch semantics simplify caller code (one
-    /// allocation for the offsets vec, no in-loop error
-    /// branching) and keep the API parity with the old
-    /// `BatchEncoder` shape.
+    /// Routes through `fsys::JournalHandle::append_batch` so the
+    /// whole batch lands in **one** LSN reservation, **one**
+    /// heap allocation for the concatenated frames, and **one**
+    /// platform `pwrite` syscall — materially faster than the
+    /// pre-0.9.1 "loop of `append` calls" shape on bulk-load
+    /// workloads (the dominant `insert_many` / transaction
+    /// commit / compaction shape).
+    ///
+    /// Per-record start offsets are derived from the returned
+    /// end-of-batch LSN by walking the layout: each record
+    /// contributes `FSYS_FRAME_OVERHEAD + payload.len()` bytes,
+    /// and the payload begins `FSYS_PRE_PAYLOAD_BYTES` after the
+    /// frame header.
     pub(crate) fn append_batch<'a, I>(&self, payloads: I) -> Result<Vec<u64>>
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
         let payloads: Vec<&[u8]> = payloads.into_iter().collect();
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let end_lsn = self
+            .journal
+            .append_batch(&payloads)
+            .map_err(|err| Error::Io(std::io::Error::other(format!("fsys append_batch: {err}"))))?
+            .as_u64();
+
+        // Reconstruct per-payload start offsets from the batch's
+        // end LSN. Frames are appended back-to-back, so the
+        // start of frame `i` is end_of_batch minus the cumulative
+        // frame size from `i` onward; the payload sits
+        // FSYS_PRE_PAYLOAD_BYTES into the frame.
+        let total_frame_size: u64 = payloads
+            .iter()
+            .map(|p| FSYS_FRAME_OVERHEAD + p.len() as u64)
+            .sum();
+        let batch_start = end_lsn - total_frame_size;
         let mut starts = Vec::with_capacity(payloads.len());
-        let mut last_end_lsn: u64 = 0;
-        for payload in payloads {
-            let end_lsn = self
-                .journal
-                .append(payload)
-                .map_err(|err| Error::Io(std::io::Error::other(format!("fsys append: {err}"))))?
-                .as_u64();
-            let payload_start = end_lsn - FSYS_POST_PAYLOAD_BYTES - payload.len() as u64;
-            starts.push(payload_start);
-            last_end_lsn = end_lsn;
+        let mut cursor = batch_start;
+        for payload in &payloads {
+            starts.push(cursor + FSYS_PRE_PAYLOAD_BYTES);
+            cursor += FSYS_FRAME_OVERHEAD + payload.len() as u64;
         }
 
         // mmap refresh is lazy — see [`Self::mmap`] for the
         // strategy. We do not refresh on the write path.
 
-        if matches!(self.policy, FlushPolicy::WriteThrough) && last_end_lsn > 0 {
+        if matches!(self.policy, FlushPolicy::WriteThrough) {
             self.journal
-                .sync_through(fsys::Lsn(last_end_lsn))
+                .sync_through(fsys::Lsn::new(end_lsn))
                 .map_err(|err| Error::Io(std::io::Error::other(format!("fsys sync: {err}"))))?;
         }
 
@@ -369,8 +418,8 @@ impl Store {
     /// metadata). Used on graceful drop and on encryption
     /// metadata changes.
     pub(crate) fn persist_meta(&self) -> Result<()> {
-        let header = *self.meta.read().map_err(|_| Error::LockPoisoned)?;
-        meta::write(&self.path, &header)?;
+        let header = *self.meta.read();
+        meta::write_with(&self.fs, &self.path, &header)?;
         Ok(())
     }
 
@@ -385,7 +434,7 @@ impl Store {
         verify: [u8; meta::META_VERIFY_LEN],
     ) -> Result<()> {
         {
-            let mut guard = self.meta.write().map_err(|_| Error::LockPoisoned)?;
+            let mut guard = self.meta.write();
             guard.encryption_salt = salt;
             guard.encryption_verify = verify;
             guard.flags |= meta::FLAG_ENCRYPTED;
@@ -422,8 +471,8 @@ impl Store {
 
         // Lock the mmap so no concurrent readers grab the old
         // Arc while we swap.
-        let mut mmap_guard = self.mmap.write().map_err(|_| Error::LockPoisoned)?;
-        let mut file_guard = self.read_file.lock().map_err(|_| Error::LockPoisoned)?;
+        let mut mmap_guard = self.mmap.write();
+        let mut file_guard = self.read_file.lock();
 
         // Drop the old read-file by replacing it with a placeholder
         // pointing at the replacement. Windows requires the file
@@ -462,7 +511,7 @@ impl Store {
     /// (post-append) or after `swap_underlying` wires up a new
     /// file.
     fn refresh_mmap(&self) -> Result<()> {
-        let file_guard = self.read_file.lock().map_err(|_| Error::LockPoisoned)?;
+        let file_guard = self.read_file.lock();
         // SAFETY: same invariants as the initial mmap in
         // `open_with_policy` — `file_guard` keeps the fd alive
         // for the duration of the mapping; the mapping covers
@@ -472,7 +521,7 @@ impl Store {
         let new_mmap = unsafe { Mmap::map(&*file_guard)? };
         let new_len = new_mmap.len() as u64;
         drop(file_guard);
-        let mut mmap_guard = self.mmap.write().map_err(|_| Error::LockPoisoned)?;
+        let mut mmap_guard = self.mmap.write();
         *mmap_guard = Arc::new(new_mmap);
         self.mmap_len.store(new_len, Ordering::Release);
         Ok(())

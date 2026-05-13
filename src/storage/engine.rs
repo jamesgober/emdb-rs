@@ -19,13 +19,16 @@
 //! On encrypted databases, AEAD encrypt/decrypt is added on top
 //! (~200-400ns extra per record on commodity AES-NI hardware).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ops::{Bound, RangeBounds};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
+use crossbeam_skiplist::SkipMap;
+use crossbeam_utils::CachePadded;
 use memmap2::Mmap;
+use parking_lot::RwLock;
 
 use crate::storage::flush::FlushPolicy;
 use crate::storage::format::{self, RecordView};
@@ -44,20 +47,23 @@ pub(crate) const DEFAULT_NAMESPACE_ID: u32 = 0;
 /// Per-namespace runtime state. The `index` maps `(hash, key) → file
 /// offset`; `record_count` tracks live records for cheap `len` queries.
 /// When the engine was opened with `enable_range_scans(true)`,
-/// `range_index` carries a sorted secondary index (BTreeMap keyed by
-/// the actual key bytes) so callers can iterate keys in sorted order.
+/// `range_index` carries a sorted secondary index — a lock-free
+/// `crossbeam_skiplist::SkipMap` keyed by the actual key bytes so
+/// concurrent inserts + range iteration scale without acquiring a
+/// global lock. The hot `record_count` atomic is cache-padded so
+/// inserts in one namespace don't false-share with reads in another.
 struct NamespaceRuntime {
     index: Index,
-    record_count: AtomicU64,
-    range_index: Option<RwLock<BTreeMap<Vec<u8>, u64>>>,
+    record_count: CachePadded<AtomicU64>,
+    range_index: Option<Arc<SkipMap<Vec<u8>, u64>>>,
 }
 
 impl NamespaceRuntime {
     fn new(range_scans_enabled: bool) -> Self {
         Self {
             index: Index::new(),
-            record_count: AtomicU64::new(0),
-            range_index: range_scans_enabled.then(|| RwLock::new(BTreeMap::new())),
+            record_count: CachePadded::new(AtomicU64::new(0)),
+            range_index: range_scans_enabled.then(|| Arc::new(SkipMap::new())),
         }
     }
 }
@@ -92,6 +98,11 @@ pub(crate) struct EngineConfig {
     /// How `db.flush()` interacts with concurrent flush requests.
     /// Defaults to `OnEachFlush` to preserve v0.7.x semantics.
     pub(crate) flush_policy: FlushPolicy,
+    /// Optional Linux io_uring `SQPOLL` idle window in milliseconds.
+    /// `None` keeps the conservative non-SQPOLL submission path;
+    /// `Some(idle_ms)` opts the journal's per-handle ring into
+    /// kernel-side polling. Linux-only; ignored elsewhere.
+    pub(crate) iouring_sqpoll_idle_ms: Option<u32>,
     /// Optional 32-byte AES-256 key (post-KDF). `None` for
     /// unencrypted. Stored in a [`zeroize::Zeroizing`] wrapper so
     /// the bytes clear when the config is dropped.
@@ -115,6 +126,7 @@ impl Default for EngineConfig {
             flags: 0,
             enable_range_scans: false,
             flush_policy: FlushPolicy::default(),
+            iouring_sqpoll_idle_ms: None,
             #[cfg(feature = "encrypt")]
             encryption_key: None,
             #[cfg(feature = "encrypt")]
@@ -203,6 +215,7 @@ impl Engine {
             config.path.clone(),
             flags,
             config.flush_policy,
+            config.iouring_sqpoll_idle_ms,
         )?);
         let header = store.header()?;
 
@@ -247,7 +260,7 @@ impl Engine {
 
         // Always create the default namespace runtime.
         {
-            let mut guard = engine.namespaces.write().map_err(|_| Error::LockPoisoned)?;
+            let mut guard = engine.namespaces.write();
             let _existing = guard.insert(
                 DEFAULT_NAMESPACE_ID,
                 Arc::new(NamespaceRuntime::new(range_scans_enabled)),
@@ -487,9 +500,8 @@ impl Engine {
                 if prev.is_none() {
                     let _ = ns.record_count.fetch_add(1, Ordering::AcqRel);
                 }
-                if let Some(range_lock) = ns.range_index.as_ref() {
-                    let mut range = range_lock.write().map_err(|_| Error::LockPoisoned)?;
-                    let _ = range.insert(key, offset);
+                if let Some(range_map) = ns.range_index.as_ref() {
+                    let _ = range_map.insert(key, offset);
                 }
             }
             RecoveryAction::Remove { ns_id, key } => {
@@ -498,9 +510,8 @@ impl Engine {
                 if ns.index.remove(key_hash, &key)?.is_some() {
                     let _ = ns.record_count.fetch_sub(1, Ordering::AcqRel);
                 }
-                if let Some(range_lock) = ns.range_index.as_ref() {
-                    let mut range = range_lock.write().map_err(|_| Error::LockPoisoned)?;
-                    let _ = range.remove(&key);
+                if let Some(range_map) = ns.range_index.as_ref() {
+                    let _ = range_map.remove(&key);
                 }
             }
             RecoveryAction::NamespaceName { ns_id, name } => {
@@ -523,10 +534,7 @@ impl Engine {
                 // into this ns_id land in the right place. Then bind
                 // the name → id mapping.
                 let _ = self.ensure_namespace_runtime(ns_id)?;
-                let mut name_guard = self
-                    .namespace_names
-                    .write()
-                    .map_err(|_| Error::LockPoisoned)?;
+                let mut name_guard = self.namespace_names.write();
                 let _existing = name_guard.insert(name_str, ns_id);
                 drop(name_guard);
                 // Bump the id allocator past this id.
@@ -579,12 +587,12 @@ impl Engine {
 
     fn ensure_namespace_runtime(&self, ns_id: u32) -> Result<Arc<NamespaceRuntime>> {
         {
-            let guard = self.namespaces.read().map_err(|_| Error::LockPoisoned)?;
+            let guard = self.namespaces.read();
             if let Some(ns) = guard.get(&ns_id) {
                 return Ok(Arc::clone(ns));
             }
         }
-        let mut guard = self.namespaces.write().map_err(|_| Error::LockPoisoned)?;
+        let mut guard = self.namespaces.write();
         let range_scans = self.range_scans_enabled;
         let entry = guard
             .entry(ns_id)
@@ -599,8 +607,8 @@ impl Engine {
     }
 
     fn namespace(&self, ns_id: u32) -> Result<Arc<NamespaceRuntime>> {
-        let guard = self.namespaces.read().map_err(|_| Error::LockPoisoned)?;
-        guard
+        self.namespaces
+            .read()
             .get(&ns_id)
             .map(Arc::clone)
             .ok_or(Error::InvalidConfig("unknown namespace id"))
@@ -625,17 +633,18 @@ impl Engine {
         if prev.is_none() {
             let _ = ns.record_count.fetch_add(1, Ordering::AcqRel);
         }
-        if let Some(range_lock) = ns.range_index.as_ref() {
-            let mut range = range_lock.write().map_err(|_| Error::LockPoisoned)?;
-            let _ = range.insert(key.to_vec(), offset);
+        if let Some(range_map) = ns.range_index.as_ref() {
+            let _ = range_map.insert(key.to_vec(), offset);
         }
         Ok(())
     }
 
-    /// Bulk insert multiple records under a single writer-lock hold.
-    /// All records are framed into one buffer and written via a single
-    /// `write_all` syscall. Records are NOT atomic as a group (no
-    /// Begin/End markers); for atomic batches use the transaction API.
+    /// Bulk insert multiple records via fsys's vectored
+    /// `JournalHandle::append_batch`: one LSN reservation, one heap
+    /// allocation for the concatenated frames, one platform `pwrite`
+    /// covering the whole batch. Records are NOT atomic as a group
+    /// (no Begin/End markers); for atomic batches use the
+    /// transaction API.
     pub(crate) fn insert_many(
         &self,
         ns_id: u32,
@@ -649,54 +658,51 @@ impl Engine {
 
         #[cfg(feature = "encrypt")]
         let encryption = self.encryption.clone();
-        #[cfg(not(feature = "encrypt"))]
-        let encryption: Option<()> = None;
 
-        // Sequentially append every record via fsys's lock-free
-        // journal. Per-call overhead is the fsys frame header
-        // (12 bytes); fsync cost is amortised by group-commit
+        // Pre-encode every record into one `Vec<Vec<u8>>`, then
+        // submit the whole batch via fsys's vectored
+        // `append_batch`: one LSN reservation, one heap
+        // allocation for the concatenated frames, one platform
+        // `pwrite`. fsync cost is amortised by group-commit
         // when the engine flushes at the end of the batch.
-        let mut offsets: Vec<u64> = Vec::with_capacity(items.len());
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(items.len());
         for (key, value, expires_at) in &items {
-            let off = {
+            let payload: Vec<u8> = {
                 #[cfg(feature = "encrypt")]
                 {
                     if let Some(ctx) = encryption.as_ref() {
-                        let mut payload = Vec::with_capacity(20 + key.len() + value.len());
-                        format::encode_insert_body(&mut payload, ns_id, key, value, *expires_at);
-                        let nonce_then_ct = ctx.encrypt(&payload)?;
-                        self.store.append_with(|buf| {
-                            buf.push(format::TAG_INSERT | format::TAG_ENCRYPTED_FLAG);
-                            buf.extend_from_slice(&nonce_then_ct);
-                            Ok(())
-                        })?
+                        let mut plain = Vec::with_capacity(20 + key.len() + value.len());
+                        format::encode_insert_body(&mut plain, ns_id, key, value, *expires_at);
+                        let nonce_then_ct = ctx.encrypt(&plain)?;
+                        let mut frame = Vec::with_capacity(1 + nonce_then_ct.len());
+                        frame.push(format::TAG_INSERT | format::TAG_ENCRYPTED_FLAG);
+                        frame.extend_from_slice(&nonce_then_ct);
+                        frame
                     } else {
-                        self.store.append_with(|buf| {
-                            buf.push(format::TAG_INSERT);
-                            format::encode_insert_body(buf, ns_id, key, value, *expires_at);
-                            Ok(())
-                        })?
+                        let mut frame = Vec::with_capacity(1 + 20 + key.len() + value.len());
+                        frame.push(format::TAG_INSERT);
+                        format::encode_insert_body(&mut frame, ns_id, key, value, *expires_at);
+                        frame
                     }
                 }
                 #[cfg(not(feature = "encrypt"))]
                 {
-                    let _ = encryption;
-                    self.store.append_with(|buf| {
-                        buf.push(format::TAG_INSERT);
-                        format::encode_insert_body(buf, ns_id, key, value, *expires_at);
-                        Ok(())
-                    })?
+                    let mut frame = Vec::with_capacity(1 + 20 + key.len() + value.len());
+                    frame.push(format::TAG_INSERT);
+                    format::encode_insert_body(&mut frame, ns_id, key, value, *expires_at);
+                    frame
                 }
             };
-            offsets.push(off);
+            payloads.push(payload);
         }
+        let offsets = self
+            .store
+            .append_batch(payloads.iter().map(Vec::as_slice))?;
 
         // Now update the index. Records are already on disk; this just
-        // bumps the in-memory map.
-        let mut range_guard = match ns.range_index.as_ref() {
-            Some(lock) => Some(lock.write().map_err(|_| Error::LockPoisoned)?),
-            None => None,
-        };
+        // bumps the in-memory map. The SkipMap is lock-free so no
+        // guard acquisition is needed across the iteration.
+        let range_map = ns.range_index.as_ref();
         for ((key, _value, _exp), offset) in items.iter().zip(offsets.iter()) {
             let key_hash = Index::hash_key(key);
             let prev = ns
@@ -705,8 +711,8 @@ impl Engine {
             if prev.is_none() {
                 let _ = ns.record_count.fetch_add(1, Ordering::AcqRel);
             }
-            if let Some(range) = range_guard.as_deref_mut() {
-                let _ = range.insert(key.clone(), *offset);
+            if let Some(range_map) = range_map {
+                let _ = range_map.insert(key.clone(), *offset);
             }
         }
         Ok(())
@@ -929,9 +935,8 @@ impl Engine {
             if ns.index.remove(key_hash, key)?.is_some() {
                 let _ = ns.record_count.fetch_sub(1, Ordering::AcqRel);
             }
-            if let Some(range_lock) = ns.range_index.as_ref() {
-                let mut range = range_lock.write().map_err(|_| Error::LockPoisoned)?;
-                let _ = range.remove(key);
+            if let Some(range_map) = ns.range_index.as_ref() {
+                let _ = range_map.remove(key);
             }
         }
         Ok(prev)
@@ -962,7 +967,7 @@ impl Engine {
         let mut live_records: u64 = 0;
         let mut named_namespace_count: usize = 0;
         {
-            let guard = self.namespaces.read().map_err(|_| Error::LockPoisoned)?;
+            let guard = self.namespaces.read();
             for (ns_id, ns) in guard.iter() {
                 live_records = live_records.saturating_add(ns.record_count.load(Ordering::Acquire));
                 if *ns_id != DEFAULT_NAMESPACE_ID {
@@ -1011,8 +1016,7 @@ impl Engine {
     ///
     /// Returns I/O errors from any of the rewrite, sync, or rename
     /// steps; on failure, the original file is left untouched (the
-    /// temp file is best-effort cleaned up). Returns
-    /// [`Error::LockPoisoned`] on any poisoned engine lock.
+    /// temp file is best-effort cleaned up).
     pub(crate) fn compact_in_place(&self) -> Result<()> {
         // Snapshot every namespace + its name so we can re-emit the
         // name → id binding in the compacted file.
@@ -1060,9 +1064,8 @@ impl Engine {
             let ns = self.namespace(*ns_id)?;
             ns.index.clear()?;
             ns.record_count.store(0, Ordering::Release);
-            if let Some(range_lock) = ns.range_index.as_ref() {
-                let mut range = range_lock.write().map_err(|_| Error::LockPoisoned)?;
-                range.clear();
+            if let Some(range_map) = ns.range_index.as_ref() {
+                clear_skipmap(range_map);
             }
         }
         self.recovery_scan()?;
@@ -1172,19 +1175,35 @@ impl Engine {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(meta::meta_path_for(path));
 
+        // Build one fsys handle and reuse it for both the meta
+        // sidecar write and the journal open. Builder init pays
+        // the hardware-capability probe; doing it once instead
+        // of twice halves the steady-state compaction overhead.
+        let fs = fsys::builder()
+            .tune_for(fsys::Workload::Database)
+            .build()
+            .map_err(|err| Error::Io(std::io::Error::other(format!("fsys init: {err}"))))?;
+
         // Write the meta sidecar first. The reader on the
         // recovery scan does not need the sidecar to walk the
         // journal, but `Store::open` does, and a missing sidecar
         // would cause `open` to synthesise a fresh one with
         // default flags — destroying any encryption metadata.
-        meta::write(path, header_template)?;
+        meta::write_with(&fs, path, header_template)?;
 
-        let fs = fsys::builder()
-            .build()
-            .map_err(|err| Error::Io(std::io::Error::other(format!("fsys init: {err}"))))?;
+        let journal_opts = fsys::JournalOptions::new()
+            .write_lifetime_hint(Some(fsys::WriteLifetimeHint::Long));
         let journal = fs
-            .journal(path)
+            .journal_with(path, journal_opts)
             .map_err(|err| Error::Io(std::io::Error::other(format!("fsys journal: {err}"))))?;
+
+        // Pre-encode every record up-front, then submit them as
+        // a single vectored `append_batch`: one LSN reservation,
+        // one heap allocation for the concatenated frames, one
+        // platform `pwrite`. Materially faster than calling
+        // `append` in a tight loop, especially on bulk-load
+        // workloads (which is the dominant compaction shape).
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
 
         // First emit name-binding records for every non-default
         // namespace so a reopen of the compacted file restores
@@ -1193,20 +1212,21 @@ impl Engine {
             if *ns_id == DEFAULT_NAMESPACE_ID || name.is_empty() {
                 continue;
             }
-            let payload = self.encode_namespace_name_payload(*ns_id, name.as_bytes())?;
-            let _lsn = journal
-                .append(&payload)
-                .map_err(|err| Error::Io(std::io::Error::other(format!("fsys append: {err}"))))?;
+            payloads.push(self.encode_namespace_name_payload(*ns_id, name.as_bytes())?);
         }
 
         // Then emit the data (insert) records for every namespace.
         for (ns_id, _, records) in snapshots {
             for (key, value, expires_at) in records {
-                let payload = self.encode_insert_payload(*ns_id, key, value, *expires_at)?;
-                let _lsn = journal.append(&payload).map_err(|err| {
-                    Error::Io(std::io::Error::other(format!("fsys append: {err}")))
-                })?;
+                payloads.push(self.encode_insert_payload(*ns_id, key, value, *expires_at)?);
             }
+        }
+
+        if !payloads.is_empty() {
+            let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+            let _ = journal
+                .append_batch(&refs)
+                .map_err(|err| Error::Io(std::io::Error::other(format!("fsys append_batch: {err}"))))?;
         }
 
         // Force-sync everything we just wrote. fsys's
@@ -1277,9 +1297,8 @@ impl Engine {
         let ns = self.namespace(ns_id)?;
         ns.index.clear()?;
         ns.record_count.store(0, Ordering::Release);
-        if let Some(range_lock) = ns.range_index.as_ref() {
-            let mut range = range_lock.write().map_err(|_| Error::LockPoisoned)?;
-            range.clear();
+        if let Some(range_map) = ns.range_index.as_ref() {
+            clear_skipmap(range_map);
         }
         Ok(())
     }
@@ -1291,39 +1310,21 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`Error::InvalidConfig`] if range scans were not enabled
-    /// at open time, or [`Error::LockPoisoned`] on poisoned namespace
-    /// lock.
+    /// at open time.
     pub(crate) fn range_scan<R>(&self, ns_id: u32, range: R) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
     where
         R: RangeBounds<Vec<u8>>,
     {
         let ns = self.namespace(ns_id)?;
-        let range_lock = ns.range_index.as_ref().ok_or(Error::InvalidConfig(
+        let range_map = ns.range_index.as_ref().ok_or(Error::InvalidConfig(
             "range scans not enabled; pass `EmdbBuilder::enable_range_scans(true)` at open time",
         ))?;
 
-        // Snapshot (key, offset) pairs under a read lock, drop the lock
-        // before we touch the mmap.
-        let pairs: Vec<(Vec<u8>, u64)> = {
-            let guard = range_lock.read().map_err(|_| Error::LockPoisoned)?;
-            // BTreeMap::range needs `RangeBounds<&[u8]>` semantics; we
-            // adapt by converting the user's bounds into byte-slice
-            // bounds.
-            let start = match range.start_bound() {
-                Bound::Included(v) => Bound::Included(v.as_slice()),
-                Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
-                Bound::Unbounded => Bound::Unbounded,
-            };
-            let end = match range.end_bound() {
-                Bound::Included(v) => Bound::Included(v.as_slice()),
-                Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
-                Bound::Unbounded => Bound::Unbounded,
-            };
-            guard
-                .range::<[u8], _>((start, end))
-                .map(|(k, off)| (k.clone(), *off))
-                .collect()
-        };
+        // Snapshot (key, offset) pairs via the lock-free SkipMap
+        // iterator. No global lock is held; concurrent inserts
+        // continue to advance against the same skiplist while we
+        // scan.
+        let pairs: Vec<(Vec<u8>, u64)> = skipmap_range_snapshot(range_map, &range);
 
         // Now resolve each offset to its value via the mmap. Using
         // `read_value_at` keeps the encryption-aware decode path.
@@ -1346,12 +1347,11 @@ impl Engine {
         Ok(offsets)
     }
 
-    /// Snapshot the (key, offset) pairs in a `range` query under a
-    /// single read-lock acquisition, sorted by key. Used by lazy
-    /// range iterators so the BTreeMap lock isn't held across the
-    /// caller's iteration. The keys are cloned out of the BTreeMap
-    /// (cheap relative to value reads); offsets are looked up in
-    /// the mmap on each `next()`.
+    /// Snapshot the (key, offset) pairs in a `range` query via the
+    /// lock-free SkipMap iterator. Used by lazy range iterators so
+    /// no lock is held across the caller's iteration. The keys are
+    /// cloned out of the skiplist (cheap relative to value reads);
+    /// offsets are looked up in the mmap on each `next()`.
     pub(crate) fn snapshot_range_offsets<R>(
         &self,
         ns_id: u32,
@@ -1361,25 +1361,11 @@ impl Engine {
         R: RangeBounds<Vec<u8>>,
     {
         let ns = self.namespace(ns_id)?;
-        let range_lock = ns.range_index.as_ref().ok_or(Error::InvalidConfig(
+        let range_map = ns.range_index.as_ref().ok_or(Error::InvalidConfig(
             "range scans not enabled; pass `EmdbBuilder::enable_range_scans(true)` at open time",
         ))?;
 
-        let guard = range_lock.read().map_err(|_| Error::LockPoisoned)?;
-        let start = match range.start_bound() {
-            Bound::Included(v) => Bound::Included(v.as_slice()),
-            Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-        let end = match range.end_bound() {
-            Bound::Included(v) => Bound::Included(v.as_slice()),
-            Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-        Ok(guard
-            .range::<[u8], _>((start, end))
-            .map(|(k, off)| (k.clone(), *off))
-            .collect())
+        Ok(skipmap_range_snapshot(range_map, &range))
     }
 
     /// Decode a single record at `offset` into an owned tuple. Used by
@@ -1422,7 +1408,7 @@ impl Engine {
     /// overwritten by a later record with a different key (hash
     /// collision repaired) or is no longer an `Insert`. Used by
     /// lazy range iterators that already know the key from the
-    /// BTreeMap snapshot.
+    /// `SkipMap` snapshot.
     pub(crate) fn read_value_with_meta_at(
         &self,
         offset: u64,
@@ -1500,10 +1486,7 @@ impl Engine {
         }
         // Lookup first.
         {
-            let guard = self
-                .namespace_names
-                .read()
-                .map_err(|_| Error::LockPoisoned)?;
+            let guard = self.namespace_names.read();
             if let Some(id) = guard.get(name) {
                 return Ok(*id);
             }
@@ -1512,10 +1495,7 @@ impl Engine {
         // We persist BEFORE inserting into the in-memory map so that a
         // crash between the two leaves no in-memory entry without a
         // corresponding on-disk record.
-        let mut name_guard = self
-            .namespace_names
-            .write()
-            .map_err(|_| Error::LockPoisoned)?;
+        let mut name_guard = self.namespace_names.write();
         if let Some(id) = name_guard.get(name) {
             return Ok(*id);
         }
@@ -1525,7 +1505,7 @@ impl Engine {
         // body directly.
         let _record_offset = self.append_namespace_name(id, name)?;
         let _ = name_guard.insert(name.to_string(), id);
-        let mut runtimes = self.namespaces.write().map_err(|_| Error::LockPoisoned)?;
+        let mut runtimes = self.namespaces.write();
         let _ = runtimes.insert(
             id,
             Arc::new(NamespaceRuntime::new(self.range_scans_enabled)),
@@ -1562,15 +1542,12 @@ impl Engine {
         if name.is_empty() {
             return Err(Error::InvalidConfig("default namespace cannot be dropped"));
         }
-        let mut name_guard = self
-            .namespace_names
-            .write()
-            .map_err(|_| Error::LockPoisoned)?;
+        let mut name_guard = self.namespace_names.write();
         let id = match name_guard.remove(name) {
             Some(id) => id,
             None => return Ok(false),
         };
-        let mut runtimes = self.namespaces.write().map_err(|_| Error::LockPoisoned)?;
+        let mut runtimes = self.namespaces.write();
         let _ = runtimes.remove(&id);
         Ok(true)
     }
@@ -1578,16 +1555,52 @@ impl Engine {
     /// Enumerate every live namespace as `(id, name)`. The default
     /// namespace is reported with name `""`.
     pub(crate) fn list_namespaces(&self) -> Result<Vec<(u32, String)>> {
-        let guard = self
-            .namespace_names
-            .read()
-            .map_err(|_| Error::LockPoisoned)?;
+        let guard = self.namespace_names.read();
         let mut out: Vec<(u32, String)> = vec![(DEFAULT_NAMESPACE_ID, String::new())];
         for (name, id) in guard.iter() {
             out.push((*id, name.clone()));
         }
         out.sort_by_key(|(id, _)| *id);
         Ok(out)
+    }
+}
+
+/// Snapshot the `(key, offset)` entries of a `SkipMap` falling inside
+/// `bounds` into an owned `Vec`. The skiplist iterator is lock-free,
+/// so this lets callers materialise a stable view without holding any
+/// lock while they walk the mmap for value bytes.
+fn skipmap_range_snapshot<R>(
+    map: &SkipMap<Vec<u8>, u64>,
+    bounds: &R,
+) -> Vec<(Vec<u8>, u64)>
+where
+    R: RangeBounds<Vec<u8>>,
+{
+    let start = match bounds.start_bound() {
+        Bound::Included(v) => Bound::Included(v.as_slice()),
+        Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    let end = match bounds.end_bound() {
+        Bound::Included(v) => Bound::Included(v.as_slice()),
+        Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    map.range::<[u8], _>((start, end))
+        .map(|entry| (entry.key().clone(), *entry.value()))
+        .collect()
+}
+
+/// Drop every entry in `map`. crossbeam-skiplist's `SkipMap` has no
+/// in-place `clear`; we walk the entries and remove them. Callers
+/// must serialise this with concurrent writers themselves — the
+/// engine only invokes it under `clear_namespace` / compaction
+/// reset, both of which already hold the engine's logical
+/// "exclusive" stance.
+fn clear_skipmap(map: &SkipMap<Vec<u8>, u64>) {
+    let keys: Vec<Vec<u8>> = map.iter().map(|entry| entry.key().clone()).collect();
+    for key in keys {
+        let _ = map.remove(&key);
     }
 }
 

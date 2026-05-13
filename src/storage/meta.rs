@@ -166,16 +166,30 @@ pub(crate) fn read(db_path: &Path) -> Result<Option<MetaHeader>> {
     }
 }
 
-/// Write the sidecar metadata file atomically. Routes through
-/// [`fsys::Handle::write`]'s temp-file + atomic-rename path so
-/// torn writes either leave the previous body intact or produce
-/// the complete new body.
+/// Write the sidecar metadata file atomically using a fresh
+/// `fsys::Handle`. Routes through [`fsys::Handle::write`]'s
+/// temp-file + atomic-rename path so torn writes either leave
+/// the previous body intact or produce the complete new body.
+///
+/// Prefer [`write_with`] when the caller already owns a cached
+/// handle — building one here pays the full builder-init cost
+/// (hardware probe, capability detection) on every meta write.
 pub(crate) fn write(db_path: &Path, header: &MetaHeader) -> Result<()> {
-    let path = meta_path_for(db_path);
-    let body = header.encode();
     let fs = fsys::builder()
+        .tune_for(fsys::Workload::Database)
         .build()
         .map_err(|err| Error::Io(std::io::Error::other(format!("fsys init: {err}"))))?;
+    write_with(&fs, db_path, header)
+}
+
+/// Write the sidecar metadata file via a caller-supplied
+/// `fsys::Handle`. The atomic-replace contract is identical to
+/// [`write`]; this variant exists so that the engine's cached
+/// handle can be threaded through without re-paying the
+/// builder-init cost on every meta-sidecar persist.
+pub(crate) fn write_with(fs: &fsys::Handle, db_path: &Path, header: &MetaHeader) -> Result<()> {
+    let path = meta_path_for(db_path);
+    let body = header.encode();
     fs.write(&path, &body)
         .map_err(|err| Error::Io(std::io::Error::other(format!("fsys write meta: {err}"))))?;
     Ok(())
