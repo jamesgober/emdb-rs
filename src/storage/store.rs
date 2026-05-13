@@ -176,8 +176,8 @@ impl Store {
         // `append` returns, the bytes are in the OS page cache
         // and any subsequent mmap covering that offset will see
         // them.
-        let journal_opts = fsys::JournalOptions::new()
-            .write_lifetime_hint(Some(fsys::WriteLifetimeHint::Long));
+        let journal_opts =
+            fsys::JournalOptions::new().write_lifetime_hint(Some(fsys::WriteLifetimeHint::Long));
         let journal = fs
             .journal_with(&path, journal_opts)
             .map_err(|err| Error::Io(std::io::Error::other(format!("fsys journal: {err}"))))?;

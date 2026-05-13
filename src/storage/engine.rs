@@ -1191,8 +1191,8 @@ impl Engine {
         // default flags — destroying any encryption metadata.
         meta::write_with(&fs, path, header_template)?;
 
-        let journal_opts = fsys::JournalOptions::new()
-            .write_lifetime_hint(Some(fsys::WriteLifetimeHint::Long));
+        let journal_opts =
+            fsys::JournalOptions::new().write_lifetime_hint(Some(fsys::WriteLifetimeHint::Long));
         let journal = fs
             .journal_with(path, journal_opts)
             .map_err(|err| Error::Io(std::io::Error::other(format!("fsys journal: {err}"))))?;
@@ -1224,9 +1224,9 @@ impl Engine {
 
         if !payloads.is_empty() {
             let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
-            let _ = journal
-                .append_batch(&refs)
-                .map_err(|err| Error::Io(std::io::Error::other(format!("fsys append_batch: {err}"))))?;
+            let _ = journal.append_batch(&refs).map_err(|err| {
+                Error::Io(std::io::Error::other(format!("fsys append_batch: {err}")))
+            })?;
         }
 
         // Force-sync everything we just wrote. fsys's
@@ -1569,10 +1569,7 @@ impl Engine {
 /// `bounds` into an owned `Vec`. The skiplist iterator is lock-free,
 /// so this lets callers materialise a stable view without holding any
 /// lock while they walk the mmap for value bytes.
-fn skipmap_range_snapshot<R>(
-    map: &SkipMap<Vec<u8>, u64>,
-    bounds: &R,
-) -> Vec<(Vec<u8>, u64)>
+fn skipmap_range_snapshot<R>(map: &SkipMap<Vec<u8>, u64>, bounds: &R) -> Vec<(Vec<u8>, u64)>
 where
     R: RangeBounds<Vec<u8>>,
 {
