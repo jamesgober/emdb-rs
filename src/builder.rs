@@ -185,6 +185,23 @@ impl EmdbBuilder {
     pub fn build(self) -> Result<Emdb> {
         Emdb::from_builder(self)
     }
+
+    /// Async-context variant of [`Self::build`]. Routes the build
+    /// through `tokio::task::spawn_blocking` so the file-open and
+    /// recovery scan don't block the async-task scheduler. Gated
+    /// behind the `async` feature.
+    ///
+    /// Returns an [`crate::AsyncEmdb`] handle. Reach for the sync
+    /// surface via [`crate::AsyncEmdb::sync_handle`] when needed.
+    #[cfg(feature = "async")]
+    pub async fn build_async(self) -> Result<crate::AsyncEmdb> {
+        let emdb = tokio::task::spawn_blocking(move || self.build())
+            .await
+            .map_err(|err| {
+                crate::Error::Io(std::io::Error::other(format!("async join: {err}")))
+            })??;
+        Ok(crate::AsyncEmdb::from_sync(emdb))
+    }
 }
 
 #[cfg(test)]

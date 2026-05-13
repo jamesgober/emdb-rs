@@ -4,6 +4,87 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5](https://github.com/jamesgober/emdb-rs/compare/v0.9.4...v0.9.5) — 2026-05-13
+
+**Async surface.** New opt-in `async` feature exposing
+`AsyncEmdb` and `AsyncNamespace` wrappers plus
+`EmdbBuilder::build_async`. Every async method routes through
+`tokio::task::spawn_blocking` so emdb's blocking I/O never
+stalls the async-task scheduler. No breaking change to the
+sync API; programs that don't enable the feature pay no
+tokio dep cost.
+
+### Added
+
+- **`async` feature flag** in `Cargo.toml`. Pulls in
+  `tokio = "1"` with `rt` + `rt-multi-thread` + `macros`
+  (no `fs` — emdb's I/O goes through fsys, not tokio::fs).
+- **`AsyncEmdb`** — cheap-clone async handle holding
+  `Arc<Emdb>` internally. Mirrors the full sync `Emdb`
+  surface: `open` / `open_in_memory` / `from_sync`,
+  `insert` / `insert_many` / `insert_with_ttl` / `get` /
+  `remove` / `contains_key` / `len` / `is_empty` / `clear`,
+  `flush` / `checkpoint` / `stats` / `backup_to` / `compact`,
+  `iter` / `keys` / `range` / `range_prefix` / `iter_from`
+  / `iter_after`, `transaction`, `namespace` /
+  `drop_namespace` / `list_namespaces`, plus TTL methods
+  (`expires_at` / `ttl` / `persist` / `sweep_expired`)
+  under `#[cfg(feature = "ttl")]`. Bridge to the sync API
+  via `sync_handle()` for advanced uses (zero-copy reads,
+  streaming iterators).
+- **`AsyncNamespace`** — mirror of `Namespace` with the
+  same `spawn_blocking` routing.
+- **`EmdbBuilder::build_async()`** — async-context entry
+  point that mirrors `EmdbBuilder::build()`. Routes the
+  file-open + recovery scan through `spawn_blocking`.
+- **`tests/async_api.rs`** — 12 integration tests
+  covering open/builder/namespace/transaction/iter/range/
+  insert_many/stats/concurrent-clones/TTL/file
+  round-trip. Run via
+  `cargo test --features async --test async_api`.
+
+### Cost model — what async users should know
+
+Each async op pays one `spawn_blocking` dispatch (tokio
+schedules the closure onto its blocking pool) plus one
+ownership transfer (key + value cloned to owned `Vec<u8>`
+so the closure can take them by value). The dispatch is
+sub-microsecond on a warm blocking pool; the value clone
+is O(key + value bytes).
+
+When the sync cost dominates (record decode, fsync, mmap
+remap), spawn_blocking overhead is negligible. When the
+sync cost is a single hash-table probe (`get` on an
+in-memory hot key), the overhead may dominate — for
+those workloads, prefer the sync surface or batch via
+`insert_many` / `range`.
+
+### Streaming iterators
+
+The sync API offers lazy iterators (`iter`, `keys`,
+`range_iter`, etc.) that decode records on each `next()`.
+The async surface currently materialises these into owned
+`Vec`s before returning — streaming via `impl Stream` is
+on the roadmap for a later 0.9.x. For large iterations,
+reach for the sync handle via `AsyncEmdb::sync_handle()`
+and drive the iterator inside a single `spawn_blocking`.
+
+### Internals — module map
+
+| Module | Change |
+|---|---|
+| [`src/async_impl.rs`](src/async_impl.rs) | **New.** `AsyncEmdb` + `AsyncNamespace` + helper `blocking` / `blocking_infallible` wrappers around `tokio::task::spawn_blocking`. |
+| [`src/builder.rs`](src/builder.rs) | New `#[cfg(feature = "async")] pub async fn build_async(self) -> Result<AsyncEmdb>`. |
+| [`src/lib.rs`](src/lib.rs) | `#[cfg(feature = "async")] mod async_impl;` + re-export of `AsyncEmdb` and `AsyncNamespace`. Module-level docs gained an "Async surface" section. |
+| [`tests/async_api.rs`](tests/async_api.rs) | **New.** 12 multi-thread tokio-runtime tests. |
+| [`Cargo.toml`](Cargo.toml) | New `async = ["dep:tokio"]` feature; `tokio = { optional = true, ... }` in `[dependencies]`; `tokio` (unconditional) in `[dev-dependencies]` for the integration test runtime. |
+
+### Breaking changes
+
+**None.** Programs that compile against 0.9.4 compile
+against 0.9.5 unchanged. Programs that don't enable the
+`async` feature pay no tokio cost.
+
 ## [0.9.4](https://github.com/jamesgober/emdb-rs/compare/v0.9.3...v0.9.4) — 2026-05-13
 
 **Critical fix.** Patch release. Fixes a TOCTOU race in the

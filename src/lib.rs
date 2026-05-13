@@ -168,12 +168,52 @@
 //! - [`Emdb::checkpoint`] — explicit fast-reopen checkpoint that
 //!   persists the file header's `tail_hint`.
 //!
+//! ## Async surface
+//!
+//! Opt-in via the `async` feature. Wraps the sync API in
+//! [`tokio::task::spawn_blocking`] so blocking I/O never stalls the
+//! async-task scheduler. Exposes [`AsyncEmdb`] and
+//! [`AsyncNamespace`], plus [`EmdbBuilder::build_async`] for the
+//! builder path.
+//!
+//! ```ignore
+//! # // gated behind `async` feature
+//! use emdb::{AsyncEmdb, Emdb};
+//!
+//! # async fn ex() -> Result<(), emdb::Error> {
+//! // Open via the simple constructor.
+//! let db = AsyncEmdb::open("/tmp/users.emdb").await?;
+//! db.insert("alice", "active").await?;
+//! let value = db.get("alice").await?;
+//!
+//! // Or build with explicit configuration.
+//! let configured = Emdb::builder()
+//!     .path("/tmp/configured.emdb")
+//!     .enable_range_scans(true)
+//!     .build_async()
+//!     .await?;
+//! # let _ = (db, configured); Ok(())
+//! # }
+//! ```
+//!
+//! Every async method clones the underlying `Arc<Emdb>` into a
+//! `spawn_blocking` closure; cheap, but each call allocates owned
+//! `Vec<u8>` copies for key/value bytes so the closure can take
+//! them by value. For latency-sensitive workloads where the
+//! spawn dispatch overhead exceeds the sync cost (e.g. tight
+//! `get` loops on a hot in-memory key), reach for the sync
+//! handle via [`AsyncEmdb::sync_handle`] and batch via
+//! `insert_many` / `range`.
+//!
 //! ## Cargo features
 //!
 //! - `ttl` *(default)* — per-record expiration and `default_ttl`.
 //! - `nested` — dotted-prefix group operations and `Focus` handles.
 //! - `encrypt` — AES-256-GCM + ChaCha20-Poly1305 at-rest encryption
 //!   with raw-key or Argon2id-derived passphrase.
+//! - `async` — [`AsyncEmdb`] / [`AsyncNamespace`] wrappers via
+//!   tokio's `spawn_blocking`. Pulls in `tokio` with `rt` +
+//!   `rt-multi-thread` + `macros`.
 //! - `bench-compare`, `bench-rocksdb`, `bench-redis` — comparative
 //!   bench peers (dev-only, never required by application builds).
 
@@ -205,6 +245,8 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(feature = "async")]
+mod async_impl;
 mod builder;
 mod data_dir;
 mod db;
@@ -224,6 +266,8 @@ mod transaction;
 mod ttl;
 mod value_ref;
 
+#[cfg(feature = "async")]
+pub use async_impl::{AsyncEmdb, AsyncNamespace};
 pub use builder::EmdbBuilder;
 pub use db::{Emdb, EmdbIter, EmdbKeyIter, EmdbRangeIter};
 #[cfg(feature = "encrypt")]
