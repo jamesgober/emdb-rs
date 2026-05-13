@@ -113,23 +113,28 @@ fn concurrent_inserts_reads_removes_under_growth() {
                 let r2 = rng_step(&mut seed);
                 let op_kind = r2 % 100;
                 if op_kind < 60 {
-                    // Insert (or replace).
+                    // Insert (or replace). Take the reference lock
+                    // BEFORE the db op so the (db, reference) update
+                    // pair is atomic with respect to other writers
+                    // racing on the same key. Without this ordering,
+                    // T0's db.insert and T1's db.insert can land in
+                    // one order while their reference.insert calls
+                    // land in the opposite order, leaving the
+                    // reference disagreeing with the db.
                     let value = value_at(key_idx, generation);
-                    db.insert(key.as_slice(), value.as_slice())
-                        .expect("insert");
-                    reference.lock().insert(key, Some(value));
+                    let mut ref_guard = reference.lock();
+                    db.insert(key.as_slice(), value.as_slice()).expect("insert");
+                    let _ = ref_guard.insert(key, Some(value));
                 } else if op_kind < 85 {
-                    // Get. Snapshot the reference value at the time of
-                    // the read; the actual db value must be one of: the
-                    // reference's value, or `None` (if another thread
-                    // removed it between our reference read and our db
-                    // read). We don't strictly check this in-flight; the
-                    // post-join walk catches divergences.
+                    // Get. Read-only — no reference update needed.
                     let _ = db.get(key.as_slice()).expect("get");
                 } else {
-                    // Remove.
+                    // Remove. Same ordering invariant as insert: take
+                    // the reference lock first so the (db, reference)
+                    // pair is atomic.
+                    let mut ref_guard = reference.lock();
                     let _ = db.remove(key.as_slice()).expect("remove");
-                    reference.lock().insert(key, None);
+                    let _ = ref_guard.insert(key, None);
                 }
             }
         }));
@@ -206,8 +211,7 @@ fn concurrent_inserts_only_force_growth_then_read_back() {
                 let idx = base + i;
                 let key = key_at(idx);
                 let value = value_at(idx, tid as u32);
-                db.insert(key.as_slice(), value.as_slice())
-                    .expect("insert");
+                db.insert(key.as_slice(), value.as_slice()).expect("insert");
             }
         }));
     }
@@ -224,16 +228,14 @@ fn concurrent_inserts_only_force_growth_then_read_back() {
             let key = key_at(idx);
             let expected = value_at(idx, tid as u32);
             let actual = db.get(key.as_slice()).expect("get");
-            if actual.as_deref() != Some(expected.as_slice()) {
-                if missing.len() < 5 {
-                    missing.push(format!(
-                        "key idx {idx} (thread {tid}): expected {:?}, got {:?}",
-                        String::from_utf8_lossy(&expected),
-                        actual
-                            .as_ref()
-                            .map(|v| String::from_utf8_lossy(v).into_owned())
-                    ));
-                }
+            if actual.as_deref() != Some(expected.as_slice()) && missing.len() < 5 {
+                missing.push(format!(
+                    "key idx {idx} (thread {tid}): expected {:?}, got {:?}",
+                    String::from_utf8_lossy(&expected),
+                    actual
+                        .as_ref()
+                        .map(|v| String::from_utf8_lossy(v).into_owned())
+                ));
             }
         }
     }

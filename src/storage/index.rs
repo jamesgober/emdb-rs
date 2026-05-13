@@ -179,19 +179,31 @@ impl AtomicSlot {
         }
     }
 
-    /// Acquires the slot's write lock by flipping `seq` to odd via
-    /// CAS, applies the three field stores under `Relaxed`, then
-    /// releases by incrementing `seq` to the next even value. The
-    /// `Release` on the closing store pairs with `Acquire` on
-    /// readers' opening `seq` load to publish the field writes.
+    /// Unconditional write. Acquires the seqlock, stores the three
+    /// fields under `Relaxed`, releases. Used only by the growth-
+    /// migration path which holds the outer shard write-lock and is
+    /// therefore the sole writer; no concurrent writer races are
+    /// possible.
+    ///
+    /// **Do not call from the hot path.** Concurrent hot-path writers
+    /// race on the "is this slot available" check — use
+    /// [`Self::try_claim`] / [`Self::try_update`] / [`Self::try_tombstone`]
+    /// instead, which verify the slot's state under the seqlock and
+    /// abort if it changed between probe and acquire.
     #[inline]
-    fn write(&self, state: u8, hash: u64, offset: u64) {
-        // Acquire the write lock: spin until we observe even seq and
-        // succeed at the CAS to odd. Contention on the same slot is
-        // exceedingly rare (writers are sharded by hash mod 64; intra-
-        // shard, same-slot writes only happen for the same key or
-        // bucket-collisions on the same hash) so a simple CAS loop is
-        // appropriate.
+    fn write_unconditional(&self, state: u8, hash: u64, offset: u64) {
+        let original = self.acquire_seqlock();
+        self.state.store(state, Ordering::Relaxed);
+        self.hash.store(hash, Ordering::Relaxed);
+        self.offset.store(offset, Ordering::Relaxed);
+        self.release_seqlock(original);
+    }
+
+    /// Acquire the slot's seqlock via CAS-loop. Returns the previous
+    /// even-state seq value (caller passes it to
+    /// [`Self::release_seqlock`] for the matching release).
+    #[inline]
+    fn acquire_seqlock(&self) -> u64 {
         loop {
             let s = self.seq.load(Ordering::Acquire);
             if s & 1 == 0
@@ -200,21 +212,131 @@ impl AtomicSlot {
                     .compare_exchange_weak(s, s | 1, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
-                break;
+                return s;
             }
             spin_loop();
         }
-        // Bracketed by the seqlock — readers either see the pre-write
-        // state (s) or wait through the odd phase. No fence needed
-        // between the inner stores; the seqlock provides ordering.
-        self.state.store(state, Ordering::Relaxed);
+    }
+
+    /// Release the seqlock by bumping to the next even value. The
+    /// `Release` ordering publishes any field writes made under the
+    /// lock.
+    #[inline]
+    fn release_seqlock(&self, original_even: u64) {
+        self.seq
+            .store(original_even.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Attempt to claim a slot that the probe observed as
+    /// `expected_state` (typically `STATE_EMPTY` or
+    /// `STATE_TOMBSTONE`). Acquires the seqlock, re-checks the
+    /// state, and only writes if it still matches.
+    ///
+    /// Returns `true` on successful claim. Returns `false` when the
+    /// slot's state changed between the probe and the claim
+    /// (someone else wrote into it first); caller must restart the
+    /// probe.
+    ///
+    /// This is the load-bearing TOCTOU fix: the prior
+    /// unconditional `write` let two concurrent inserts to
+    /// different hashes that bucket to the same probe position
+    /// both observe `EMPTY`, both acquire the seqlock in sequence,
+    /// and the second one overwrite the first's entry. The
+    /// re-check under the lock catches this.
+    #[inline]
+    fn try_claim(&self, expected_state: u8, new_state: u8, hash: u64, offset: u64) -> bool {
+        let original = self.acquire_seqlock();
+        if self.state.load(Ordering::Relaxed) != expected_state {
+            self.release_seqlock(original);
+            return false;
+        }
+        self.state.store(new_state, Ordering::Relaxed);
         self.hash.store(hash, Ordering::Relaxed);
         self.offset.store(offset, Ordering::Relaxed);
-        // Close the seqlock window. Release ensures the inner stores
-        // are visible to readers that observe the new even seq value.
-        let s = self.seq.load(Ordering::Relaxed);
-        self.seq.store((s & !1).wrapping_add(2), Ordering::Release);
+        self.release_seqlock(original);
+        true
     }
+
+    /// Attempt to update an `Occupied` slot's offset in place,
+    /// verifying that the slot is still occupied with the expected
+    /// hash under the seqlock. Returns `Some(prev_offset)` on
+    /// success, `None` if the slot's state or hash changed between
+    /// probe and update (e.g., a concurrent thread tombstoned the
+    /// slot, or it migrated to overflow, or a 64-bit hash collision
+    /// arrived). Caller must restart the probe on `None`.
+    #[inline]
+    fn try_update(&self, expected_hash: u64, new_offset: u64) -> Option<u64> {
+        let original = self.acquire_seqlock();
+        if self.state.load(Ordering::Relaxed) != STATE_OCCUPIED
+            || self.hash.load(Ordering::Relaxed) != expected_hash
+        {
+            self.release_seqlock(original);
+            return None;
+        }
+        let prev = self.offset.load(Ordering::Relaxed);
+        self.offset.store(new_offset, Ordering::Relaxed);
+        self.release_seqlock(original);
+        Some(prev)
+    }
+
+    /// Attempt to tombstone an `Occupied` slot, verifying the
+    /// expected hash. Returns `Some(prev_offset)` on success,
+    /// `None` if the slot raced (state changed). Caller must
+    /// restart the probe on `None`.
+    #[inline]
+    fn try_tombstone(&self, expected_hash: u64) -> Option<u64> {
+        let original = self.acquire_seqlock();
+        if self.state.load(Ordering::Relaxed) != STATE_OCCUPIED
+            || self.hash.load(Ordering::Relaxed) != expected_hash
+        {
+            self.release_seqlock(original);
+            return None;
+        }
+        let prev = self.offset.load(Ordering::Relaxed);
+        self.state.store(STATE_TOMBSTONE, Ordering::Relaxed);
+        self.hash.store(0, Ordering::Relaxed);
+        self.offset.store(0, Ordering::Relaxed);
+        self.release_seqlock(original);
+        Some(prev)
+    }
+
+    /// Attempt to promote an `Occupied` slot to `Overflow`, verifying
+    /// the expected hash. The overflow map already holds the migrated
+    /// entries; this flips the primary-slot marker. Returns `true` on
+    /// success, `false` if the slot raced.
+    #[inline]
+    fn try_promote_to_overflow(&self, expected_hash: u64) -> bool {
+        let original = self.acquire_seqlock();
+        if self.state.load(Ordering::Relaxed) != STATE_OCCUPIED
+            || self.hash.load(Ordering::Relaxed) != expected_hash
+        {
+            self.release_seqlock(original);
+            return false;
+        }
+        self.state.store(STATE_OVERFLOW, Ordering::Relaxed);
+        // hash stays so the probe can still identify this bucket;
+        // offset is unused in Overflow state.
+        self.offset.store(0, Ordering::Relaxed);
+        self.release_seqlock(original);
+        true
+    }
+}
+
+/// Outcome of one attempt at a `replace` operation. Distinguishes
+/// "done" (return to caller) from "the table is full and needs to
+/// grow before another attempt" from "a concurrent writer raced us
+/// at the same slot and we should restart the probe." The retry
+/// loop in `Shard::replace` dispatches on this.
+enum ReplaceOutcome {
+    /// Operation complete. `Option<u64>` is the prior offset (or
+    /// `None` for a fresh insert).
+    Done(Option<u64>),
+    /// Table is at or over the growth threshold and has no usable
+    /// slot for this insert. Caller must grow and retry.
+    NeedGrow,
+    /// A concurrent writer modified the slot between our probe and
+    /// our claim/update. Caller must restart the probe.
+    Retry,
 }
 
 /// Per-shard interior. Held under `Shard::inner: RwLock<_>`; growth
@@ -316,6 +438,12 @@ impl Shard {
     /// Insert-or-replace. Returns the previous offset when this key
     /// was already present (offset updated in place); `None` when a
     /// fresh entry was inserted.
+    ///
+    /// The outer loop dispatches on the three [`ReplaceOutcome`]
+    /// values: `Done` returns to the caller, `NeedGrow` triggers a
+    /// shard rebuild and retries, `Retry` re-runs the probe against
+    /// the same table (a concurrent writer beat us to a slot we
+    /// observed as available, so the probe state is stale).
     fn replace<F>(
         &self,
         hash: u64,
@@ -326,27 +454,27 @@ impl Shard {
     where
         F: FnMut(u64) -> Result<Option<Vec<u8>>>,
     {
-        // Loop so growth can retry the probe without unwinding.
         loop {
-            if let Some(result) = self.replace_attempt(hash, key, offset, &mut resolve_existing)? {
-                return Ok(result);
+            match self.replace_attempt(hash, key, offset, &mut resolve_existing)? {
+                ReplaceOutcome::Done(prev) => return Ok(prev),
+                ReplaceOutcome::NeedGrow => self.grow(),
+                ReplaceOutcome::Retry => continue,
             }
-            // Growth needed. Acquire the write lock and rebuild.
-            self.grow();
         }
     }
 
-    /// Single attempt at `replace`. Returns `Ok(Some(prev))` on
-    /// success (where `prev` is the previous offset or `None` for a
-    /// fresh insert). Returns `Ok(None)` when the table is too full
-    /// to insert and the caller must grow before retrying.
+    /// Single attempt at `replace`. Probes the table starting at the
+    /// hash's home slot; uses verify-then-write slot operations
+    /// ([`AtomicSlot::try_claim`] / [`AtomicSlot::try_update`] /
+    /// [`AtomicSlot::try_promote_to_overflow`]) so concurrent
+    /// inserts to the same probe-bucket cannot stomp on each other.
     fn replace_attempt<F>(
         &self,
         hash: u64,
         key: &[u8],
         offset: u64,
         resolve_existing: &mut F,
-    ) -> Result<Option<Option<u64>>>
+    ) -> Result<ReplaceOutcome>
     where
         F: FnMut(u64) -> Result<Option<Vec<u8>>>,
     {
@@ -359,18 +487,25 @@ impl Shard {
             let snap = inner.table[idx].read();
             match snap.state {
                 STATE_EMPTY => {
-                    // Insert here (or at the first earlier tombstone if any).
-                    let target = first_reusable.unwrap_or(idx);
-                    inner.table[target].write(STATE_OCCUPIED, hash, offset);
-                    // Maintain occupancy counts. Both empty→occupied and
-                    // tombstone→occupied bump `occupied`; the
-                    // tombstone→occupied case also decrements
-                    // `tombstones`.
+                    // End of probe chain. Insert at the earliest
+                    // available slot (this empty one, or a
+                    // tombstone earlier in the chain) using
+                    // try_claim — verifies the slot's state
+                    // hasn't changed since the probe read.
+                    let (target, expected_state) = match first_reusable {
+                        Some(t) => (t, STATE_TOMBSTONE),
+                        None => (idx, STATE_EMPTY),
+                    };
+                    if !inner.table[target].try_claim(expected_state, STATE_OCCUPIED, hash, offset)
+                    {
+                        // Lost the claim race; restart the probe.
+                        return Ok(ReplaceOutcome::Retry);
+                    }
                     let _ = inner.occupied.fetch_add(1, Ordering::AcqRel);
-                    if first_reusable.is_some() {
+                    if expected_state == STATE_TOMBSTONE {
                         let _ = inner.tombstones.fetch_sub(1, Ordering::AcqRel);
                     }
-                    return Ok(Some(None));
+                    return Ok(ReplaceOutcome::Done(None));
                 }
                 STATE_TOMBSTONE => {
                     if first_reusable.is_none() {
@@ -379,28 +514,23 @@ impl Shard {
                     continue;
                 }
                 STATE_OCCUPIED if snap.hash == hash => {
-                    // Same hash, occupied. Resolver disambiguates whether
-                    // it's the same key (update in place) or a real
-                    // 64-bit-hash collision (move to overflow).
+                    // Same hash, occupied. Resolver disambiguates
+                    // whether it's the same key (update in place)
+                    // or a real 64-bit-hash collision (move to
+                    // overflow). Resolver runs OUTSIDE the slot
+                    // seqlock so user code can't stall a slot.
                     match resolve_existing(snap.offset)? {
                         Some(existing_key) if existing_key.as_slice() == key => {
-                            // Update offset in place. State stays
-                            // `Occupied`, hash stays the same. No
-                            // occupancy delta.
-                            inner.table[idx].write(STATE_OCCUPIED, hash, offset);
-                            return Ok(Some(Some(snap.offset)));
+                            match inner.table[idx].try_update(hash, offset) {
+                                Some(prev) => return Ok(ReplaceOutcome::Done(Some(prev))),
+                                None => return Ok(ReplaceOutcome::Retry),
+                            }
                         }
                         Some(existing_key) => {
                             // Real 64-bit collision. Migrate both
-                            // into overflow, then re-acquire the
-                            // shard read-lock and flip the primary
+                            // into overflow, then flip the primary
                             // slot to STATE_OVERFLOW so subsequent
-                            // gets consult the overflow map. We drop
-                            // the inner read-lock before taking the
-                            // overflow mutex to keep a consistent
-                            // lock-ordering convention across the
-                            // module (inner → overflow, never held
-                            // simultaneously).
+                            // gets consult the overflow map.
                             let existing_offset = snap.offset;
                             drop(inner);
                             {
@@ -409,46 +539,42 @@ impl Shard {
                                 entries.push((existing_key, existing_offset));
                                 entries.push((key.to_vec(), offset));
                             }
+                            // Re-acquire the read-lock and flip the
+                            // marker. If the slot raced (e.g., a
+                            // concurrent tombstone), the overflow
+                            // map still has our entries; the next
+                            // probe-and-write of this hash will
+                            // discover them.
                             let inner = self.inner.read();
                             for step2 in 0..inner.capacity {
                                 let idx2 = inner.probe_index(hash, step2);
                                 let snap2 = inner.table[idx2].read();
                                 if snap2.state == STATE_OCCUPIED && snap2.hash == hash {
-                                    inner.table[idx2].write(STATE_OVERFLOW, hash, 0);
-                                    return Ok(Some(None));
+                                    let _ = inner.table[idx2].try_promote_to_overflow(hash);
+                                    break;
                                 }
                                 if snap2.state == STATE_EMPTY {
                                     break;
                                 }
                             }
-                            // If we didn't find the matching slot
-                            // (table grew between drops), overflow
-                            // lookups still work via the marker we
-                            // would have set on a subsequent access.
-                            // The primary slot stays as
-                            // STATE_OCCUPIED with the existing
-                            // offset; concurrent get() for the
-                            // existing key returns the correct
-                            // offset, and a get() for the new key
-                            // returns None until the resolver path
-                            // promotes it. This is a benign edge
-                            // case under the pause-the-world growth
-                            // protocol.
-                            return Ok(Some(None));
+                            return Ok(ReplaceOutcome::Done(None));
                         }
                         None => {
-                            // Resolver couldn't recover the existing
-                            // key (record gone). Treat as stale; just
-                            // overwrite.
-                            inner.table[idx].write(STATE_OCCUPIED, hash, offset);
-                            return Ok(Some(Some(snap.offset)));
+                            // Resolver couldn't recover the
+                            // existing key (record gone — possibly
+                            // mid-compaction or stale offset). Just
+                            // overwrite the offset.
+                            match inner.table[idx].try_update(hash, offset) {
+                                Some(prev) => return Ok(ReplaceOutcome::Done(Some(prev))),
+                                None => return Ok(ReplaceOutcome::Retry),
+                            }
                         }
                     }
                 }
                 STATE_OCCUPIED => continue,
                 STATE_OVERFLOW if snap.hash == hash => {
-                    // Hash is already in overflow. Add or update this
-                    // key there. No primary-table modification.
+                    // Hash is already in overflow. Add or update
+                    // this key in the overflow map.
                     drop(inner);
                     let mut overflow = self.overflow.lock();
                     let entries = overflow.entry(hash).or_default();
@@ -456,109 +582,104 @@ impl Shard {
                         if entry.0.as_slice() == key {
                             let prev = entry.1;
                             entry.1 = offset;
-                            return Ok(Some(Some(prev)));
+                            return Ok(ReplaceOutcome::Done(Some(prev)));
                         }
                     }
                     entries.push((key.to_vec(), offset));
-                    return Ok(Some(None));
+                    return Ok(ReplaceOutcome::Done(None));
                 }
                 STATE_OVERFLOW => continue,
                 _ => continue,
             }
         }
-        // Full probe loop with no terminator. If a tombstone was
-        // seen mid-chain AND the table isn't over the growth
-        // threshold, reuse the tombstone. Otherwise signal growth
-        // by returning `Ok(None)`.
+        // Probe loop walked the whole table without finding a
+        // terminator. If we saw a tombstone we can reclaim AND
+        // we're not over the growth threshold, try the claim.
+        // Otherwise signal growth.
         match first_reusable {
             Some(target) if !inner.over_load_factor() => {
-                inner.table[target].write(STATE_OCCUPIED, hash, offset);
+                if !inner.table[target].try_claim(STATE_TOMBSTONE, STATE_OCCUPIED, hash, offset) {
+                    return Ok(ReplaceOutcome::Retry);
+                }
                 let _ = inner.occupied.fetch_add(1, Ordering::AcqRel);
                 let _ = inner.tombstones.fetch_sub(1, Ordering::AcqRel);
-                Ok(Some(None))
+                Ok(ReplaceOutcome::Done(None))
             }
             _ => {
                 drop(inner);
-                Ok(None)
+                Ok(ReplaceOutcome::NeedGrow)
             }
         }
     }
 
     /// Remove a key. Returns the previous offset if any.
+    ///
+    /// Uses verify-then-tombstone semantics
+    /// ([`AtomicSlot::try_tombstone`]) — if the slot's state or
+    /// hash changed between our probe and our tombstone attempt,
+    /// the probe restarts. This catches concurrent inserts /
+    /// removes / collisions on the same probe-bucket.
+    ///
+    /// For entries in the overflow map (real 64-bit hash
+    /// collisions, astronomically rare), the primary slot's
+    /// `STATE_OVERFLOW` marker is **not** demoted when the overflow
+    /// drains to zero or one entry. This is intentional: the
+    /// demote-on-drain races with concurrent inserts that may be
+    /// adding new entries to the same overflow bucket, and the cost
+    /// of leaving the marker is one permanently-consumed slot per
+    /// real hash collision (negligible — collisions are 1 in 2⁶⁴).
     fn remove(&self, hash: u64, key: &[u8]) -> Option<u64> {
-        let inner = self.inner.read();
-        for step in 0..inner.capacity {
-            let idx = inner.probe_index(hash, step);
-            let snap = inner.table[idx].read();
-            match snap.state {
-                STATE_EMPTY => return None,
-                STATE_OCCUPIED if snap.hash == hash => {
-                    let prev = snap.offset;
-                    inner.table[idx].write(STATE_TOMBSTONE, 0, 0);
-                    let _ = inner.occupied.fetch_sub(1, Ordering::AcqRel);
-                    let _ = inner.tombstones.fetch_add(1, Ordering::AcqRel);
-                    return Some(prev);
-                }
-                STATE_OVERFLOW if snap.hash == hash => {
-                    drop(inner);
-                    let mut overflow = self.overflow.lock();
-                    let mut matched: Option<u64> = None;
-                    if let Some(entries) = overflow.get_mut(&hash) {
-                        let mut take = None;
-                        for (i, (k, off)) in entries.iter().enumerate() {
-                            if k.as_slice() == key {
-                                take = Some((i, *off));
+        loop {
+            let inner = self.inner.read();
+            let mut raced = false;
+            for step in 0..inner.capacity {
+                let idx = inner.probe_index(hash, step);
+                let snap = inner.table[idx].read();
+                match snap.state {
+                    STATE_EMPTY => return None,
+                    STATE_OCCUPIED if snap.hash == hash => {
+                        match inner.table[idx].try_tombstone(hash) {
+                            Some(prev) => {
+                                let _ = inner.occupied.fetch_sub(1, Ordering::AcqRel);
+                                let _ = inner.tombstones.fetch_add(1, Ordering::AcqRel);
+                                return Some(prev);
+                            }
+                            None => {
+                                // Slot raced (concurrent replace /
+                                // collision-promote / etc.). Restart
+                                // the probe.
+                                raced = true;
                                 break;
                             }
                         }
-                        if let Some((i, off)) = take {
-                            let _ = entries.remove(i);
-                            matched = Some(off);
-                        }
-                        // Collapse the overflow entry back into the
-                        // primary slot if only one key remains. Walk
-                        // the probe chain and demote the marker.
-                        if entries.len() == 1 {
-                            let (last_key, last_off) = entries[0].clone();
-                            let _ = overflow.remove(&hash);
-                            drop(overflow);
-                            let inner = self.inner.read();
-                            for step2 in 0..inner.capacity {
-                                let idx2 = inner.probe_index(hash, step2);
-                                let snap2 = inner.table[idx2].read();
-                                if snap2.state == STATE_OVERFLOW && snap2.hash == hash {
-                                    inner.table[idx2].write(STATE_OCCUPIED, hash, last_off);
-                                    break;
-                                }
-                                if snap2.state == STATE_EMPTY {
-                                    break;
-                                }
-                            }
-                            let _ = last_key; // keep key alive; demotion uses only offset
-                        } else if entries.is_empty() {
-                            let _ = overflow.remove(&hash);
-                            drop(overflow);
-                            let inner = self.inner.read();
-                            for step2 in 0..inner.capacity {
-                                let idx2 = inner.probe_index(hash, step2);
-                                let snap2 = inner.table[idx2].read();
-                                if snap2.state == STATE_OVERFLOW && snap2.hash == hash {
-                                    inner.table[idx2].write(STATE_TOMBSTONE, 0, 0);
-                                    let _ = inner.tombstones.fetch_add(1, Ordering::AcqRel);
-                                    break;
-                                }
-                                if snap2.state == STATE_EMPTY {
-                                    break;
-                                }
-                            }
-                        }
                     }
-                    return matched;
+                    STATE_OVERFLOW if snap.hash == hash => {
+                        drop(inner);
+                        let mut overflow = self.overflow.lock();
+                        let mut matched: Option<u64> = None;
+                        if let Some(entries) = overflow.get_mut(&hash) {
+                            let mut take = None;
+                            for (i, (k, off)) in entries.iter().enumerate() {
+                                if k.as_slice() == key {
+                                    take = Some((i, *off));
+                                    break;
+                                }
+                            }
+                            if let Some((i, off)) = take {
+                                let _ = entries.remove(i);
+                                matched = Some(off);
+                            }
+                        }
+                        return matched;
+                    }
+                    _ => continue,
                 }
-                _ => continue,
             }
+            if !raced {
+                return None;
+            }
+            // Fell through due to a race — restart probe.
         }
-        None
     }
 
     /// Total live entry count for this shard.
@@ -580,11 +701,13 @@ impl Shard {
         primary + overflow_total.saturating_sub(overflow_hashes)
     }
 
-    /// Drop every entry.
+    /// Drop every entry. Holds the outer write-lock so no concurrent
+    /// ops can race the clear; we can use the unconditional slot
+    /// write path.
     fn clear(&self) {
         let inner = self.inner.write();
         for slot in inner.table.iter() {
-            slot.write(STATE_EMPTY, 0, 0);
+            slot.write_unconditional(STATE_EMPTY, 0, 0);
         }
         inner.occupied.store(0, Ordering::Release);
         inner.tombstones.store(0, Ordering::Release);
@@ -638,19 +761,17 @@ impl Shard {
 }
 
 /// Insert a known-unique `(hash, offset)` pair into a freshly-allocated
-/// table during growth. The table is private to the calling shard so
-/// there are no concurrent operations; we do not need the seqlock-write
-/// path's CAS — direct stores under the slot's atomics work, and we
-/// still go through `AtomicSlot::write` so the seqlock contract holds
-/// for any reader that races a peek (none should during growth, but
-/// the cost is negligible).
+/// table during growth. The table is private to the calling shard
+/// (the shard's outer write-lock is held by the migrator) so no
+/// concurrent operations can race; we use the unconditional slot
+/// write path.
 fn insert_into_fresh_table(inner: &ShardInner, state: u8, hash: u64, offset: u64) {
     for step in 0..inner.capacity {
         let idx = inner.probe_index(hash, step);
-        let slot = &inner.table[step_to_actual(inner, idx)];
+        let slot = &inner.table[idx];
         let snap = slot.read();
         if snap.state == STATE_EMPTY {
-            slot.write(state, hash, offset);
+            slot.write_unconditional(state, hash, offset);
             let _ = inner.occupied.fetch_add(1, Ordering::AcqRel);
             return;
         }
@@ -659,11 +780,6 @@ fn insert_into_fresh_table(inner: &ShardInner, state: u8, hash: u64, offset: u64
     // half-full after migration. A probe sequence longer than the table
     // means a logic bug.
     debug_assert!(false, "insert_into_fresh_table: probe overflowed");
-}
-
-#[inline]
-fn step_to_actual(_inner: &ShardInner, idx: usize) -> usize {
-    idx
 }
 
 /// Sharded index. One per namespace. Public surface unchanged from
