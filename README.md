@@ -150,7 +150,7 @@ tuning notes.
 
 ## Status
 
-**v0.9.4.** Pre-1.0; the 0.9.x line is API-stable and on-disk-
+**v0.9.5.** Pre-1.0; the 0.9.x line is API-stable and on-disk-
 format-stable. The storage substrate is a
 [`fsys`](https://crates.io/crates/fsys) journal — lock-free LSN
 reservation, group-commit fsync, NVMe passthrough flush,
@@ -166,14 +166,17 @@ table of seqlock-protected slots (64 shards, ~8–12 ns
 uncontended `get`). Every `std::sync` lock on the hot path is
 now `parking_lot` (v0.9.2); the optional sorted secondary
 index is a lock-free `crossbeam_skiplist::SkipMap` (v0.9.2).
-New opt-in `EmdbBuilder::iouring_sqpoll(idle_ms)` (v0.9.2)
-exposes Linux io_uring kernel-side SQPOLL polling.
+Opt-in `EmdbBuilder::iouring_sqpoll(idle_ms)` (v0.9.2) exposes
+Linux io_uring kernel-side SQPOLL polling. **v0.9.5 adds the
+opt-in `async` feature** with `AsyncEmdb` / `AsyncNamespace` /
+`EmdbBuilder::build_async` wrappers routed through
+`tokio::task::spawn_blocking`.
 
-> **v0.9.3 users:** upgrade to v0.9.4. v0.9.3 shipped with a
-> TOCTOU race in the new primary index that could cause silent
-> data loss under concurrent inserts hashing to the same probe
-> bucket. v0.9.4 fixes it. The on-disk journal is unaffected;
-> a clean restart rebuilds a correct in-memory index.
+> **v0.9.3 users:** upgrade to v0.9.4 or later. v0.9.3 shipped
+> with a TOCTOU race in the new primary index that could cause
+> silent data loss under concurrent inserts hashing to the same
+> probe bucket. v0.9.4 fixes it. The on-disk journal is
+> unaffected; a clean restart rebuilds a correct in-memory index.
 
 The API surface from v0.8.5 carries over: optional at-rest
 encryption (AES-256-GCM or ChaCha20-Poly1305, raw key or
@@ -189,8 +192,8 @@ Pre-1.0. The remaining work before v1.0:
 - 5 M end-to-end bench re-capture on bare-metal Linux +
   Windows NVMe (full Criterion sample counts).
 - Lock-free index migration (arc-swap + dual-write protocol).
-- Async surface over fsys's io_uring path behind an opt-in
-  feature.
+- Streaming async iterators (`impl Stream`) on top of the
+  v0.9.5 `AsyncEmdb` surface.
 - Automated migration tool for v0.7 / v0.8 → v0.9 databases.
 - `docs/STABILITY-1.0.md` SemVer commitment doc.
 
@@ -200,10 +203,10 @@ No further architectural changes are planned before 1.0.
 
 ```toml
 [dependencies]
-emdb = "0.9.4"
+emdb = "0.9.5"
 
 # All optional features
-emdb = { version = "0.9.4", features = ["ttl", "nested", "encrypt"] }
+emdb = { version = "0.9.5", features = ["ttl", "nested", "encrypt"] }
 ```
 
 MSRV: Rust 1.75.

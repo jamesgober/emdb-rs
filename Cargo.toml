@@ -1,6 +1,6 @@
 [package]
 name = "emdb"
-version = "0.9.4"
+version = "0.9.5"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -84,10 +84,22 @@ redb = { version = "2.1", optional = true }
 redis = { version = "0.27", optional = true }
 sled = { version = "0.34", optional = true }
 rocksdb = { version = "0.22", optional = true }
+# Tokio runtime — gated behind the `async` feature flag. The async
+# surface (`AsyncEmdb`, `AsyncNamespace`, `EmdbBuilder::build_async`)
+# routes every blocking emdb call through `tokio::task::spawn_blocking`
+# so the runtime's async tasks never block on emdb's sync I/O.
+# Feature set: `rt` + `rt-multi-thread` for `spawn_blocking`,
+# `macros` for `#[tokio::test]`. We deliberately do NOT pull in
+# `fs` — emdb's I/O goes through fsys, not tokio::fs.
+tokio = { version = "1", optional = true, default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }
 fastrand = "2"
+# Async tests need a full tokio runtime under #[tokio::test]. Pulled
+# in unconditionally for dev so the async integration tests can
+# compile under any feature set that enables `async`.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time"] }
 
 [features]
 default = ["ttl"]
@@ -97,6 +109,12 @@ nested = []
 # Argon2id-derived passphrase. Activates the
 # `EmdbBuilder::encryption_key`/`encryption_passphrase` APIs.
 encrypt = ["dep:aes-gcm", "dep:rand_core", "dep:argon2", "dep:chacha20poly1305", "dep:zeroize"]
+# Async surface — `AsyncEmdb` / `AsyncNamespace` plus
+# `EmdbBuilder::build_async`. Wraps the sync API in
+# `tokio::task::spawn_blocking` so async runtimes don't stall on
+# emdb's blocking I/O. Opt-in: programs that don't use async pay no
+# tokio dep cost.
+async = ["dep:tokio"]
 bench-compare = ["dep:redb", "dep:sled"]
 bench-redis = ["dep:redis"]
 bench-rocksdb = ["dep:rocksdb"]
