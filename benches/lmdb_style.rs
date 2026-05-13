@@ -211,8 +211,7 @@ fn bench_emdb(elements: usize) -> Vec<PhaseResult> {
             let (key, value) = random_pair(&mut rng);
             chunk.push((key.to_vec(), value));
         }
-        db.insert_many(chunk)
-            .expect("emdb batch insert");
+        db.insert_many(chunk).expect("emdb batch insert");
         db.flush().expect("emdb batch flush");
     }
     results.push(PhaseResult::duration("batch writes", start.elapsed()));
