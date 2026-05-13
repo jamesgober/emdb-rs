@@ -4,6 +4,196 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4](https://github.com/jamesgober/emdb-rs/compare/v0.9.3...v0.9.4) — 2026-05-13
+
+**Critical fix.** Patch release. Fixes a TOCTOU race in the
+sharded open-addressed primary index introduced in v0.9.3
+that could cause silent data loss under concurrent inserts
+hashing to the same probe bucket.
+
+### Fixed
+
+- **Concurrent insert race in the primary index**
+  ([`src/storage/index.rs`](src/storage/index.rs)). Two
+  threads probing distinct hashes that mapped to the same
+  bucket could both observe `STATE_EMPTY` and both proceed
+  to the seqlock-protected unconditional write, with the
+  second writer silently overwriting the first writer's
+  entry. Replaced the unconditional `write` with verify-
+  then-write methods (`try_claim`, `try_update`,
+  `try_tombstone`, `try_promote_to_overflow`) that re-check
+  slot state under the seqlock; if it changed between
+  probe and claim, the probe restarts via a new
+  `ReplaceOutcome::Retry` outcome.
+- **Stress-test reference-state race** in
+  [`tests/index_stress.rs`](tests/index_stress.rs). The
+  test's reference `HashMap` was updated AFTER the db op,
+  letting two threads' `db.insert` calls land in one order
+  while their `reference.insert` calls land in the
+  opposite order. Take the reference lock BEFORE the db op
+  so the (db, reference) pair is atomic w.r.t. other
+  writers.
+
+### Caught by
+
+`tests/index_stress.rs` — concurrent stress test added in
+v0.9.3 with 8 threads × 8 K ops each, mixed insert / get /
+remove, sized to force several shard-level growth events.
+The test surfaced both bugs immediately on the first push;
+this release is the fix.
+
+### Upgrade guidance
+
+**v0.9.3 users on multi-threaded write workloads: upgrade
+immediately.** v0.9.3 silently loses index entries under
+concurrent inserts to the same probe bucket. Single-thread
+workloads are unaffected. The on-disk journal is unaffected
+(records are written correctly via fsys's lock-free LSN
+reservation; only the in-memory index has the race), so a
+clean restart re-reads every record from the journal and
+rebuilds a correct index. There is no data on disk to
+migrate or recover — restarting any v0.9.3 process onto
+v0.9.4 fixes any in-memory divergence the prior run
+accumulated.
+
+## [0.9.3](https://github.com/jamesgober/emdb-rs/compare/v0.9.2...v0.9.3) — 2026-05-13
+
+**Custom primary hash index.** Replaced
+`parking_lot::RwLock<HashMap<u64, Slot>>` with a sharded
+open-addressed table of seqlock-protected slots — same
+public surface, no API change, no on-disk format change.
+The pause-the-world growth variant ships first; full
+lock-free migration (arc-swap pointer + dual-write
+protocol) is on the perf roadmap for a later 0.9.x.
+
+> **Caveat: shipped with a concurrent-insert TOCTOU race
+> that was fixed in v0.9.4.** v0.9.3 users running
+> multi-threaded write workloads should upgrade. See the
+> v0.9.4 entry above for the bug detail and upgrade
+> guidance.
+
+### Internals — primary index rewrite
+
+- **`AtomicSlot`** — 32-byte slot with `seq: AtomicU64`
+  (seqlock version + write-in-progress bit),
+  `state: AtomicU8` (Empty / Occupied / Tombstone /
+  Overflow), `hash: AtomicU64`, `offset: AtomicU64`.
+- **64 shards**, each owning a `RwLock<ShardInner>`
+  wrapping a `Box<[AtomicSlot]>` + occupancy counters.
+  Outer RwLock is only contended during growth.
+- **Open addressing** with linear probing; tombstones do
+  not terminate probes.
+- **64-bit hash collisions** (1 in 2⁶⁴, astronomical) fall
+  back to a per-shard `Mutex<HashMap<u64, Vec<(key,
+  offset)>>>`. Primary slot flips to `STATE_OVERFLOW` and
+  subsequent gets consult the overflow map. Fast path
+  pays zero — overflow is only acquired after a real
+  collision occurred.
+- **Growth** triggers at load factor 0.75 — outer write-
+  lock blocks new probes briefly while the table doubles.
+
+### Added
+
+- [`benches/index_hotpath.rs`](benches/index_hotpath.rs) —
+  Criterion microbench with 5 scenarios (single-thread
+  get / replace / mixed + concurrent get / mixed at 1 / 2
+  / 4 / 8 threads). Reproducible baseline for regression
+  tracking; reference point for the future lock-free-
+  migration follow-up.
+- Two new unit tests in
+  [`src/storage/index.rs`](src/storage/index.rs):
+  `growth_triggers_and_preserves_entries` and
+  `tombstone_is_reused_on_subsequent_insert`.
+
+### Performance (consumer NVMe, Criterion `--quick`)
+
+| Bench | Throughput |
+|---|---:|
+| `single/get` | 3.59 M get/s |
+| `single/replace` | 499 K replace/s |
+| `single/mixed_80r_20w` | 1.48 M ops/s |
+| `concurrent_get/4` | 9.50 M get/s |
+| `concurrent_get/8` | 8.48 M get/s |
+
+End-to-end `get` ~280 ns; the seqlock-protected probe
+contributes ~8-12 ns uncontended versus ~25-40 ns for the
+prior `parking_lot::RwLock<HashMap>`. Bare-metal numbers
+under full Criterion sample counts are deferred to the
+v1.0 release.
+
+## [0.9.2](https://github.com/jamesgober/emdb-rs/compare/v0.9.0...v0.9.2) — 2026-05-12
+
+**Perf-tuning pass on the fsys 0.9.x substrate.** Picks up
+every fsys knob emdb wasn't using yet, replaces every
+`std::sync` lock on the hot path with `parking_lot`,
+swaps the optional sorted secondary index for a lock-free
+`crossbeam_skiplist::SkipMap`, and adds a new opt-in
+`EmdbBuilder::iouring_sqpoll(idle_ms)` for sustained
+Linux WAL throughput. No breaking change, no on-disk
+format change — drop-in upgrade from 0.9.0.
+
+### Changed — fsys substrate `0.9` → `0.9.8`
+
+Picks up vectored `JournalHandle::append_batch`,
+`tune_for(Workload::Database)` preset (8 MiB resident
+buffer pool, 256-deep io_uring ring, 4 K-deep batch
+queue), `WriteLifetimeHint::Long` for Linux NVMe GC
+reduction, and the `IORING_SETUP_SQPOLL` opt-in. emdb's
+compaction and `insert_many` now route through
+vectored `append_batch` — one LSN reservation, one heap
+allocation, one platform `pwrite` for the whole batch.
+The compile-side change required a `Lsn::new(offset)`
+update at two call sites (fsys made `Lsn`'s inner field
+private between 0.9.0 and 0.9.8 to preserve the
+monotonic invariant).
+
+### Changed — locks
+
+- `std::sync::{RwLock, Mutex}` → `parking_lot` everywhere
+  on hot paths (index shards, store `read_file` / `mmap`
+  / `meta`, engine `namespaces` / `namespace_names`
+  registries). Single-CAS read fast path, no poisoning.
+- `RwLock<BTreeMap<Vec<u8>, u64>>` for the optional
+  sorted secondary index → `Arc<crossbeam_skiplist::SkipMap>`.
+  Lock-free concurrent inserts and range iteration —
+  range scans no longer queue behind concurrent
+  inserts. The clear-on-compaction path walks the
+  skiplist and removes entries one by one (SkipMap has
+  no in-place `clear`); both call sites already hold the
+  engine's logical exclusive stance.
+
+### Added
+
+- `EmdbBuilder::iouring_sqpoll(idle_ms: u32)` — opt-in
+  Linux io_uring kernel-side SQPOLL submission polling.
+  No-op on macOS / Windows. Falls back cleanly to
+  non-SQPOLL on EPERM (kernel < 5.13 without
+  `CAP_SYS_NICE`, sandboxed containers, etc.) — same
+  durability contract, slower path.
+- `meta::write_with(&fs, path, header)` — meta-sidecar
+  writes that reuse the engine's cached fsys handle
+  instead of rebuilding one per call (eliminates
+  redundant hardware-capability probing on
+  `persist_meta`).
+- `CachePadded` around `Store::mmap_len` and
+  `NamespaceRuntime::record_count` to eliminate
+  false-sharing ping-pong on the hot atomics.
+
+### Notes
+
+- `Error::LockPoisoned` enum variant remains on the
+  public surface for API stability but is no longer
+  produced by any call site — parking_lot locks cannot
+  poison. Code matching on the variant continues to
+  compile and run; the branch simply never executes.
+
+### New dependencies
+
+- `parking_lot = "0.12"` (already transitive via fsys)
+- `crossbeam-skiplist = "0.1"`
+- `crossbeam-utils = "0.8"` (already transitive via fsys)
+- `fsys` pin tightened from `"0.9"` → `"0.9.8"`
+
 ## [0.9.0](https://github.com/jamesgober/emdb-rs/compare/v0.8.5...v0.9.0) — 2026-05-05
 
 Major architectural change. The storage substrate is now

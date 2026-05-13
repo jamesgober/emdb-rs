@@ -147,15 +147,30 @@ tuning notes.
 
 ## Status
 
-**v0.9.0.** Major architectural change from v0.8.5 — the storage
-substrate is now a [`fsys`](https://crates.io/crates/fsys) journal
-(lock-free LSN reservation, group-commit fsync, NVMe passthrough
-flush, io_uring on Linux). emdb's read path keeps its own
-`Arc<Mmap>` over the journal file for zero-copy lookups; the
-write path delegates entirely to fsys. Existing v0.7 / v0.8.x
-file formats are not compatible — v0.9 uses fsys's frame format
-on the data file and a new `<path>.meta` sidecar for emdb's
-metadata.
+**v0.9.4.** Pre-1.0; the 0.9.x line is API-stable and on-disk-
+format-stable. The storage substrate is a
+[`fsys`](https://crates.io/crates/fsys) journal — lock-free LSN
+reservation, group-commit fsync, NVMe passthrough flush,
+io_uring on Linux — with `tune_for(Workload::Database)` preset
+applied, `WriteLifetimeHint::Long` on the journal, and vectored
+`append_batch` routing for `insert_many` / transactions /
+compaction. emdb's read path keeps its own `Arc<Mmap>` over the
+journal file for zero-copy lookups; the write path delegates
+entirely to fsys.
+
+The in-memory index since v0.9.3 is a sharded open-addressed
+table of seqlock-protected slots (64 shards, ~8–12 ns
+uncontended `get`). Every `std::sync` lock on the hot path is
+now `parking_lot` (v0.9.2); the optional sorted secondary
+index is a lock-free `crossbeam_skiplist::SkipMap` (v0.9.2).
+New opt-in `EmdbBuilder::iouring_sqpoll(idle_ms)` (v0.9.2)
+exposes Linux io_uring kernel-side SQPOLL polling.
+
+> **v0.9.3 users:** upgrade to v0.9.4. v0.9.3 shipped with a
+> TOCTOU race in the new primary index that could cause silent
+> data loss under concurrent inserts hashing to the same probe
+> bucket. v0.9.4 fixes it. The on-disk journal is unaffected;
+> a clean restart rebuilds a correct in-memory index.
 
 The API surface from v0.8.5 carries over: optional at-rest
 encryption (AES-256-GCM or ChaCha20-Poly1305, raw key or
@@ -166,20 +181,26 @@ variants (`OnEachFlush`, `Group`, `WriteThrough`); streaming
 zero-copy `get_zerocopy`; atomic `backup_to(path)`; point-in-time
 `stats()`; stale-lockfile recovery (`lock_holder` + `break_lock`).
 
-Pre-1.0. The remaining work before v1.0 is API stabilisation:
-an audit pass for `pub` vs `pub(crate)`, a `cargo-fuzz` target
-for the record decoder, and a `docs/stability.md` SemVer
-commitment. No further architectural changes are planned before
-1.0.
+Pre-1.0. The remaining work before v1.0:
+
+- 5 M end-to-end bench re-capture on bare-metal Linux +
+  Windows NVMe (full Criterion sample counts).
+- Lock-free index migration (arc-swap + dual-write protocol).
+- Async surface over fsys's io_uring path behind an opt-in
+  feature.
+- Automated migration tool for v0.7 / v0.8 → v0.9 databases.
+- `docs/STABILITY-1.0.md` SemVer commitment doc.
+
+No further architectural changes are planned before 1.0.
 
 ## Installation
 
 ```toml
 [dependencies]
-emdb = "0.9.0"
+emdb = "0.9.4"
 
 # All optional features
-emdb = { version = "0.9.0", features = ["ttl", "nested", "encrypt"] }
+emdb = { version = "0.9.4", features = ["ttl", "nested", "encrypt"] }
 ```
 
 MSRV: Rust 1.75.
