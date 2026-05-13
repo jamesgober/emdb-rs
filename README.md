@@ -1,4 +1,6 @@
 <h1 align="center">
+    <img width="99" alt="Rust logo" src="https://raw.githubusercontent.com/jamesgober/rust-collection/72baabd71f00e14aa9184efcb16fa3deddda3a0a/assets/rust-logo.svg">
+    <br>
     <strong>emdb</strong>
     <br>
     <sup><sub>EMBEDDED DATABASE FOR RUST</sub></sup>
@@ -8,6 +10,7 @@
     <a href="https://crates.io/crates/emdb"><img alt="crates.io" src="https://img.shields.io/crates/v/emdb.svg"></a>
     <a href="https://crates.io/crates/emdb" alt="Download emdb"><img alt="Crates.io Downloads" src="https://img.shields.io/crates/d/emdb?color=%230099ff"></a>
     <a href="https://docs.rs/emdb"><img alt="docs.rs" src="https://docs.rs/emdb/badge.svg"></a>
+    <img alt="MSRV" src="https://img.shields.io/badge/MSRV-1.75%2B-blue.svg?style=flat-square" title="Rust Version">
     <a href="https://github.com/jamesgober/emdb-rs/actions"><img alt="CI" src="https://github.com/jamesgober/emdb-rs/actions/workflows/ci.yml/badge.svg"></a>
 </p>
 
@@ -625,6 +628,14 @@ Full bench workflow and tuning notes: [docs/BENCH.md](docs/BENCH.md).
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](./LICENSE).
+Licensed under the [Apache License, Version 2.0](./LICENSE)
 
-Copyright &copy; 2026 James Gober.
+
+
+<!-- COPYRIGHT
+---------------------------------->
+<div align="center">
+  <br>
+  <h2></h2>
+  Copyright &copy; 2026 James Gober.
+</div>
