@@ -171,10 +171,9 @@
 //! ## Async surface
 //!
 //! Opt-in via the `async` feature. Wraps the sync API in
-//! [`tokio::task::spawn_blocking`] so blocking I/O never stalls the
-//! async-task scheduler. Exposes [`AsyncEmdb`] and
-//! [`AsyncNamespace`], plus [`EmdbBuilder::build_async`] for the
-//! builder path.
+//! `tokio::task::spawn_blocking` so blocking I/O never stalls the
+//! async-task scheduler. Exposes `AsyncEmdb` and `AsyncNamespace`,
+//! plus `EmdbBuilder::build_async` for the builder path.
 //!
 //! ```ignore
 //! # // gated behind `async` feature
@@ -202,7 +201,7 @@
 //! them by value. For latency-sensitive workloads where the
 //! spawn dispatch overhead exceeds the sync cost (e.g. tight
 //! `get` loops on a hot in-memory key), reach for the sync
-//! handle via [`AsyncEmdb::sync_handle`] and batch via
+//! handle via `AsyncEmdb::sync_handle` and batch via
 //! `insert_many` / `range`.
 //!
 //! ## Cargo features
@@ -211,7 +210,7 @@
 //! - `nested` — dotted-prefix group operations and `Focus` handles.
 //! - `encrypt` — AES-256-GCM + ChaCha20-Poly1305 at-rest encryption
 //!   with raw-key or Argon2id-derived passphrase.
-//! - `async` — [`AsyncEmdb`] / [`AsyncNamespace`] wrappers via
+//! - `async` — `AsyncEmdb` / `AsyncNamespace` wrappers via
 //!   tokio's `spawn_blocking`. Pulls in `tokio` with `rt` +
 //!   `rt-multi-thread` + `macros`.
 //! - `bench-compare`, `bench-rocksdb`, `bench-redis` — comparative

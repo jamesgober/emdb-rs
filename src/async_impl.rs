@@ -97,8 +97,18 @@ where
 /// through `tokio::task::spawn_blocking` so emdb's blocking I/O
 /// never stalls the async-task scheduler.
 ///
-/// See the [module docs](self) for the cost model and the
-/// streaming-iterator caveat.
+/// **Cost model:** each call dispatches one `spawn_blocking` task
+/// (sub-microsecond on a warm pool) and clones key + value bytes
+/// to owned `Vec<u8>` so the closure can take them by value. For
+/// workloads where this overhead matters more than the underlying
+/// I/O cost, reach for the sync handle via
+/// [`AsyncEmdb::sync_handle`].
+///
+/// **Iterators:** the sync API's lazy iterators (`iter`, `keys`,
+/// `range_iter`, etc.) are materialised into owned `Vec`s before
+/// returning from the async surface. Streaming via `impl Stream` is
+/// a follow-up; today, large iterations should drive the sync
+/// iterator inside a single `spawn_blocking` via `sync_handle()`.
 #[derive(Clone, Debug)]
 pub struct AsyncEmdb {
     inner: Arc<Emdb>,
