@@ -156,8 +156,9 @@ Notes:
   1.06× faster than sled.**
 - `random range reads` is N/A because the bench runs in hash-
   only mode. Set `EmdbBuilder::enable_range_scans(true)` to
-  enable the opt-in BTreeMap secondary index, then use
-  `range_iter` / `range_prefix_iter` for streaming consumption.
+  enable the opt-in lock-free `SkipMap` secondary index, then
+  use `range_iter` / `range_prefix_iter` for streaming
+  consumption.
 - One genuine regression vs. v0.8.5: `bulk load` is slower
   (3 086 ms → 13 724 ms). fsys's per-record framing
   (12-byte CRC-32C frame around every record) and lock-free

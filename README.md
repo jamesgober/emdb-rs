@@ -60,11 +60,11 @@ note on the column where the table doesn't tell the whole story:
    index is hash-keyed, so the default open does not pay the memory
    tax for sorted iteration. Set
    `EmdbBuilder::enable_range_scans(true)` to maintain a parallel
-   `BTreeMap` secondary index per namespace — see the
-   [Range scans](#range-scans) section below for the API and the
-   memory-cost trade-off. v0.8 added streaming `Emdb::range_iter` /
-   `range_prefix_iter` so consumers that only read the first few
-   elements pay only for what they consume.
+   lock-free `crossbeam_skiplist::SkipMap` secondary index per
+   namespace — see the [Range scans](#range-scans) section below for
+   the API and the memory-cost trade-off. v0.8 added streaming
+   `Emdb::range_iter` / `range_prefix_iter` so consumers that only
+   read the first few elements pay only for what they consume.
 
 ### Read scaling under fan-out
 
@@ -346,8 +346,10 @@ inode until they release; new reads see the compacted layout.
 emdb's primary index is a sharded hash, so unsorted iteration is the
 default. To support range / prefix queries, opt in at open time with
 `EmdbBuilder::enable_range_scans(true)`. The engine maintains a
-parallel `BTreeMap<Vec<u8>, u64>` secondary index per namespace; range
-queries hit the BTreeMap and resolve values through the mmap.
+parallel lock-free `crossbeam_skiplist::SkipMap<Vec<u8>, u64>`
+secondary index per namespace; range queries scan the skiplist and
+resolve values through the mmap. Inserts and range iteration are
+concurrent-safe without a global lock.
 
 ```rust
 use emdb::Emdb;
@@ -372,7 +374,7 @@ assert_eq!(users.len(), same.len());
 # Ok::<(), emdb::Error>(())
 ```
 
-Cost: one `Vec<u8>` clone of the key per insert plus the `BTreeMap`
+Cost: one `Vec<u8>` clone of the key per insert plus the skiplist
 node overhead — roughly doubles in-memory index size for a typical
 workload. Calling `db.range(...)` without enabling this at open time
 returns `Error::InvalidConfig`.
@@ -397,19 +399,23 @@ scoped to a named namespace.
 underlying engine via `Arc`. Pass clones across threads instead of
 synchronising access to a single handle.
 
-**Reads scale.** A 64-shard sharded `RwLock<HashMap>` index plus
-zero-copy slices from a shared `Arc<Mmap>` keep the hot path
-contention-free: the comparative bench above hits 7.66 M reads/sec
-aggregate at 8 threads on a 4-core consumer box.
+**Reads scale.** A 64-shard sharded `parking_lot::RwLock<HashMap>`
+primary index plus zero-copy slices from a shared `Arc<Mmap>` keep
+the hot path contention-free: the comparative bench above hits
+7.66 M reads/sec aggregate at 8 threads on a 4-core consumer box.
 
-**Writes are single-writer.** All writers serialise on one mutex that
-covers the encode-and-pwrite step. This matches the model used by
-LMDB, redb, BoltDB, and most of the embedded-KV ecosystem (multi-writer
-concurrency requires either a recovery model with sentinel records or
-per-thread log segments — both queued for v1.0). High-throughput
-producer workloads should batch through `db.insert_many(...)` or
-`db.transaction(|tx| ...)`, which amortise the writer-mutex acquire
-across many records.
+**Writes scale too.** There is no writer mutex on the hot append
+path — `fsys::JournalHandle` reserves the write slot via a single
+atomic `fetch_add` on the next-LSN counter, and concurrent appenders
+issue independent `pwrite`s to their reserved byte ranges. Producers
+on N threads do not serialise on a global writer lock. Group-commit
+durability is handled by fsys's leader/follower fsync coordinator,
+so multiple concurrent `flush()` calls coalesce into one
+`fdatasync`. High-throughput producers should still batch through
+`db.insert_many(...)` or `db.transaction(|tx| ...)`, which route
+through fsys's vectored `append_batch` (one LSN reservation + one
+`pwrite` for the whole batch) — strictly faster than N independent
+appends.
 
 ```rust
 use std::sync::Arc;
@@ -435,6 +441,42 @@ for worker in workers {
 assert!(db.len()? >= 4);
 # Ok::<(), emdb::Error>(())
 ```
+
+## Performance tuning
+
+The defaults are tuned for storage-engine workloads — emdb opens its
+fsys handle with `tune_for(Workload::Database)` (8 MiB resident
+buffer pool, 256-deep io_uring ring, 4 K-deep batch queue) and
+applies `WriteLifetimeHint::Long` to the journal on Linux so the
+SSD groups journal data into long-lived NAND blocks. Bulk inserts
+and transactions route through fsys's vectored
+`JournalHandle::append_batch`, which submits the whole batch as one
+LSN reservation + one `pwrite` — strictly faster than calling
+`append` in a tight loop. None of these require caller action.
+
+Two opt-in knobs go past the defaults:
+
+```rust
+use emdb::{Emdb, FlushPolicy};
+
+// Linux io_uring kernel-side SQPOLL submission polling. The kernel
+// spawns a polling thread that drains the SQ without requiring
+// `io_uring_enter` syscalls; idles after `idle_ms` of no submissions.
+// Sustained-throughput WAL writers see measurable wins; bursty
+// workloads pay for the polling thread and are better off without it.
+// Linux-only. Falls back cleanly to non-SQPOLL on EPERM / unsupported
+// kernels — same durability contract, slower path.
+let db = Emdb::builder()
+    .iouring_sqpoll(50)              // idle window in milliseconds
+    .flush_policy(FlushPolicy::Group) // pairs well with group-commit
+    .build()?;
+# Ok::<(), emdb::Error>(())
+```
+
+`FlushPolicy::Group` enables the group-commit coordinator so
+concurrent `flush()` calls share one `fdatasync`. The default
+`OnEachFlush` is the right choice for single-writer workloads or
+when the application already batches durability.
 
 ## TTL example
 

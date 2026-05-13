@@ -39,7 +39,7 @@ impl Namespace {
         self.engine().insert(self.ns_id, &key, &value, 0)
     }
 
-    /// Insert many key/value pairs in one writer-locked pass.
+    /// Insert many key/value pairs in one vectored journal-append pass.
     pub fn insert_many<I, K, V>(&self, items: I) -> Result<()>
     where
         I: IntoIterator<Item = (K, V)>,

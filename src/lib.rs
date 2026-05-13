@@ -112,7 +112,9 @@
 //! Range queries are opt-in via
 //! [`EmdbBuilder::enable_range_scans`]; once enabled,
 //! [`Emdb::range_iter`] / [`Emdb::range_prefix_iter`] return streaming
-//! iterators backed by a parallel `BTreeMap` secondary index.
+//! iterators backed by a lock-free `crossbeam_skiplist::SkipMap`
+//! secondary index — inserts and range scans run concurrently
+//! without a global lock.
 //!
 //! ## Group-commit durability
 //!

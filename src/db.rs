@@ -156,6 +156,7 @@ impl Emdb {
             flags: 0,
             enable_range_scans: builder.enable_range_scans,
             flush_policy: builder.flush_policy,
+            iouring_sqpoll_idle_ms: builder.iouring_sqpoll_idle_ms,
             #[cfg(feature = "encrypt")]
             encryption_key: builder.encryption_key,
             #[cfg(feature = "encrypt")]
@@ -205,7 +206,7 @@ impl Emdb {
             .insert(DEFAULT_NAMESPACE_ID, &key, &value, expires_at)
     }
 
-    /// Insert many key/value pairs in one writer-locked pass.
+    /// Insert many key/value pairs in one vectored journal-append pass.
     pub fn insert_many<I, K, V>(&self, items: I) -> Result<()>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -328,10 +329,10 @@ impl Emdb {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::LockPoisoned`] on a poisoned namespace
-    /// or header lock. I/O errors from the metadata call are
-    /// silently absorbed — the file size falls back to the in-memory
-    /// `logical_size_bytes`, which is a strict lower bound.
+    /// I/O errors from the metadata call are silently absorbed — the
+    /// file size falls back to the in-memory `logical_size_bytes`,
+    /// which is a strict lower bound. The engine's locks are
+    /// `parking_lot`-backed and cannot poison.
     pub fn stats(&self) -> Result<crate::EmdbStats> {
         self.inner.engine.stats()
     }
@@ -356,8 +357,7 @@ impl Emdb {
     ///
     /// # Errors
     ///
-    /// Returns I/O errors from the header write or the `fdatasync`,
-    /// or [`crate::Error::LockPoisoned`] on poisoned engine locks.
+    /// Returns I/O errors from the header write or the `fdatasync`.
     pub fn checkpoint(&self) -> Result<()> {
         self.inner.engine.checkpoint()
     }
@@ -408,8 +408,7 @@ impl Emdb {
     /// # Errors
     ///
     /// Returns [`crate::Error::InvalidConfig`] if range scans were not
-    /// enabled at open time. Returns [`crate::Error::LockPoisoned`] on
-    /// poisoned namespace lock.
+    /// enabled at open time.
     pub fn range<R>(&self, range: R) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
     where
         R: std::ops::RangeBounds<Vec<u8>>,
@@ -424,9 +423,9 @@ impl Emdb {
     /// of decoding the rest of the range is never paid.
     ///
     /// The iterator snapshots `(key, offset)` pairs from the
-    /// secondary BTreeMap under a single read-lock acquisition;
-    /// subsequent inserts that fall within the range are not
-    /// visible. Values are read through the mmap on demand.
+    /// secondary lock-free `SkipMap` index; subsequent inserts that
+    /// fall within the range are not visible. Values are read through
+    /// the mmap on demand.
     ///
     /// # Errors
     ///
@@ -883,11 +882,12 @@ impl Iterator for EmdbKeyIter {
 /// [`Emdb::range_prefix_iter`].
 ///
 /// The iterator carries a snapshot of `(key, offset)` pairs taken
-/// from the namespace's BTreeMap secondary index at construction
-/// time. Each `next()` consumes one pair, decodes the value via
-/// the shared mmap, and yields `(key, value)`. The BTreeMap lock
-/// is *not* held across iteration. Pairs whose backing record has
-/// been overwritten between snapshot and decode are skipped.
+/// from the namespace's lock-free `SkipMap` secondary index at
+/// construction time. Each `next()` consumes one pair, decodes the
+/// value via the shared mmap, and yields `(key, value)`. No lock is
+/// held across iteration (the snapshot is materialised eagerly into
+/// an owned vector). Pairs whose backing record has been overwritten
+/// between snapshot and decode are skipped.
 pub struct EmdbRangeIter {
     inner: Arc<Inner>,
     pairs: std::vec::IntoIter<(Vec<u8>, u64)>,

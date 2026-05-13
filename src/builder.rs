@@ -21,6 +21,14 @@ pub struct EmdbBuilder {
     pub(crate) database_name: Option<String>,
     pub(crate) enable_range_scans: bool,
     pub(crate) flush_policy: crate::FlushPolicy,
+    /// Optional Linux io_uring `SQPOLL` idle window in milliseconds.
+    /// `None` (default) keeps the conservative non-SQPOLL submission
+    /// path. `Some(idle_ms)` opts the journal's per-handle io_uring
+    /// ring into kernel-side polling: the kernel spawns a thread that
+    /// drains the SQ without requiring `io_uring_enter` syscalls,
+    /// idling itself after `idle_ms` of no submissions. Linux-only;
+    /// silently ignored on other platforms.
+    pub(crate) iouring_sqpoll_idle_ms: Option<u32>,
     #[cfg(feature = "encrypt")]
     pub(crate) encryption_key: Option<crate::encryption::KeyBytes>,
     #[cfg(feature = "encrypt")]
@@ -79,13 +87,45 @@ impl EmdbBuilder {
     /// `Emdb::range(...)` and `Namespace::range(...)` can iterate keys
     /// in lexicographic order. Off by default.
     ///
-    /// Cost: one `Vec<u8>` clone of the key per insert plus the
-    /// `BTreeMap` node overhead. Roughly doubles in-memory index size
-    /// for a typical workload. Calling `range()` without enabling this
-    /// at open time returns [`crate::Error::InvalidConfig`].
+    /// Backed by a lock-free `crossbeam_skiplist::SkipMap` — inserts
+    /// and range iteration are concurrent-safe without a global
+    /// shard-wide lock. Cost: one `Vec<u8>` clone of the key per
+    /// insert plus the skiplist node overhead. Roughly doubles
+    /// in-memory index size for a typical workload. Calling
+    /// `range()` without enabling this at open time returns
+    /// [`crate::Error::InvalidConfig`].
     #[must_use]
     pub fn enable_range_scans(mut self, enabled: bool) -> Self {
         self.enable_range_scans = enabled;
+        self
+    }
+
+    /// Opt the journal's per-handle io_uring ring into kernel-side
+    /// `IORING_SETUP_SQPOLL` submission polling. The kernel spawns a
+    /// polling thread that drains the submission queue without
+    /// requiring `io_uring_enter` syscalls, sleeping after
+    /// `idle_ms` of no submissions.
+    ///
+    /// **When to enable.** Sustained-throughput Linux WAL writers
+    /// (high-frequency `insert` / `insert_many` loops) where the
+    /// per-submission syscall overhead is measurable. The kernel
+    /// thread keeps the queue draining hot; emdb's hot append
+    /// path stops paying `io_uring_enter` on every batch.
+    ///
+    /// **Fallback.** If `io_uring_setup(2)` rejects `SQPOLL`
+    /// (kernel < 5.13 without `CAP_SYS_NICE`, sandboxed containers,
+    /// EPERM), fsys cleanly falls back to non-SQPOLL `pwrite +
+    /// fdatasync` — same durability contract, slower path. No
+    /// panic, no hang.
+    ///
+    /// **Platforms.** Linux-only. macOS and Windows ignore the
+    /// value (no io_uring on those platforms).
+    ///
+    /// Default `None` preserves the pre-0.9.7 conservative
+    /// non-SQPOLL submission path.
+    #[must_use]
+    pub fn iouring_sqpoll(mut self, idle_ms: u32) -> Self {
+        self.iouring_sqpoll_idle_ms = Some(idle_ms);
         self
     }
 

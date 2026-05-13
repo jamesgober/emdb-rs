@@ -409,8 +409,10 @@ assert_eq!(keys.len(), 2);
 ### Range iteration (opt-in)
 
 Range methods require `EmdbBuilder::enable_range_scans(true)` at
-open time. They are backed by a parallel `BTreeMap` per
-namespace; see the README for the memory-cost trade-off.
+open time. They are backed by a parallel lock-free
+`crossbeam_skiplist::SkipMap` per namespace — inserts and range
+iteration run concurrently without a global lock. See the README
+for the memory-cost trade-off.
 
 #### `range<R>(range) -> Result<Vec<(Vec<u8>, Vec<u8>)>>`
 
@@ -1013,8 +1015,9 @@ returns `self` so calls chain.
 | `database_name(s)` | OS-aware path resolution: database file name. |
 | `data_root(p)` | Override the OS-aware data root. |
 | `default_ttl(d)` | Default TTL for records inserted via plain `insert`. |
-| `enable_range_scans(b)` | Maintain a parallel `BTreeMap` for range queries. Memory cost. |
+| `enable_range_scans(b)` | Maintain a parallel lock-free `SkipMap` for range queries. Memory cost. |
 | `flush_policy(p)` | `OnEachFlush` (default), `Group`, or `WriteThrough`. |
+| `iouring_sqpoll(idle_ms)` | Opt-in Linux io_uring `SQPOLL` kernel-side submission polling. No-op on macOS/Windows. |
 | `encryption_key(k)` | Raw 32-byte key (`encrypt` feature). |
 | `encryption_passphrase(s)` | Argon2id-derived key (`encrypt` feature). |
 | `cipher(c)` | AES-GCM (default) or ChaCha20-Poly1305 (`encrypt` feature). |
