@@ -15,19 +15,12 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 /// The top-level error type returned by every fallible operation in `emdb`.
 ///
-/// The variant set is intentionally small during the early development
-/// phase. It will grow as concrete subsystems land (storage engine,
-/// transaction manager, query layer, etc.).
+/// The enum is `#[non_exhaustive]`; new variants may be added in minor
+/// releases as new failure modes emerge. Callers must never write
+/// exhaustive `match` arms over `Error` — always include a `_` arm.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// The operation is not yet implemented in this version of `emdb`.
-    ///
-    /// This variant exists to keep the public API surface stable while
-    /// internal subsystems are still being built. It will be removed
-    /// before the 1.0 release.
-    NotImplemented,
-
     /// An invalid path was provided to a nested operation.
     ///
     /// This is returned when a nested API receives an empty prefix.
@@ -86,12 +79,6 @@ pub enum Error {
     /// This indicates programmer error when constructing the database.
     InvalidConfig(&'static str),
 
-    /// A transaction operation was attempted outside a valid transaction context.
-    TransactionInvalid,
-
-    /// A transaction was aborted due to an internal invariant violation.
-    TransactionAborted(&'static str),
-
     /// Another process currently holds the advisory lock for this database.
     LockBusy {
         /// Path to the lockfile that is currently held.
@@ -100,9 +87,6 @@ pub enum Error {
 
     /// Lockfile acquisition or lockfile I/O failed.
     LockfileError(std::io::Error),
-
-    /// A synchronization lock was poisoned due to panic while held.
-    LockPoisoned,
 
     /// At-rest encryption configuration is invalid or AEAD failed
     /// internally.
@@ -129,7 +113,6 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotImplemented => f.write_str("emdb: operation not yet implemented"),
             #[cfg(feature = "nested")]
             Self::InvalidPath => f.write_str("emdb: invalid nested path"),
             #[cfg(feature = "ttl")]
@@ -150,15 +133,12 @@ impl fmt::Display for Error {
                 write!(f, "emdb: corrupted data at offset {} ({})", offset, reason)
             }
             Self::InvalidConfig(msg) => write!(f, "emdb: invalid configuration ({msg})"),
-            Self::TransactionInvalid => f.write_str("emdb: invalid transaction context"),
-            Self::TransactionAborted(msg) => write!(f, "emdb: transaction aborted ({msg})"),
             Self::LockBusy { path } => {
                 write!(f, "emdb: lock busy ({})", path.display())
             }
             Self::LockfileError(err) => {
                 write!(f, "emdb: lockfile error ({})", err.kind())
             }
-            Self::LockPoisoned => f.write_str("emdb: lock poisoned"),
             #[cfg(feature = "encrypt")]
             Self::Encryption(msg) => write!(f, "emdb: encryption error ({msg})"),
             #[cfg(feature = "encrypt")]
@@ -180,12 +160,6 @@ impl From<std::io::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_not_implemented_display_is_stable() {
-        let msg = format!("{}", Error::NotImplemented);
-        assert!(msg.contains("not yet implemented"));
-    }
 
     #[test]
     fn test_error_implements_std_error() {
@@ -237,15 +211,6 @@ mod tests {
     }
 
     #[test]
-    fn test_transaction_error_displays_are_stable() {
-        let invalid = format!("{}", Error::TransactionInvalid);
-        assert!(invalid.contains("transaction"));
-
-        let aborted = format!("{}", Error::TransactionAborted("invariant"));
-        assert!(aborted.contains("invariant"));
-    }
-
-    #[test]
     fn test_lock_errors_display_are_stable() {
         let busy = format!(
             "{}",
@@ -257,9 +222,6 @@ mod tests {
 
         let io_msg = format!("{}", Error::LockfileError(std::io::Error::other("x")));
         assert!(io_msg.contains("lockfile error"));
-
-        let poisoned = format!("{}", Error::LockPoisoned);
-        assert!(poisoned.contains("lock poisoned"));
     }
 
     #[cfg(feature = "nested")]

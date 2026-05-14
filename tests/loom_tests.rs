@@ -43,15 +43,15 @@ mod loom_like {
 
         match writer.join() {
             Ok(inner) => inner?,
-            Err(_panic) => return Err(Error::TransactionAborted("loom writer panicked")),
+            Err(_panic) => return Err(Error::InvalidConfig("loom writer panicked")),
         }
         match tx.join() {
             Ok(inner) => inner?,
-            Err(_panic) => return Err(Error::TransactionAborted("loom tx panicked")),
+            Err(_panic) => return Err(Error::InvalidConfig("loom tx panicked")),
         }
         match reader.join() {
             Ok(inner) => inner?,
-            Err(_panic) => return Err(Error::TransactionAborted("loom reader panicked")),
+            Err(_panic) => return Err(Error::InvalidConfig("loom reader panicked")),
         }
 
         Ok(())
