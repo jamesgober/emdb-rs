@@ -126,13 +126,18 @@ emdb's decoder.
 
 ### Record payload
 
-emdb encodes one of three payload types:
+emdb encodes one of three payload types (constants live in
+[`src/storage/format.rs`](src/storage/format.rs)):
 
-| Tag | Type | Contents |
-|---|---|---|
-| `0x01` | Insert | `(ns_id, key, value, optional_expires_at)` |
-| `0x02` | Tombstone | `(ns_id, key)` |
-| `0x03` | Namespace metadata | `(ns_id, name)` |
+| Tag | Constant | Type | Contents |
+|---|---|---|---|
+| `0x00` | `TAG_INSERT` | Insert | `(ns_id, key, value, optional_expires_at)` |
+| `0x01` | `TAG_REMOVE` | Remove (tombstone) | `(ns_id, key)` |
+| `0x02` | `TAG_NAMESPACE_NAME` | Namespace metadata | `(ns_id, name)` |
+
+The high bit of the tag byte (`TAG_ENCRYPTED_FLAG = 0x80`) is set
+on AEAD-encrypted records; bits 0..6 carry the kind. So an
+encrypted Insert is `0x80`, an encrypted Remove is `0x81`, etc.
 
 `ns_id` is a 4-byte namespace identifier. The default namespace
 has `ns_id = 0`; named namespaces are assigned dense IDs in the

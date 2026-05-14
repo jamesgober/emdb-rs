@@ -68,13 +68,24 @@ fn backup_path_for(path: &Path) -> PathBuf {
     out
 }
 
-/// Best-effort cleanup of the lockfile sidecar for a given path. The
-/// mmap+append engine has no separate WAL or page-store sidecar; only
-/// the `.lock` file from [`crate::lockfile::LockFile`] needs scrubbing
-/// when an admin operation aborts.
+/// Best-effort cleanup of the lockfile + meta sidecars for a given
+/// path. Both are scrubbed when an admin operation aborts so the
+/// next attempt starts clean.
 fn remove_sidecars(path: &Path) {
     let display = path.display().to_string();
     let _ = std::fs::remove_file(format!("{display}.lock"));
+    let _ = std::fs::remove_file(format!("{display}.meta"));
+}
+
+/// Sibling-file path for the meta sidecar (`<path>.meta`). The engine
+/// stores encryption flags, salt, and the AEAD verification block in
+/// this file — it must move atomically alongside the journal during
+/// an admin rewrite, otherwise the new file is read with the source
+/// key's verification block and reopens fail with `EncryptionKeyMismatch`
+/// (or `InvalidConfig` when disabling encryption).
+fn meta_sidecar(path: &Path) -> PathBuf {
+    let display = path.display().to_string();
+    PathBuf::from(format!("{display}.meta"))
 }
 
 /// Core rewrite. Source mode (`from`) describes how to *read* the
@@ -154,21 +165,50 @@ pub(crate) fn rewrite_database(
         return Err(err);
     }
 
-    // Atomic swap: rename the original to `<path>.encbak`, then
-    // rename `<path>.enc.tmp` to the original path. The `.encbak` is
-    // left behind for caller verification; failure to rename surfaces
-    // as `Io` and leaves either the original (first rename failed) or
-    // the new file (second rename failed but original is gone — the
-    // caller can recover from `.encbak`) on disk.
+    // Atomic swap: rename the original journal + its meta sidecar to
+    // `<path>.encbak` / `<path>.encbak.meta`, then move the rewritten
+    // journal + its fresh meta into the original's place. Renaming
+    // ONLY the journal would leave the source key's verification block
+    // behind in `<path>.meta`, causing every subsequent reopen with the
+    // new key to fail `EncryptionKeyMismatch` (or `InvalidConfig` when
+    // disabling encryption). The meta move is what makes the rewrite
+    // semantically complete.
+    let bak_meta = meta_sidecar(&bak);
+    let path_meta = meta_sidecar(path);
+    let tmp_meta = meta_sidecar(&tmp);
     if bak.exists() {
         let _ = std::fs::remove_file(&bak);
     }
+    if bak_meta.exists() {
+        let _ = std::fs::remove_file(&bak_meta);
+    }
     std::fs::rename(path, &bak).map_err(Error::from)?;
+    // Move the source's meta into the backup namespace too. Missing
+    // source meta is unusual but not fatal — the engine self-heals a
+    // missing verify block on first open.
+    if path_meta.exists() {
+        let _ = std::fs::rename(&path_meta, &bak_meta);
+    }
     if let Err(err) = std::fs::rename(&tmp, path) {
         // Best-effort: swap the backup back so the database is still
         // openable from the original path.
         let _ = std::fs::rename(&bak, path);
+        let _ = std::fs::rename(&bak_meta, &path_meta);
         let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&tmp_meta);
+        return Err(Error::from(err));
+    }
+    // Journal swapped — now make the rewritten meta the live meta.
+    // If this rename fails, the journal is in place but the meta is
+    // missing; the engine will self-heal but the caller should know.
+    if let Err(err) = std::fs::rename(&tmp_meta, &path_meta) {
+        // Try to keep the live state coherent: roll back the journal
+        // swap so the original key keeps working from the backup.
+        let _ = std::fs::rename(path, &tmp);
+        let _ = std::fs::rename(&bak, path);
+        let _ = std::fs::rename(&bak_meta, &path_meta);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&tmp_meta);
         return Err(Error::from(err));
     }
 

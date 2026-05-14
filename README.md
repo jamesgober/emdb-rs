@@ -43,7 +43,7 @@ milliseconds. Run on a Windows 11 NVMe consumer box. Reproduce with
 | batch writes                |    **292 ms** |    5 970 ms |   1 286 ms |     20.4× faster  |
 | nosync writes               |    **127 ms** |    1 025 ms |     675 ms |      8.1× faster  |
 | random reads (1 M)          |    **322 ms** |    2 765 ms |   6 079 ms |      8.6× faster  |
-| random reads (4 threads)    |    **703 ms** |   11 210 ms |  22 884 ms |     15.9× faster  |
+| random reads (4 threads)    |    **703 ms** |   11 210y ms |  22 884 ms |     15.9× faster  |
 | random reads (8 threads)    |    **511 ms** |   13 026 ms |  23 392 ms | **25.5× faster**  |
 | removals                    |  **5 662 ms** |   33 348 ms |  25 631 ms |      5.9× faster  |
 | compaction                  |  **8 268 ms** |   12 540 ms |       N/A  |      1.5× faster  |
@@ -356,7 +356,7 @@ use emdb::{Emdb, Error};
 let db = Emdb::open_in_memory();
 let failed = db.transaction::<_, ()>(|tx| {
     tx.insert("temp", "value")?;
-    Err(Error::TransactionAborted("rollback"))
+    Err(Error::InvalidConfig("rollback"))
 });
 
 assert!(failed.is_err());
