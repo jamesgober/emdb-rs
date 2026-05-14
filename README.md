@@ -146,7 +146,7 @@ tuning notes.
 
 ## Status
 
-**v0.9.8.** Pre-1.0 polish + RC-prep release. The 0.9.x line is
+**v0.9.9.** Pre-1.0 audit fix-up release. The 0.9.x line is
 API-stable and on-disk-format-stable. The storage substrate is a
 [`fsys`](https://crates.io/crates/fsys) journal — lock-free LSN
 reservation, group-commit fsync, NVMe passthrough flush,
@@ -218,10 +218,10 @@ No further architectural changes are planned before 1.0.
 
 ```toml
 [dependencies]
-emdb = "0.9.8"
+emdb = "0.9.9"
 
 # All optional features
-emdb = { version = "0.9.8", features = ["ttl", "nested", "encrypt", "async"] }
+emdb = { version = "0.9.9", features = ["ttl", "nested", "encrypt", "async"] }
 ```
 
 MSRV: Rust 1.75.
