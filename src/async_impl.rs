@@ -386,11 +386,11 @@ impl AsyncEmdb {
     ///
     /// The snapshot is taken synchronously inside one
     /// `spawn_blocking`, then a second `spawn_blocking` task pumps
-    /// records into a bounded mpsc channel (capacity
-    /// [`STREAM_CHANNEL_CAPACITY`]) which is wrapped as a
-    /// [`tokio_stream::wrappers::ReceiverStream`]. Memory in flight
-    /// is bounded by the channel depth, not the namespace size.
-    /// Dropping the stream halts the pump task on the next send.
+    /// records into a bounded mpsc channel (capacity 64) which is
+    /// wrapped as a [`tokio_stream::wrappers::ReceiverStream`].
+    /// Memory in flight is bounded by the channel depth, not the
+    /// namespace size. Dropping the stream halts the pump task on
+    /// the next send.
     pub async fn iter_stream(
         &self,
     ) -> Result<tokio_stream::wrappers::ReceiverStream<(Vec<u8>, Vec<u8>)>> {

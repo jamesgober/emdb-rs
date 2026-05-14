@@ -27,6 +27,7 @@ the calling patterns look like in practice.
 - [Operational APIs](#operational-apis) — `stats`, `backup_to`, `compact`, `clone_handle`
 - [Lockfile recovery](#lockfile-recovery) — `lock_holder`, `break_lock`
 - [Encryption](#encryption) — `encryption_key`, `encryption_passphrase`, key rotation (`encrypt` feature)
+- [Async surface](#async-surface) — `AsyncEmdb`, `AsyncNamespace`, eager + streaming iteration (`async` feature)
 - [Types reference](#types-reference) — `FlushPolicy`, `Ttl`, `ValueRef`, `EmdbStats`, `LockHolder`
 - [Errors](#errors) — `Error` variants and recovery patterns
 
@@ -1022,6 +1023,7 @@ returns `self` so calls chain.
 | `encryption_passphrase(s)` | Argon2id-derived key (`encrypt` feature). |
 | `cipher(c)` | AES-GCM (default) or ChaCha20-Poly1305 (`encrypt` feature). |
 | `build()` | Open or create the database. |
+| `build_async()` | Same as `build()`, but resolves to `AsyncEmdb` (`async` feature). |
 
 Path resolution rules:
 - If `path()` was set, use it.
@@ -1029,6 +1031,183 @@ Path resolution rules:
   resolve to the OS-aware data dir (XDG on Linux,
   Application Support on macOS, %LOCALAPPDATA% on Windows).
 - Else error: `Error::InvalidConfig`.
+
+---
+
+## Async surface
+
+Gated behind the `async` feature. Wraps every blocking emdb call
+in `tokio::task::spawn_blocking` so the runtime's async tasks
+never stall on emdb's blocking I/O. Pulls in `tokio`
+(`rt` + `rt-multi-thread` + `macros` + `sync`) and
+`tokio-stream`.
+
+### Why the surface exists
+
+The sync `Emdb` / `Namespace` API is the source of truth — every
+async method delegates to it inside a `spawn_blocking` closure.
+That means:
+
+- **No runtime split.** The blocking pool already exists in any
+  tokio runtime; there's no second thread pool to size.
+- **No API duplication.** The sync surface is what gets
+  benchmarked, tested, and optimised; the async wrapper inherits
+  every fix automatically.
+- **Zero overhead when off.** The `async` feature is opt-in.
+  Programs that don't use async pay no `tokio` dep cost.
+
+### Cost model
+
+Each async method dispatches one `spawn_blocking` task
+(sub-microsecond on a warm pool) and clones key + value bytes to
+owned `Vec<u8>` so the closure can take them by value. On a warm
+blocking pool with cold I/O, the spawn overhead is negligible
+against journal append / mmap decode / fsync. On a hot in-memory
+key with a single hash-table probe, the spawn overhead may
+dominate — reach for the sync handle via
+`AsyncEmdb::sync_handle()` and batch via `insert_many` /
+`transaction` instead.
+
+### Construction
+
+| Method | Returns |
+|---|---|
+| `AsyncEmdb::open(path)` | `Result<AsyncEmdb>` — async file-backed open. |
+| `AsyncEmdb::open_in_memory()` | `AsyncEmdb` — sync (no I/O). |
+| `AsyncEmdb::from_sync(emdb)` | `AsyncEmdb` — wrap an existing sync handle. |
+| `AsyncEmdb::builder()` | `EmdbBuilder` — alias for `Emdb::builder()`. |
+| `EmdbBuilder::build_async()` | `Result<AsyncEmdb>` — builder finaliser. |
+
+### Sync-handle bridge
+
+```rust,ignore
+let async_db = AsyncEmdb::open_in_memory();
+let sync_arc = async_db.sync_handle();    // Arc<Emdb>
+
+// Use the sync surface inside one spawn_blocking when you need an
+// API the async wrapper doesn't expose (e.g. zero-copy reads,
+// custom iteration patterns).
+let value: Option<Vec<u8>> = tokio::task::spawn_blocking(move || {
+    sync_arc.get("hot-key").map(|opt| opt.map(|v| v.to_vec()))
+}).await??;
+```
+
+### Core operations
+
+Every sync method has an async mirror with the same name. The
+shapes are:
+
+| Async method | Sync equivalent |
+|---|---|
+| `insert(key, value).await` | `Emdb::insert` |
+| `insert_many(items).await` | `Emdb::insert_many` |
+| `get(key).await` | `Emdb::get` (returns owned `Vec<u8>`) |
+| `remove(key).await` | `Emdb::remove` |
+| `contains_key(key).await` | `Emdb::contains_key` |
+| `len().await` / `is_empty().await` / `clear().await` | self-evident |
+| `flush().await` / `checkpoint().await` / `compact().await` | self-evident |
+| `backup_to(path).await` | `Emdb::backup_to` |
+| `stats().await` | `Emdb::stats` |
+| `transaction(\|tx\| { … }).await` | `Emdb::transaction` (closure runs on blocking pool) |
+| `namespace(name).await` | returns `AsyncNamespace` |
+| `drop_namespace(name).await` / `list_namespaces().await` | self-evident |
+| `insert_with_ttl(k, v, ttl).await` / `expires_at` / `ttl` / `persist` / `sweep_expired` | `ttl` feature |
+
+### Iteration: eager vs streaming
+
+Two flavours, picked per call:
+
+**Eager** — materialises the full result into an owned `Vec`
+inside one `spawn_blocking` before resolving. Convenient for
+small result sets; the entire result is resident before the
+first await completes.
+
+| Eager method | Returns |
+|---|---|
+| `iter().await` | `Result<Vec<(Vec<u8>, Vec<u8>)>>` |
+| `keys().await` | `Result<Vec<Vec<u8>>>` |
+| `range(range).await` | `Result<Vec<(Vec<u8>, Vec<u8>)>>` |
+| `range_prefix(prefix).await` | `Result<Vec<(Vec<u8>, Vec<u8>)>>` |
+| `iter_from(start).await` | `Result<Vec<(Vec<u8>, Vec<u8>)>>` |
+| `iter_after(start).await` | `Result<Vec<(Vec<u8>, Vec<u8>)>>` |
+
+**Streaming** — drives the sync iterator on a dedicated
+`spawn_blocking` task that pushes items through a bounded
+`tokio::sync::mpsc` channel (capacity 64). The async caller
+polls a `tokio_stream::wrappers::ReceiverStream`, applying
+natural backpressure to the blocking pump task. Memory in flight
+is bounded by the channel depth × per-record size, not the
+namespace footprint. Dropping the stream early halts the pump
+task on the next `blocking_send` (no leaked threads, no orphaned
+`Arc`s).
+
+| Streaming method | Returns |
+|---|---|
+| `iter_stream().await` | `Result<ReceiverStream<(Vec<u8>, Vec<u8>)>>` |
+| `keys_stream().await` | `Result<ReceiverStream<Vec<u8>>>` |
+| `range_stream(range).await` | `Result<ReceiverStream<(Vec<u8>, Vec<u8>)>>` |
+| `range_prefix_stream(prefix).await` | `Result<ReceiverStream<(Vec<u8>, Vec<u8>)>>` |
+| `iter_from_stream(start).await` | `Result<ReceiverStream<(Vec<u8>, Vec<u8>)>>` |
+| `iter_after_stream(start).await` | `Result<ReceiverStream<(Vec<u8>, Vec<u8>)>>` |
+
+Pick **eager** when the result set is small, fixed-size, and the
+caller wants random-access semantics over the returned `Vec`.
+
+Pick **streaming** when the result set is large or unbounded,
+the caller wants time-to-first-byte rather than time-to-last, or
+the consumer is downstream-bound (forwarding to a socket,
+folding into an aggregate, writing to another store) and
+peak-memory under load matters more than per-record latency.
+
+### Streaming example
+
+```rust,ignore
+use emdb::AsyncEmdb;
+use tokio_stream::StreamExt;
+
+# async fn ex() -> emdb::Result<()> {
+let db = AsyncEmdb::open_in_memory();
+for i in 0_u32..10_000 {
+    db.insert(format!("k{i:05}"), format!("v{i}")).await?;
+}
+
+let mut stream = db.iter_stream().await?;
+let mut processed = 0_u64;
+while let Some((_key, value)) = stream.next().await {
+    // Process incrementally. Memory peak ≈ 64 × per-record bytes,
+    // not 10 000 × per-record bytes.
+    processed += value.len() as u64;
+}
+println!("processed {processed} bytes");
+# Ok(())
+# }
+```
+
+### Backpressure semantics
+
+- Bounded channel capacity is **64**. Large enough that the
+  async consumer rarely starves the blocking pump on a
+  per-record basis; small enough that the absolute footprint
+  stays in the low-MiB range for kilobyte records.
+- The pump task uses `blocking_send`. When the channel is full,
+  the blocking thread suspends until the async consumer drains
+  a slot. No spinning.
+- If the consumer drops the stream early, the next
+  `blocking_send` returns `Err`, the pump's `for` loop breaks,
+  the sync iterator is dropped, and the blocking task exits.
+
+### AsyncNamespace
+
+Same shape, scoped to one named namespace. Every method on
+`Namespace` has the same async mirror (eager + streaming).
+Construct via `AsyncEmdb::namespace(name).await`.
+
+### Send + Clone
+
+`AsyncEmdb` and `AsyncNamespace` are both `Send + Sync + Clone`
+— clone freely; clones share the same underlying engine through
+`Arc`. The returned `ReceiverStream`s are `Send`, so they survive
+`.await` points on multi-thread tokio runtimes.
 
 ---
 
