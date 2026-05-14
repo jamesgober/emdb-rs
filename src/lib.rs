@@ -204,6 +204,18 @@
 //! handle via `AsyncEmdb::sync_handle` and batch via
 //! `insert_many` / `range`.
 //!
+//! Large iterations come in two flavours. `iter` / `keys` / `range`
+//! / `range_prefix` / `iter_from` / `iter_after` materialise the
+//! full result into an owned `Vec` before resolving — convenient
+//! for small queries. The `*_stream` variants
+//! (`iter_stream`, `keys_stream`, `range_stream`,
+//! `range_prefix_stream`, `iter_from_stream`, `iter_after_stream`)
+//! return a `tokio_stream::wrappers::ReceiverStream` backed by a
+//! bounded mpsc channel: records arrive incrementally, the
+//! blocking pump task respects the consumer's backpressure, and
+//! memory in flight is bounded by the channel depth rather than
+//! the namespace size.
+//!
 //! ## Cargo features
 //!
 //! - `ttl` *(default)* — per-record expiration and `default_ttl`.
@@ -211,8 +223,10 @@
 //! - `encrypt` — AES-256-GCM + ChaCha20-Poly1305 at-rest encryption
 //!   with raw-key or Argon2id-derived passphrase.
 //! - `async` — `AsyncEmdb` / `AsyncNamespace` wrappers via
-//!   tokio's `spawn_blocking`. Pulls in `tokio` with `rt` +
-//!   `rt-multi-thread` + `macros`.
+//!   tokio's `spawn_blocking`, plus streaming-iterator variants
+//!   backed by `tokio_stream::wrappers::ReceiverStream`. Pulls in
+//!   `tokio` (`rt` + `rt-multi-thread` + `macros` + `sync`) and
+//!   `tokio-stream`.
 //! - `bench-compare`, `bench-rocksdb`, `bench-redis` — comparative
 //!   bench peers (dev-only, never required by application builds).
 

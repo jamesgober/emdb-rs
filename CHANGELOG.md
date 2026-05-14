@@ -4,6 +4,128 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.7](https://github.com/jamesgober/emdb-rs/compare/v0.9.6...v0.9.7) — 2026-05-13
+
+**Streaming async iterators.** The async surface gains
+`iter_stream` / `keys_stream` / `range_stream` /
+`range_prefix_stream` / `iter_from_stream` / `iter_after_stream`
+on both [`AsyncEmdb`] and [`AsyncNamespace`]. Each returns a
+`tokio_stream::wrappers::ReceiverStream` backed by a bounded
+`tokio::sync::mpsc` channel (capacity 64). Records are pumped on
+a dedicated `spawn_blocking` task that respects consumer
+backpressure via `blocking_send` — when the receiver is slow,
+the sync iterator stalls instead of buffering the whole
+namespace into RAM. Pre-0.9.7 async iteration was eager: every
+call ran the sync iterator to completion inside one
+`spawn_blocking` and resolved with an owned `Vec` containing
+every record. That path still exists (it's the right call for
+small fixed-size queries), but for large or unbounded
+iterations the streaming variants bound memory at the channel
+depth × per-record size, not the namespace footprint.
+
+No on-disk format change. No API breakage. The eager methods
+(`iter`, `keys`, `range`, …) keep their signatures and
+semantics.
+
+### Why streaming was the right fix
+
+The eager methods had two structural problems for large
+namespaces:
+
+1. **Memory.** A `Vec<(Vec<u8>, Vec<u8>)>` of a million records
+   at ~1 KiB each is ~1 GiB resident before the first record
+   is processed. With streaming, the same iteration peaks at
+   `64 × per_record_bytes`, regardless of namespace size.
+2. **Time to first byte.** Eager methods can't return until
+   the entire result is materialised. For network-bound
+   downstream consumers (forwarding records to a socket,
+   pushing into a queue), that's wasted latency.
+
+The streaming model addresses both: the consumer sees the
+first record as soon as the pump task decodes it, and the
+pump task is suspended whenever the channel is full.
+
+### Backpressure design
+
+- **Bounded channel (capacity 64).** Large enough that the
+  consumer doesn't starve the pump on a per-record basis;
+  small enough that the absolute footprint stays in the
+  low-MiB range for kilobyte records.
+- **`blocking_send` on the pump side.** When the channel is
+  full, the blocking thread suspends until the async consumer
+  drains a slot. No spinning, no busy loops.
+- **Drop-aware.** If the consumer drops the stream early,
+  `blocking_send` returns `Err`, the pump's `for` loop
+  breaks, the iterator is dropped, and the blocking task
+  exits — no leaked threads, no orphaned `Arc`s.
+- **`Send` bound preserved.** The returned stream is `Send`,
+  so it can move across `.await` points on multi-thread
+  tokio runtimes (verified by a compile-time test).
+
+### New dependency
+
+- `tokio-stream = "0.1"` — gated behind the `async` feature.
+  Wraps tokio's mpsc receiver in the `futures-core::Stream`
+  trait. ~200 LOC, dep-light (transitive: `futures-core`
+  only).
+
+The `tokio` feature set under `async` also picks up `sync`,
+needed for `tokio::sync::mpsc::channel`.
+
+### Tests
+
+**12 new async streaming tests** added to
+[`tests/async_api.rs`](tests/async_api.rs), all under
+`#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`:
+
+- `iter_stream_yields_all_records` — full namespace, no losses
+- `keys_stream_yields_all_keys` — key-only path
+- `range_stream_half_open_bounds` — lex-bounded slice
+- `range_prefix_stream_filters_correctly` — prefix scoping
+- `iter_from_stream_inclusive_start` — inclusive lower bound
+- `iter_after_stream_exclusive_start` — exclusive lower bound
+- `iter_stream_drop_halts_pump` — early-drop terminates the
+  blocking pump task cleanly
+- `namespace_iter_stream_scoped_to_namespace` — namespace
+  isolation: top-level inserts don't leak into a namespace
+  stream
+- `streams_are_send` — compile-time `Send` bound check
+- `iter_stream_backpressure_round_trip` — slow consumer with
+  per-record `yield_now()` still completes correctly
+- `iter_stream_matches_eager_iter` — same input → same
+  output set as the eager method
+
+23 / 23 async tests passing. All other feature combos
+(`--no-default-features`, `--features ttl`,
+`--features ttl,nested,encrypt`, `--all-features`) remain
+green. Clippy clean, fmt clean, release build clean.
+
+### Internals — module map
+
+| Module | Change |
+|---|---|
+| [`Cargo.toml`](Cargo.toml) | Added `tokio-stream = "0.1"` (optional, default-features off); added `sync` to the `tokio` feature list; `async` feature now activates both `dep:tokio` and `dep:tokio-stream`. Dev-deps pick up `tokio-stream` and `futures-util` unconditionally for stream-test ergonomics. |
+| [`src/async_impl.rs`](src/async_impl.rs) | Added `spawn_iter_stream` helper (bounded mpsc + `spawn_blocking` pump). Added 6 streaming methods on `AsyncEmdb` and 6 on `AsyncNamespace`. Added `iter_from` / `iter_after` eager methods on `AsyncNamespace` for symmetry with `AsyncEmdb`. Module-level + struct-level docs rewritten to describe the eager-vs-streaming choice. |
+| [`src/lib.rs`](src/lib.rs) | Crate-level async docs updated to describe the streaming surface. `async` feature description in the Cargo-features section updated to list `tokio-stream`. |
+| [`tests/async_api.rs`](tests/async_api.rs) | 12 new streaming integration tests. |
+
+### Breaking changes
+
+**None.** Pure addition. All v0.9.x async code compiles and
+runs unchanged.
+
+### Installation
+
+```toml
+[dependencies]
+emdb = "0.9.7"
+
+# All features (streaming-stream variants live under `async`):
+emdb = { version = "0.9.7", features = ["ttl", "nested", "encrypt", "async"] }
+```
+
+MSRV: Rust 1.75.
+
 ## [0.9.6](https://github.com/jamesgober/emdb-rs/compare/v0.9.5...v0.9.6) — 2026-05-13
 
 **Critical fix.** Patch release. Replaces the index hash function
