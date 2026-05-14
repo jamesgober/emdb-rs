@@ -39,13 +39,29 @@
 //!
 //! ## Streaming iterators
 //!
-//! The sync API offers lazy iterators (`iter`, `keys`, `range_iter`,
-//! etc.) that decode records on each `next()`. The async surface
-//! currently materialises these into owned `Vec`s before returning
-//! — streaming via `impl Stream` is on the roadmap for a later
-//! 0.9.x. For now, large iterations should reach for the sync
-//! handle via [`AsyncEmdb::sync_handle`] and drive the iterator
-//! inside a single `spawn_blocking`.
+//! Two flavours of async iteration are exposed:
+//!
+//! - **Eager** (`iter`, `keys`, `range`, `range_prefix`, `iter_from`,
+//!   `iter_after`) — runs the sync iterator to completion inside a
+//!   single `spawn_blocking` and returns an owned `Vec`. Convenient
+//!   for small result sets; the entire result is resident before the
+//!   first await completes.
+//! - **Streaming** (`iter_stream`, `keys_stream`, `range_stream`,
+//!   `range_prefix_stream`, `iter_from_stream`, `iter_after_stream`)
+//!   — drives the sync iterator on a dedicated blocking task that
+//!   pushes items through a bounded `tokio::sync::mpsc` channel
+//!   (capacity 64). The async caller polls the returned
+//!   [`tokio_stream::wrappers::ReceiverStream`], applying natural
+//!   backpressure to the blocking pump task and bounding memory at
+//!   the channel depth × per-record size rather than the full
+//!   namespace footprint.
+//!
+//! Pick streaming whenever the result set is large enough that
+//! materialising it before the first record is unacceptable, or
+//! when the caller wants to process records as they arrive (forward
+//! them to a network socket, fold them into a running aggregate,
+//! etc.). Pick eager for small fixed-size queries where the
+//! channel/spawn cost outweighs the win.
 
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
@@ -93,6 +109,41 @@ where
     spawn_blocking(f).await.map_err(join_err)
 }
 
+/// Backpressure depth for the async streaming-iterator channels.
+///
+/// 64 owned records in flight is the right point on the
+/// memory/throughput curve for typical record sizes: large enough
+/// that the async consumer rarely starves the blocking pump task
+/// on a per-record basis, small enough that the absolute footprint
+/// stays bounded (≲ a few MiB for kilobyte records). Tuning this
+/// up doesn't help once the consumer is the bottleneck; tuning it
+/// down trades throughput for tighter memory.
+const STREAM_CHANNEL_CAPACITY: usize = 64;
+
+/// Drive a sync `Iterator` on tokio's blocking pool and surface its
+/// items as a [`tokio_stream::wrappers::ReceiverStream`]. The pump
+/// task halts the moment the consumer drops the stream
+/// (`blocking_send` returns `Err`); the iterator is dropped on the
+/// blocking thread, releasing its `Arc` references.
+fn spawn_iter_stream<I, T>(iter: I) -> tokio_stream::wrappers::ReceiverStream<T>
+where
+    I: Iterator<Item = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel::<T>(STREAM_CHANNEL_CAPACITY);
+    // JoinHandle is intentionally dropped: the pump task is fire-and-forget
+    // and self-terminating (channel-closed-on-receiver-drop or iterator
+    // exhausted). No caller needs to .await the handle.
+    let _pump: tokio::task::JoinHandle<()> = spawn_blocking(move || {
+        for item in iter {
+            if tx.blocking_send(item).is_err() {
+                break;
+            }
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
 /// Cheap-clone async handle to an [`Emdb`]. Every method routes
 /// through `tokio::task::spawn_blocking` so emdb's blocking I/O
 /// never stalls the async-task scheduler.
@@ -104,11 +155,12 @@ where
 /// I/O cost, reach for the sync handle via
 /// [`AsyncEmdb::sync_handle`].
 ///
-/// **Iterators:** the sync API's lazy iterators (`iter`, `keys`,
-/// `range_iter`, etc.) are materialised into owned `Vec`s before
-/// returning from the async surface. Streaming via `impl Stream` is
-/// a follow-up; today, large iterations should drive the sync
-/// iterator inside a single `spawn_blocking` via `sync_handle()`.
+/// **Iterators:** two flavours. The eager methods (`iter`, `keys`,
+/// `range`, …) collect into an owned `Vec` before resolving. The
+/// streaming methods (`iter_stream`, `keys_stream`, `range_stream`,
+/// …) return a [`tokio_stream::wrappers::ReceiverStream`] backed by
+/// a bounded mpsc channel — items arrive incrementally and memory
+/// is bounded by the channel depth, not the namespace size.
 #[derive(Clone, Debug)]
 pub struct AsyncEmdb {
     inner: Arc<Emdb>,
@@ -328,6 +380,91 @@ impl AsyncEmdb {
         let inner = Arc::clone(&self.inner);
         let start = start.as_ref().to_vec();
         blocking(move || Ok(inner.iter_after(start)?.collect())).await
+    }
+
+    /// Stream every `(key, value)` pair in the default namespace.
+    ///
+    /// The snapshot is taken synchronously inside one
+    /// `spawn_blocking`, then a second `spawn_blocking` task pumps
+    /// records into a bounded mpsc channel (capacity
+    /// [`STREAM_CHANNEL_CAPACITY`]) which is wrapped as a
+    /// [`tokio_stream::wrappers::ReceiverStream`]. Memory in flight
+    /// is bounded by the channel depth, not the namespace size.
+    /// Dropping the stream halts the pump task on the next send.
+    pub async fn iter_stream(
+        &self,
+    ) -> Result<tokio_stream::wrappers::ReceiverStream<(Vec<u8>, Vec<u8>)>> {
+        let inner = Arc::clone(&self.inner);
+        let iter = blocking(move || inner.iter()).await?;
+        Ok(spawn_iter_stream(iter))
+    }
+
+    /// Stream every key in the default namespace. Same semantics as
+    /// [`AsyncEmdb::iter_stream`].
+    pub async fn keys_stream(&self) -> Result<tokio_stream::wrappers::ReceiverStream<Vec<u8>>> {
+        let inner = Arc::clone(&self.inner);
+        let iter = blocking(move || inner.keys()).await?;
+        Ok(spawn_iter_stream(iter))
+    }
+
+    /// Stream every `(key, value)` pair in the half-open `range`,
+    /// sorted lexicographically. Requires range scans enabled at
+    /// builder time.
+    pub async fn range_stream<R>(
+        &self,
+        range: R,
+    ) -> Result<tokio_stream::wrappers::ReceiverStream<(Vec<u8>, Vec<u8>)>>
+    where
+        R: RangeBounds<Vec<u8>> + Send + 'static,
+    {
+        let inner = Arc::clone(&self.inner);
+        let iter = blocking(move || inner.range_iter(range)).await?;
+        Ok(spawn_iter_stream(iter))
+    }
+
+    /// Stream every `(key, value)` pair starting with `prefix`.
+    /// Requires range scans enabled at builder time.
+    pub async fn range_prefix_stream<K>(
+        &self,
+        prefix: K,
+    ) -> Result<tokio_stream::wrappers::ReceiverStream<(Vec<u8>, Vec<u8>)>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let inner = Arc::clone(&self.inner);
+        let prefix = prefix.as_ref().to_vec();
+        let iter = blocking(move || inner.range_prefix_iter(prefix)).await?;
+        Ok(spawn_iter_stream(iter))
+    }
+
+    /// Stream keys at or after `start`. Requires range scans
+    /// enabled at builder time.
+    pub async fn iter_from_stream<K>(
+        &self,
+        start: K,
+    ) -> Result<tokio_stream::wrappers::ReceiverStream<(Vec<u8>, Vec<u8>)>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let inner = Arc::clone(&self.inner);
+        let start = start.as_ref().to_vec();
+        let iter = blocking(move || inner.iter_from(start)).await?;
+        Ok(spawn_iter_stream(iter))
+    }
+
+    /// Stream keys strictly after `start`. Requires range scans
+    /// enabled at builder time.
+    pub async fn iter_after_stream<K>(
+        &self,
+        start: K,
+    ) -> Result<tokio_stream::wrappers::ReceiverStream<(Vec<u8>, Vec<u8>)>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let inner = Arc::clone(&self.inner);
+        let start = start.as_ref().to_vec();
+        let iter = blocking(move || inner.iter_after(start)).await?;
+        Ok(spawn_iter_stream(iter))
     }
 
     /// Insert with TTL.
@@ -566,5 +703,105 @@ impl AsyncNamespace {
         let ns = self.inner.clone();
         let prefix = prefix.as_ref().to_vec();
         blocking(move || ns.range_prefix(prefix)).await
+    }
+
+    /// Eagerly collect keys at or after `start`. Requires range
+    /// scans enabled at builder time.
+    pub async fn iter_from<K>(&self, start: K) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let ns = self.inner.clone();
+        let start = start.as_ref().to_vec();
+        blocking(move || Ok(ns.iter_from(start)?.collect())).await
+    }
+
+    /// Eagerly collect keys strictly after `start`. Requires range
+    /// scans enabled at builder time.
+    pub async fn iter_after<K>(&self, start: K) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let ns = self.inner.clone();
+        let start = start.as_ref().to_vec();
+        blocking(move || Ok(ns.iter_after(start)?.collect())).await
+    }
+
+    /// Stream every `(key, value)` pair in this namespace. See
+    /// [`AsyncEmdb::iter_stream`] for the channel-backed
+    /// backpressure model.
+    pub async fn iter_stream(
+        &self,
+    ) -> Result<tokio_stream::wrappers::ReceiverStream<(Vec<u8>, Vec<u8>)>> {
+        let ns = self.inner.clone();
+        let iter = blocking(move || ns.iter()).await?;
+        Ok(spawn_iter_stream(iter))
+    }
+
+    /// Stream every key in this namespace.
+    pub async fn keys_stream(&self) -> Result<tokio_stream::wrappers::ReceiverStream<Vec<u8>>> {
+        let ns = self.inner.clone();
+        let iter = blocking(move || ns.keys()).await?;
+        Ok(spawn_iter_stream(iter))
+    }
+
+    /// Stream every `(key, value)` pair in the half-open `range`,
+    /// sorted lexicographically. Requires range scans enabled at
+    /// builder time.
+    pub async fn range_stream<R>(
+        &self,
+        range: R,
+    ) -> Result<tokio_stream::wrappers::ReceiverStream<(Vec<u8>, Vec<u8>)>>
+    where
+        R: RangeBounds<Vec<u8>> + Send + 'static,
+    {
+        let ns = self.inner.clone();
+        let iter = blocking(move || ns.range_iter(range)).await?;
+        Ok(spawn_iter_stream(iter))
+    }
+
+    /// Stream every `(key, value)` pair starting with `prefix`.
+    /// Requires range scans enabled at builder time.
+    pub async fn range_prefix_stream<K>(
+        &self,
+        prefix: K,
+    ) -> Result<tokio_stream::wrappers::ReceiverStream<(Vec<u8>, Vec<u8>)>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let ns = self.inner.clone();
+        let prefix = prefix.as_ref().to_vec();
+        let iter = blocking(move || ns.range_prefix_iter(prefix)).await?;
+        Ok(spawn_iter_stream(iter))
+    }
+
+    /// Stream keys at or after `start`. Requires range scans
+    /// enabled at builder time.
+    pub async fn iter_from_stream<K>(
+        &self,
+        start: K,
+    ) -> Result<tokio_stream::wrappers::ReceiverStream<(Vec<u8>, Vec<u8>)>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let ns = self.inner.clone();
+        let start = start.as_ref().to_vec();
+        let iter = blocking(move || ns.iter_from(start)).await?;
+        Ok(spawn_iter_stream(iter))
+    }
+
+    /// Stream keys strictly after `start`. Requires range scans
+    /// enabled at builder time.
+    pub async fn iter_after_stream<K>(
+        &self,
+        start: K,
+    ) -> Result<tokio_stream::wrappers::ReceiverStream<(Vec<u8>, Vec<u8>)>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let ns = self.inner.clone();
+        let start = start.as_ref().to_vec();
+        let iter = blocking(move || ns.iter_after(start)).await?;
+        Ok(spawn_iter_stream(iter))
     }
 }

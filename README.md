@@ -150,7 +150,7 @@ tuning notes.
 
 ## Status
 
-**v0.9.6.** Pre-1.0; the 0.9.x line is API-stable and on-disk-
+**v0.9.7.** Pre-1.0; the 0.9.x line is API-stable and on-disk-
 format-stable. The storage substrate is a
 [`fsys`](https://crates.io/crates/fsys) journal — lock-free LSN
 reservation, group-commit fsync, NVMe passthrough flush,
@@ -170,7 +170,16 @@ Opt-in `EmdbBuilder::iouring_sqpoll(idle_ms)` (v0.9.2) exposes
 Linux io_uring kernel-side SQPOLL polling. **v0.9.5 adds the
 opt-in `async` feature** with `AsyncEmdb` / `AsyncNamespace` /
 `EmdbBuilder::build_async` wrappers routed through
-`tokio::task::spawn_blocking`.
+`tokio::task::spawn_blocking`. **v0.9.6** replaces the index
+hash function with a wyhash-style mixer + Murmur3 fmix64
+finalizer (0 collisions on the stress-test key pattern that
+produced 36 % under FxHash). **v0.9.7** adds streaming
+async-iterator variants (`iter_stream`, `keys_stream`,
+`range_stream`, `range_prefix_stream`, `iter_from_stream`,
+`iter_after_stream`) backed by a bounded
+`tokio::sync::mpsc` channel — memory in flight is bounded by
+the channel depth rather than the namespace size, and the
+blocking pump task respects consumer backpressure.
 
 > **v0.9.3 users:** upgrade to v0.9.4 or later. v0.9.3 shipped
 > with a TOCTOU race in the new primary index that could cause
@@ -186,14 +195,16 @@ variants (`OnEachFlush`, `Group`, `WriteThrough`); streaming
 `iter` / `keys` / `range`; cursor-style `iter_from` / `iter_after`;
 zero-copy `get_zerocopy`; atomic `backup_to(path)`; point-in-time
 `stats()`; stale-lockfile recovery (`lock_holder` + `break_lock`).
+The `async` feature exposes both eager async iteration and
+streaming `*_stream` variants over a bounded backpressured
+channel; pump tasks honour consumer drops so dropping a stream
+early halts decode immediately.
 
 Pre-1.0. The remaining work before v1.0:
 
 - 5 M end-to-end bench re-capture on bare-metal Linux +
   Windows NVMe (full Criterion sample counts).
 - Lock-free index migration (arc-swap + dual-write protocol).
-- Streaming async iterators (`impl Stream`) on top of the
-  v0.9.5 `AsyncEmdb` surface.
 - Automated migration tool for v0.7 / v0.8 → v0.9 databases.
 - `docs/STABILITY-1.0.md` SemVer commitment doc.
 
@@ -203,10 +214,10 @@ No further architectural changes are planned before 1.0.
 
 ```toml
 [dependencies]
-emdb = "0.9.6"
+emdb = "0.9.7"
 
 # All optional features
-emdb = { version = "0.9.6", features = ["ttl", "nested", "encrypt"] }
+emdb = { version = "0.9.7", features = ["ttl", "nested", "encrypt", "async"] }
 ```
 
 MSRV: Rust 1.75.
