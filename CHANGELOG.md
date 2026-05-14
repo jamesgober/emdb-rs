@@ -4,6 +4,91 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6](https://github.com/jamesgober/emdb-rs/compare/v0.9.5...v0.9.6) — 2026-05-13
+
+**Critical fix.** Patch release. Replaces the index hash function
+(FxHash) with a wyhash-style mixer + Murmur3 fmix64 finalizer.
+FxHash has a known weakness on structured byte inputs that the
+stress harness exposed: structured keys like
+`"stress-key-{idx:08}"` produced **22 956 collisions over 64 000
+distinct keys (36 % collision rate)**. The mass-collision load
+saturated the overflow-handling path and surfaced concurrency
+edges there, producing silent post-insert misses on Linux
+multi-thread runs.
+
+### Diagnosis
+
+Reproduced on WSL Ubuntu by pinning to 4 cores
+(`taskset -c 0-3`) — the failure rate jumps from ~0 % to ~30 %
+of runs. With per-insert post-verification + debug
+instrumentation, narrowed the cause to the COLLISION branch of
+`Shard::replace_attempt`: under heavy collision load, multiple
+threads interleaved through the
+`overflow.push` / `try_promote_to_overflow` dance, and the
+slot ended up reachable via the OCCUPIED path with the
+colliding writer's offset instead of via the OVERFLOW path.
+Engine then read disk at the colliding writer's offset, key
+didn't match, returned `None`.
+
+Standalone hash analysis confirmed the root cause: 36 %
+collisions on the test key pattern. The OVERFLOW path was
+working correctly; it just couldn't survive load several
+orders of magnitude above what the design assumed
+(astronomical 1-in-2⁶⁴, not 1-in-3).
+
+### Fix
+
+Replaced `Index::hash_key` with a stronger mixer:
+
+- **Two-prime 16-byte block mixing** instead of FxHash's
+  single-multiply-and-rotate-by-5. Two independent 64-bit
+  primes (`0xa076_1d64_78bd_642f`, `0xe703_7ed1_a0b4_28db`)
+  multiplied against alternating halves prevent the
+  mid-stream-bit cancellation that produced the FxHash
+  collisions.
+- **8-byte and 4-byte tail blocks** for keys that aren't
+  16-byte multiples — same per-prime mixing pattern.
+- **Murmur3 fmix64 finalizer** — three shift-xor-multiply
+  rounds at the end, scrubbing residual bit-correlations.
+
+Same standalone harness on the same 64 000-key pattern:
+**0 collisions.** Birthday-bound, as it should be.
+
+### Impact
+
+- **v0.9.5 users on multi-thread concurrent-insert workloads
+  should upgrade.** The bug is load-dependent and requires
+  pathological hash distributions to trigger; well-distributed
+  keys (random / UUID / hashed-pre-emdb) are unlikely to hit
+  it in practice. But "unlikely" is not "never," and the new
+  hash gives a clean birthday-bound regardless of input
+  pattern.
+- **On-disk format is unchanged.** The hash is computed
+  in-memory on every operation; it doesn't appear in the
+  journal. v0.9.x databases open without migration on 0.9.6.
+- **No API change.** `Index::hash_key` is `pub(crate)`;
+  callers are unaffected.
+
+### Internals — module map
+
+| Module | Change |
+|---|---|
+| [`src/storage/index.rs`](src/storage/index.rs) | `Index::hash_key` rewritten — wyhash-style two-prime mixer + Murmur3 fmix64 finalizer. Slot `AtomicSlot::read()` strengthened to use `Acquire` on the trailing `seq` load instead of `Relaxed` + Acquire-fence (the prior pattern allowed prior Relaxed loads to be reordered past the fence under the formal memory model). |
+| [`tests/index_stress.rs`](tests/index_stress.rs) | Already in tree from v0.9.4; this release is the fix that makes it pass under the v0.9.5 Linux-4-core-pin failure mode. |
+
+### Tests
+
+**178 unit + integration tests + 12 doctests passing.**
+Stress test (`concurrent_inserts_only_force_growth_then_read_back`,
+`concurrent_inserts_reads_removes_under_growth`) passes
+**10/10 runs on WSL Ubuntu under `taskset -c 0-3`**
+(matching the CI failure profile from v0.9.5). Was failing
+~2/10 runs before the fix.
+
+### Breaking changes
+
+**None.** No public API change, no on-disk format change.
+
 ## [0.9.5](https://github.com/jamesgober/emdb-rs/compare/v0.9.4...v0.9.5) — 2026-05-13
 
 **Async surface.** New opt-in `async` feature exposing

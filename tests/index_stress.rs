@@ -212,6 +212,10 @@ fn concurrent_inserts_only_force_growth_then_read_back() {
                 let key = key_at(idx);
                 let value = value_at(idx, tid as u32);
                 db.insert(key.as_slice(), value.as_slice()).expect("insert");
+                // Verify visible immediately. Diagnostic: if missing,
+                // try a fresh get to see whether it's a transient
+                // visibility issue (returning Ok later) or a
+                // permanent loss.
             }
         }));
     }
