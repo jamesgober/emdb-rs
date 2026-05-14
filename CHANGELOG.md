@@ -4,6 +4,178 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.9](https://github.com/jamesgober/emdb-rs/compare/v0.9.8...v0.9.9) — 2026-05-14
+
+**Pre-1.0 audit fix-up release.** After 0.9.8 shipped, ran a
+four-front audit (doc accuracy, error hardening, test coverage,
+bench coverage) to verify everything is honest before locking
+in the 1.0 stability contract. The audit found three real
+issues, all fixed in this release. **`Emdb::disable_encryption`
+and `Emdb::rotate_encryption_key` were broken in v0.9.8 and
+earlier — anyone using those APIs should upgrade to 0.9.9.**
+
+On-disk format unchanged. v0.9.x databases open unchanged on
+0.9.9.
+
+### Bug fix: encryption admin sidecar leak (CRITICAL)
+
+[`Emdb::disable_encryption`](src/db.rs) and
+[`Emdb::rotate_encryption_key`](src/db.rs) were leaking the
+source key's `<path>.meta` sidecar across the atomic rewrite.
+The journal at `<path>` was correctly rewritten under the new
+key (or as plaintext), but the meta sidecar — which carries
+the AEAD verification block — was not moved. After the
+rewrite, opens with the new key read the stale verification
+block from `<path>.meta` and surfaced
+`Error::EncryptionKeyMismatch`; `disable_encryption` similarly
+left the `FLAG_ENCRYPTED` bit set in the surviving meta and
+made the file unopenable without a key.
+
+[Zero tests covered these paths in 0.9.8 or earlier.](tests/encryption_admin.rs)
+The audit's test-coverage pass exposed it immediately.
+
+**Fix:** `rewrite_database` now moves the meta sidecar
+alongside the journal during the atomic swap, with proper
+rollback on partial failure. The full procedure:
+
+1. Rename `<path>` → `<path>.encbak` (journal).
+2. Rename `<path>.meta` → `<path>.encbak.meta` (meta sidecar).
+3. Rename `<tmp>` → `<path>` (rewritten journal).
+4. Rename `<tmp>.meta` → `<path>.meta` (rewritten meta).
+5. On any step's failure: roll back every prior rename so the
+   database stays openable from the original path.
+
+### Bug fix: ARCHITECTURE.md frame tag values
+
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) listed frame
+record tags as `0x01` (Insert), `0x02` (Tombstone),
+`0x03` (Namespace metadata). The actual code in
+[`src/storage/format.rs`](src/storage/format.rs) uses `0x00`
+(`TAG_INSERT`), `0x01` (`TAG_REMOVE`), `0x02`
+(`TAG_NAMESPACE_NAME`). Anyone using the doc to build a
+recovery tool, parser, or migration script would have
+produced corruption.
+
+Fixed — values + constant names + the encryption-flag bit
+(`0x80`) are now documented accurately.
+
+### Public-API cleanup: dead `Error` variants removed
+
+Removed four `Error` variants that were defined but never
+constructed in production code:
+
+- `Error::NotImplemented` — placeholder from early dev.
+- `Error::TransactionInvalid` — transactions are always valid
+  by construction (the type system enforces it via
+  `&mut Transaction`).
+- `Error::TransactionAborted` — aborts happen via
+  `Err` return from the closure, not a specific error
+  variant.
+- `Error::LockPoisoned` — `parking_lot` mutexes don't poison.
+
+Per the SemVer + `#[non_exhaustive]` rules in
+[`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md), removing
+variants from a `#[non_exhaustive]` enum does not break
+exhaustive-match callers (because exhaustive matching is
+forbidden on non-exhaustive enums). The change is non-breaking
+for any well-formed downstream code; landing it in 0.9.9 keeps
+the 1.0 surface clean.
+
+The README's transaction example and the loom test that
+referenced `TransactionAborted` are updated to use
+`Error::InvalidConfig` for the same "abort the closure"
+purpose.
+
+### New regression tests
+
+**[`tests/encryption_admin.rs`](tests/encryption_admin.rs)** — 9 tests:
+
+- `enable_encryption_round_trips_every_record`
+- `disable_encryption_round_trips_every_record`
+- `rotate_encryption_key_swaps_keys_atomically`
+- `wrong_key_on_reopen_surfaces_encryption_key_mismatch`
+- `tampered_ciphertext_is_rejected`
+- `encryption_plus_ttl_round_trip`
+- `chacha20_cipher_round_trip`
+- `passphrase_round_trip`
+- `wrong_passphrase_is_rejected`
+
+These cover the operational paths downstream users hit on
+first key adoption, key rotation, and decommissioning. Pre-this-
+release coverage was zero.
+
+**[`tests/hash_regression.rs`](tests/hash_regression.rs)** — 2 tests
+pinned to the exact v0.9.6 stress pattern (`stress-key-{idx:08}`
+× 64 000):
+
+- `v0_9_6_hash_function_handles_stress_pattern_without_misses`
+- `v0_9_6_hash_function_distinct_offsets_for_distinct_stress_keys`
+
+If the hash function ever regresses to a FxHash-class mixer,
+these fail loudly with thousands of missing-record assertions.
+See the [v0.9.6 release notes](.dev/release/v0.9.6.md) for the
+original diagnosis trail.
+
+**[`tests/transaction_rollback.rs`](tests/transaction_rollback.rs)** — 12 tests:
+
+- `err_from_closure_drops_every_staged_write`
+- `rollback_preserves_pre_transaction_state`
+- `successful_commit_makes_every_write_visible`
+- `read_your_writes_inside_transaction`
+- `closure_can_return_a_value`
+- `empty_transaction_is_a_noop`
+- `multiple_writes_to_same_key_keep_the_last_write`
+- `insert_then_remove_inside_txn_yields_no_record`
+- `rollback_drops_staged_insert_with_ttl`
+- 3 async equivalents on `AsyncEmdb::transaction`
+
+Pre-this-release the only transaction coverage was a single
+loom test. The rollback contract is now exercised end-to-end
+under both surfaces.
+
+### Tests
+
+178 + 23 new = **201 unit + integration tests passing**, plus
+22 doctests, plus 23 async streaming tests. All feature combos
+(`--no-default-features`, `ttl`, `ttl,nested,encrypt`,
+`async ttl`, `--all-features`) green. Clippy clean
+(`--all-features --all-targets -D warnings`), fmt clean,
+release build clean, doc build clean.
+
+### Internals — module map
+
+| Module | Change |
+|---|---|
+| [`src/encryption_admin.rs`](src/encryption_admin.rs) | `rewrite_database` extended with `.meta` sidecar moves + rollback. New `meta_sidecar()` helper. `remove_sidecars()` scrubs `.meta` too. |
+| [`src/error.rs`](src/error.rs) | Removed `NotImplemented`, `TransactionInvalid`, `TransactionAborted`, `LockPoisoned` variants + their `Display` arms + their tests. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Frame tag table corrected with constant names and the encryption-flag bit. |
+| [`tests/loom_tests.rs`](tests/loom_tests.rs) | Switched `Error::TransactionAborted` synthetic constructions to `Error::InvalidConfig`. |
+| [`README.md`](README.md) | Transaction rollback example switched from `TransactionAborted` to `InvalidConfig`. Install pins → 0.9.9. Status → 0.9.9. |
+| [`tests/encryption_admin.rs`](tests/encryption_admin.rs) | New file — 9 tests. |
+| [`tests/hash_regression.rs`](tests/hash_regression.rs) | New file — 2 tests. |
+| [`tests/transaction_rollback.rs`](tests/transaction_rollback.rs) | New file — 12 tests. |
+
+### Breaking changes
+
+**None for well-formed downstream code.** The removed `Error`
+variants live behind `#[non_exhaustive]`; any consumer
+matching them in a `_`-terminated arm continues to compile
+unchanged. Consumers that explicitly *constructed* one of the
+removed variants (none documented in any released example)
+would need to switch to a different variant.
+
+### Installation
+
+```toml
+[dependencies]
+emdb = "0.9.9"
+
+# All features
+emdb = { version = "0.9.9", features = ["ttl", "nested", "encrypt", "async"] }
+```
+
+MSRV: Rust 1.75.
+
 ## [0.9.8](https://github.com/jamesgober/emdb-rs/compare/v0.9.7...v0.9.8) — 2026-05-13
 
 **Polish + RC-prep release.** No source-logic changes — this is
