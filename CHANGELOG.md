@@ -4,6 +4,152 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.8](https://github.com/jamesgober/emdb-rs/compare/v0.9.7...v0.9.8) — 2026-05-13
+
+**Polish + RC-prep release.** No source-logic changes — this is
+the documentation refresh, examples sweep, doc-test expansion,
+and 1.0 stability-commitment release. The 0.9.x line is now in
+its final shape: 0.9.6 fixed the index hash function, 0.9.7
+shipped streaming async iterators, and 0.9.8 lands the
+documentation + 1.0 stability surface that downstream
+integrators need.
+
+### Documentation refresh
+
+Five new design docs added under [`docs/`](docs/), each
+load-bearing for a different reader:
+
+| Document | For |
+|---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Engine internals: storage substrate, sharded hash index, read/write paths, crash recovery, compaction, concurrency model, failure modes. The reference for contributors. |
+| [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | Per-op cost model + tuning knobs. Predict performance for a workload without running benchmarks. |
+| [`docs/PLATFORM-NOTES.md`](docs/PLATFORM-NOTES.md) | Linux / Windows / macOS / WSL2 specifics: io_uring, NVMe passthrough, `F_FULLFSYNC`, `FILE_FLAG_WRITE_THROUGH`, lockfile semantics, path resolution. |
+| [`docs/EXAMPLES.md`](docs/EXAMPLES.md) | When-to-use guide. Eager vs streaming, sync vs async, `insert_many` vs `transaction` vs loop, single namespace vs many, raw key vs passphrase encryption. |
+| [`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md) | 1.x SemVer + MSRV commitment, deprecation policy, on-disk format guarantees, yanked-release procedure, security-disclosure path. |
+
+[`docs/API.md`](docs/API.md) gains a comprehensive
+[Async surface](docs/API.md#async-surface) section covering
+both the eager and streaming variants on `AsyncEmdb` and
+`AsyncNamespace`. [`docs/BENCH.md`](docs/BENCH.md) is updated
+to reflect the seven bench harnesses (was six) and explains
+how the async surface relates to the bench numbers (no
+dedicated async harness; add the `spawn_blocking` dispatch +
+owned-`Vec` clone overhead to the sync numbers).
+
+### Examples sweep
+
+Nine new runnable example programs under
+[`examples/`](examples/), each focused on one capability:
+
+| Example | What it demonstrates |
+|---|---|
+| `bulk_load` | `insert_many` vs an insert-in-a-loop. |
+| `range_scan` | Opt-in `enable_range_scans(true)` + half-open ranges + prefix queries + lazy iteration. |
+| `ttl_cache` | `default_ttl` + `insert_with_ttl` + lazy expiry on read + eager `sweep_expired`. |
+| `transactions` | Atomic batches: commit-on-Ok, rollback-on-Err, returning a value from the closure. |
+| `namespaces` | Multi-tenant isolation via named namespaces — independent indexes, independent clears, independent drops. |
+| `zero_copy` | `get_zerocopy` returning a `ValueRef` borrowed directly from the mmap. |
+| `encryption` | Raw 32-byte key + Argon2id-derived passphrase + cipher choice (AES-GCM vs ChaCha20-Poly1305). |
+| `group_commit` | `FlushPolicy::OnEachFlush` vs `Group` vs `WriteThrough` — the v0.9.x reality (Group == OnEachFlush; WriteThrough is the real semantic distinction). |
+| `async_basics` | `AsyncEmdb` over a tokio multi-thread runtime: insert / get / namespace / transaction / sync_handle bridge. |
+| `streaming` | v0.9.7 `iter_stream` / `range_stream` / `range_prefix_stream` + early-drop cleanup. |
+
+Each new example is registered in `Cargo.toml` with the right
+`required-features`, so `cargo run --example <name>` picks up
+the necessary feature flags automatically.
+
+### Doc-test expansion (M-6)
+
+`# Examples` sections added to every load-bearing public
+method on `Emdb`:
+
+- `insert`, `insert_many`, `get`, `remove`
+- `flush`, `compact`
+- `namespace`
+- `transaction` (two doctests — commit + rollback)
+
+The doc-test count went from 13 to 22, all passing. Every
+public method that a user is likely to reach for now has a
+runnable example right next to its signature in the rustdoc.
+
+### `Cargo.toml` metadata polish
+
+- `description` rewritten to highlight the v0.9.x capabilities
+  (Bitcask-style journal, lock-free sharded index, at-rest
+  encryption, sync + async with streaming iterators) — same
+  length, sharper for crates.io search.
+- `keywords` tuned for crates.io discovery: `database`,
+  `embedded`, `key-value`, `kv`, `storage`.
+- `categories` unchanged: `database`,
+  `database-implementations`, `data-structures`, `caching`.
+
+### README polish
+
+- Status section refreshed to call out v0.9.8 as polish + RC
+  prep, with cross-links to the five new docs.
+- New top-level **Documentation** section after the install
+  block listing every doc + example destination.
+- Group-commit section corrected for the v0.9.x reality:
+  `OnEachFlush` and `Group` are functionally identical (both
+  share fsys's group-commit coordinator); the separate `Group`
+  variant is retained only for source-compat with v0.8.x
+  callers, and the previous `max_wait` / `max_batch` tuning
+  knobs are gone.
+- Cargo features list adds the `async` feature.
+- Stale "Range scans on a single namespace" entry removed
+  from the Non-goals section (range scans have been supported
+  via opt-in `enable_range_scans(true)` since v0.8).
+- Install pins bumped to 0.9.8; `async` added to the
+  all-features pin.
+
+### Breaking changes
+
+**None.** Pure documentation, examples, and metadata. All
+v0.9.x source code compiles and runs unchanged. The on-disk
+format is unchanged.
+
+### Tests
+
+All pre-0.9.8 tests still pass. The 9 new doc-tests added in
+this release pass under `--features ttl,nested,encrypt,async`.
+The 9 new examples each compile and run under their declared
+feature flags.
+
+178 unit + integration tests + 22 doctests + 23 async
+streaming tests, all green. Feature combos
+(`--no-default-features`, `--features ttl`,
+`--features ttl,nested,encrypt`, `--features "async ttl"`,
+`--all-features`) all check clean. Clippy clean, fmt clean,
+release build clean.
+
+### Internals — module map
+
+| Module | Change |
+|---|---|
+| [`Cargo.toml`](Cargo.toml) | Version bumped to 0.9.8. `description` sharpened. Five new `[[example]]` entries with `required-features` for the feature-gated examples. |
+| [`README.md`](README.md) | Status refresh, new Documentation index, group-commit prose updated for v0.9.x reality, Non-goals cleaned up, install pin → 0.9.8, `async` added to features list. |
+| [`docs/API.md`](docs/API.md) | New `## Async surface` section covering eager + streaming variants. `EmdbBuilder` table picks up `build_async()`. |
+| [`docs/BENCH.md`](docs/BENCH.md) | Bench-count corrected (six → seven; missing `index_hotpath` added). New paragraph on how async-surface perf relates to sync benches. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | New file — full engine reference. |
+| [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | New file — cost model + tuning. |
+| [`docs/PLATFORM-NOTES.md`](docs/PLATFORM-NOTES.md) | New file — OS-specific behaviour. |
+| [`docs/EXAMPLES.md`](docs/EXAMPLES.md) | New file — when-to-use guide. |
+| [`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md) | New file — 1.x stability contract. |
+| [`src/db.rs`](src/db.rs) | `# Examples` sections added to `insert`, `insert_many`, `get`, `remove`, `flush`, `compact`, `namespace`, `transaction`. No logic changes. |
+| [`examples/`](examples/) | Nine new programs: `bulk_load`, `range_scan`, `ttl_cache`, `transactions`, `namespaces`, `zero_copy`, `encryption`, `group_commit`, `async_basics`, `streaming`. |
+
+### Installation
+
+```toml
+[dependencies]
+emdb = "0.9.8"
+
+# All features
+emdb = { version = "0.9.8", features = ["ttl", "nested", "encrypt", "async"] }
+```
+
+MSRV: Rust 1.75.
+
 ## [0.9.7](https://github.com/jamesgober/emdb-rs/compare/v0.9.6...v0.9.7) — 2026-05-13
 
 **Streaming async iterators.** The async surface gains

@@ -1,6 +1,6 @@
 # Benchmarking emdb
 
-This project ships six Criterion / raw-timing benches:
+This project ships seven Criterion / raw-timing benches:
 
 - [`benches/kv.rs`](../benches/kv.rs) — focused micro-bench for the
   `insert` / `get` / `remove` hot paths, ephemeral DB, single thread.
@@ -10,6 +10,12 @@ This project ships six Criterion / raw-timing benches:
   multi-thread read fan-out (1 / 2 / 4 / 8 reader threads) against
   a pre-populated DB, showcases the lock-free `Arc<Mmap>` read
   path.
+- [`benches/index_hotpath.rs`](../benches/index_hotpath.rs) —
+  index-only microbench. Targets `Index::get` / `Index::insert` in
+  isolation, with no journal I/O. The right place to catch
+  regressions in the sharded hash path itself
+  (post-0.9.6 wyhash + Murmur3 fmix64 hash function, seqlock-
+  protected slot reads).
 - [`benches/group_commit.rs`](../benches/group_commit.rs) —
   multi-thread per-record-flush comparison between
   `FlushPolicy::OnEachFlush` and `FlushPolicy::Group`. Default
@@ -26,9 +32,24 @@ This project ships six Criterion / raw-timing benches:
   values, full phase set including bulk load, individual writes,
   batch writes, nosync writes, random reads × 2, MT reads at 4 /
   8 threads, removals, uncompacted / compacted size). Range-read
-  phases are recorded as `N/A` for emdb because the hash index
-  does not support sorted iteration unless
+  phases are recorded as `N/A` for emdb by default because the
+  hash index does not support sorted iteration unless
   `EmdbBuilder::enable_range_scans(true)` is set.
+
+## Async surface (no dedicated bench)
+
+The `async` feature wraps the sync surface in
+`tokio::task::spawn_blocking`; the streaming variants
+(`iter_stream`, `range_stream`, …) drive the sync iterator on
+the blocking pool with a bounded mpsc channel. There is no
+dedicated async bench harness — measure async perf by adding a
+`spawn_blocking` dispatch (~1 µs on a warm pool) plus one
+owned-`Vec` clone for key + value bytes on top of the sync
+numbers from the benches above. For pure-IO workloads (journal
+append, mmap decode, fsync) the wrapping overhead is
+negligible; for hot-key tight-loop reads the wrapping dominates
+and the sync surface via `AsyncEmdb::sync_handle()` is the
+right call.
 
 ## Quick runs
 

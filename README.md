@@ -82,34 +82,30 @@ For more thread-count granularity, run
 
 ### Group commit: multi-threaded per-record durability
 
-`FlushPolicy::Group` lets concurrent `flush()` calls share a single
-`fdatasync`. The shape that motivates it is N independent producer
-threads each writing one record then calling `flush` for per-record
-durability — a pattern where `OnEachFlush` pays N syncs even though
-one would do.
+Concurrent `flush()` calls share a single `fdatasync` automatically
+in 0.9.x — fsys's internal group-commit coordinator coalesces
+in-flight flushes around any active sync syscall, with no tuning
+knobs. The shape that benefits is N independent producer threads
+each writing one record then calling `flush` for per-record
+durability: instead of paying N syncs, the coalescer collapses
+them into one.
 
-Run with `cargo bench --bench group_commit --features ttl`. Default
-workload is 8 threads × 200 writes/thread:
+`FlushPolicy::OnEachFlush` (the default) and `FlushPolicy::Group`
+are functionally identical in 0.9.x; both route through the same
+coordinator. The separate `Group` variant is retained only for
+source-compatibility with v0.8.x callers that wrote
+`FlushPolicy::Group { max_wait, max_batch }`. Those tuning knobs
+are gone — fsys's coordinator runs on a different (immediate-
+coalesce) shape and the previous parameters did not map cleanly.
 
-| policy         | wall time (ms) |   writes/sec |    speedup |
-|----------------|---------------:|-------------:|-----------:|
-| OnEachFlush    |          2192  |         730  |      1.00× |
-| Group          |       **272**  |    **5 880** |  **8.06×** |
+Run with `cargo bench --bench group_commit --features ttl` to see
+the in-tree numbers on your hardware. New code should write:
 
-`max_batch` should be set close to the expected concurrent flusher
-count (typically `num_cpus`). Setting it higher means the leader
-waits the full `max_wait` for followers that can never arrive,
-turning batching into pure tail latency.
-
-```rust,no_run
-use std::time::Duration;
+```rust
 use emdb::{Emdb, FlushPolicy};
 
 let db = Emdb::builder()
-    .flush_policy(FlushPolicy::Group {
-        max_wait: Duration::from_micros(500),
-        max_batch: 8,
-    })
+    .flush_policy(FlushPolicy::OnEachFlush)  // default; explicit for clarity
     .build()?;
 # Ok::<(), emdb::Error>(())
 ```
@@ -150,8 +146,8 @@ tuning notes.
 
 ## Status
 
-**v0.9.7.** Pre-1.0; the 0.9.x line is API-stable and on-disk-
-format-stable. The storage substrate is a
+**v0.9.8.** Pre-1.0 polish + RC-prep release. The 0.9.x line is
+API-stable and on-disk-format-stable. The storage substrate is a
 [`fsys`](https://crates.io/crates/fsys) journal — lock-free LSN
 reservation, group-commit fsync, NVMe passthrough flush,
 io_uring on Linux — with `tune_for(Workload::Database)` preset
@@ -179,7 +175,15 @@ async-iterator variants (`iter_stream`, `keys_stream`,
 `iter_after_stream`) backed by a bounded
 `tokio::sync::mpsc` channel — memory in flight is bounded by
 the channel depth rather than the namespace size, and the
-blocking pump task respects consumer backpressure.
+blocking pump task respects consumer backpressure. **v0.9.8**
+is the polish + RC-prep release — docs refresh
+([ARCHITECTURE.md](docs/ARCHITECTURE.md),
+[PERFORMANCE.md](docs/PERFORMANCE.md),
+[PLATFORM-NOTES.md](docs/PLATFORM-NOTES.md),
+[EXAMPLES.md](docs/EXAMPLES.md),
+[STABILITY-1.0.md](docs/STABILITY-1.0.md)),
+9 new runnable examples, expanded doc-tests on every
+load-bearing public method, no source-logic changes.
 
 > **v0.9.3 users:** upgrade to v0.9.4 or later. v0.9.3 shipped
 > with a TOCTOU race in the new primary index that could cause
@@ -214,13 +218,28 @@ No further architectural changes are planned before 1.0.
 
 ```toml
 [dependencies]
-emdb = "0.9.7"
+emdb = "0.9.8"
 
 # All optional features
-emdb = { version = "0.9.7", features = ["ttl", "nested", "encrypt", "async"] }
+emdb = { version = "0.9.8", features = ["ttl", "nested", "encrypt", "async"] }
 ```
 
 MSRV: Rust 1.75.
+
+## Documentation
+
+- [API reference](docs/API.md) — every public method documented.
+- [Architecture](docs/ARCHITECTURE.md) — storage substrate, index,
+  read/write paths, crash recovery, compaction.
+- [Performance](docs/PERFORMANCE.md) — per-op cost model + tuning.
+- [Platform notes](docs/PLATFORM-NOTES.md) — Linux / Windows / macOS
+  specifics.
+- [Examples guide](docs/EXAMPLES.md) — when to reach for which API.
+- [Stability commitment](docs/STABILITY-1.0.md) — the 1.x SemVer
+  + MSRV contract.
+- [Benchmark guide](docs/BENCH.md) — running the bench harnesses.
+- [API docs on docs.rs](https://docs.rs/emdb).
+- Runnable examples under [`examples/`](examples/).
 
 ## Quick start
 
@@ -427,6 +446,11 @@ scoped to a named namespace.
 - `encrypt` — AES-256-GCM + ChaCha20-Poly1305 at-rest encryption with
   raw-key or Argon2id-derived passphrase. Pulls in `aes-gcm`,
   `chacha20poly1305`, `argon2`, `rand_core`.
+- `async` — `AsyncEmdb` / `AsyncNamespace` wrappers via tokio's
+  `spawn_blocking`, plus streaming-iterator variants
+  (`iter_stream`, `keys_stream`, `range_stream`, …) backed by a
+  bounded `tokio::sync::mpsc` channel. Pulls in `tokio`
+  (`rt` + `rt-multi-thread` + `macros` + `sync`) and `tokio-stream`.
 - `bench-compare` — pulls in `redb` and `sled` for the comparative
   bench (dev-only; not for production builds).
 - `bench-rocksdb` / `bench-redis` — additional comparative bench peers.
@@ -607,8 +631,6 @@ atomic rewrite-then-rename, leaving an `.encbak` backup.
 - Client/server operation (use a dedicated DBMS for that).
 - SQL.
 - Distributed replication.
-- Range scans on a single namespace (the index is hash-based; insert a
-  prefix-sorted secondary structure on top if you need ranges).
 
 ## Benchmarking
 

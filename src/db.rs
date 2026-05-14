@@ -194,6 +194,22 @@ impl Emdb {
     // ---- core key/value operations ----
 
     /// Insert or replace a key/value pair.
+    ///
+    /// Writes one frame to the journal; returns as soon as the bytes
+    /// are in the OS page cache (the default `FlushPolicy::OnEachFlush`
+    /// — durability is established only by a subsequent `flush`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use emdb::Emdb;
+    ///
+    /// let db = Emdb::open_in_memory();
+    /// db.insert("name", "emdb")?;
+    /// db.insert(b"key".to_vec(), b"value".to_vec())?;
+    /// assert_eq!(db.get("name")?.as_deref(), Some(b"emdb".as_slice()));
+    /// # Ok::<(), emdb::Error>(())
+    /// ```
     pub fn insert(&self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
         let key = key.into();
         let value = value.into();
@@ -207,6 +223,26 @@ impl Emdb {
     }
 
     /// Insert many key/value pairs in one vectored journal-append pass.
+    ///
+    /// Routes through `fsys::JournalHandle::append_batch` — one LSN
+    /// reservation, one `pwrite` of the whole batch as a single
+    /// contiguous buffer. Strictly faster than the equivalent
+    /// insert-in-a-loop, especially under any flush policy that
+    /// would otherwise pay per-record fsync.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use emdb::Emdb;
+    ///
+    /// let db = Emdb::open_in_memory();
+    /// let batch: Vec<(String, String)> = (0..1000)
+    ///     .map(|i| (format!("k{i}"), format!("v{i}")))
+    ///     .collect();
+    /// db.insert_many(batch.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
+    /// assert_eq!(db.len()?, 1000);
+    /// # Ok::<(), emdb::Error>(())
+    /// ```
     pub fn insert_many<I, K, V>(&self, items: I) -> Result<()>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -261,6 +297,26 @@ impl Emdb {
     }
 
     /// Fetch a value by key.
+    ///
+    /// Allocates a fresh `Vec<u8>` for the returned value. For tight
+    /// loops on small values where the allocation dominates, prefer
+    /// [`Self::get_zerocopy`] — it borrows directly from the mmap.
+    ///
+    /// Returns `Ok(None)` for missing keys, expired records (when the
+    /// `ttl` feature is on), and tombstoned slots. Returns `Err` only
+    /// on I/O / decode failures.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use emdb::Emdb;
+    ///
+    /// let db = Emdb::open_in_memory();
+    /// db.insert("k", "v")?;
+    /// assert_eq!(db.get("k")?.as_deref(), Some(b"v".as_slice()));
+    /// assert_eq!(db.get("missing")?, None);
+    /// # Ok::<(), emdb::Error>(())
+    /// ```
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
         #[cfg(feature = "ttl")]
@@ -283,6 +339,23 @@ impl Emdb {
     }
 
     /// Remove a key, returning the previously-stored value if any.
+    ///
+    /// Writes a tombstone frame to the journal. The on-disk record is
+    /// removed only at compaction time; lookups return `None` from
+    /// the moment `remove` returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use emdb::Emdb;
+    ///
+    /// let db = Emdb::open_in_memory();
+    /// db.insert("k", "v")?;
+    /// assert_eq!(db.remove("k")?.as_deref(), Some(b"v".as_slice()));
+    /// assert!(db.get("k")?.is_none());
+    /// assert!(db.remove("k")?.is_none()); // already removed
+    /// # Ok::<(), emdb::Error>(())
+    /// ```
     pub fn remove(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         self.inner.engine.remove(DEFAULT_NAMESPACE_ID, key.as_ref())
     }
@@ -310,6 +383,22 @@ impl Emdb {
     }
 
     /// Force pending writes to disk (`fdatasync`).
+    ///
+    /// Insert calls return as soon as bytes are in the OS page cache;
+    /// durability is established here. Concurrent `flush` calls from
+    /// multiple threads coalesce through fsys's group-commit
+    /// coordinator into a single sync syscall.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use emdb::Emdb;
+    ///
+    /// let db = Emdb::open_in_memory();
+    /// db.insert("k", "v")?;
+    /// db.flush()?; // bytes are now durable (no-op on in-memory)
+    /// # Ok::<(), emdb::Error>(())
+    /// ```
     pub fn flush(&self) -> Result<()> {
         self.inner.engine.flush()
     }
@@ -718,6 +807,19 @@ impl Emdb {
     /// Returns I/O errors from the rewrite, sync, or rename phases.
     /// On failure the original file is left untouched and the temp
     /// file is best-effort cleaned up.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use emdb::Emdb;
+    ///
+    /// let db = Emdb::open_in_memory();
+    /// for i in 0_u32..100 { db.insert(format!("k{i}"), "v")?; }
+    /// for i in 0_u32..100 { let _ = db.remove(format!("k{i}"))?; }
+    /// db.compact()?; // reclaim space from the 100 tombstones
+    /// assert_eq!(db.len()?, 0);
+    /// # Ok::<(), emdb::Error>(())
+    /// ```
     pub fn compact(&self) -> Result<()> {
         self.inner.engine.compact_in_place()
     }
@@ -731,6 +833,23 @@ impl Emdb {
     // ---- namespace operations ----
 
     /// Open or create a named namespace.
+    ///
+    /// Each named namespace has its own hash index, its own `len()`,
+    /// and its own lifecycle. Use namespaces to isolate logical
+    /// "tables" within one database file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use emdb::Emdb;
+    ///
+    /// let db = Emdb::open_in_memory();
+    /// let users = db.namespace("users")?;
+    /// users.insert("alice", "data")?;
+    /// assert_eq!(users.len()?, 1);
+    /// assert_eq!(db.len()?, 0); // default namespace is untouched
+    /// # Ok::<(), emdb::Error>(())
+    /// ```
     pub fn namespace(&self, name: impl AsRef<str>) -> Result<crate::namespace::Namespace> {
         let name_ref = name.as_ref();
         let ns_id = self.inner.engine.create_or_open_namespace(name_ref)?;
@@ -763,6 +882,37 @@ impl Emdb {
     /// CRC) but a crash mid-commit leaves a prefix of the batch
     /// durable. This is a deliberate trade-off for write throughput.
     /// Callers that need true all-or-nothing must use external means.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use emdb::Emdb;
+    ///
+    /// let db = Emdb::open_in_memory();
+    /// db.transaction(|tx| {
+    ///     tx.insert("a", "1")?;
+    ///     tx.insert("b", "2")?;
+    ///     tx.insert("c", "3")?;
+    ///     Ok(())
+    /// })?;
+    /// assert_eq!(db.len()?, 3);
+    /// # Ok::<(), emdb::Error>(())
+    /// ```
+    ///
+    /// Returning `Err` rolls back staged writes:
+    ///
+    /// ```
+    /// use emdb::{Emdb, Error};
+    ///
+    /// let db = Emdb::open_in_memory();
+    /// let result: Result<(), Error> = db.transaction(|tx| {
+    ///     tx.insert("staged", "value")?;
+    ///     Err(Error::InvalidConfig("rolling back"))
+    /// });
+    /// assert!(result.is_err());
+    /// assert!(db.get("staged")?.is_none());
+    /// # Ok::<(), emdb::Error>(())
+    /// ```
     pub fn transaction<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&mut crate::transaction::Transaction<'_>) -> Result<T>,
