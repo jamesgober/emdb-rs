@@ -133,18 +133,34 @@ impl Emdb {
             )?);
         }
 
-        // No path supplied at all → ephemeral mode. Synthesise a unique
-        // tempfile path and mark the resulting handle ephemeral so the
-        // file is removed on Drop.
+        // No path supplied at all → ephemeral mode. Synthesise a
+        // unique tempfile path and mark the resulting handle
+        // ephemeral so the file is removed on Drop.
+        //
+        // Uniqueness sources: a process-global atomic counter (every
+        // call inside one process gets a distinct value), the OS
+        // process id (distinguishes concurrent processes — e.g. two
+        // cargo test workers, or two doctest executables running side
+        // by side), the system nanosecond clock (cosmetic — helps
+        // debugging by sorting paths chronologically), and the
+        // current thread id (further entropy for forensics). The
+        // counter alone is sufficient for in-process uniqueness;
+        // including pid + nanos + tid is belt-and-suspenders so the
+        // path is unique across the whole machine even under heavy
+        // parallel test workloads.
         let (path, ephemeral) = match path {
             Some(p) => (p, false),
             None => {
+                use core::sync::atomic::{AtomicU64, Ordering};
+                static MEMORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+                let counter = MEMORY_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let pid = std::process::id();
                 let mut p = std::env::temp_dir();
                 let nanos = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0_u128, |d| d.as_nanos());
                 let tid = std::thread::current().id();
-                p.push(format!("emdb-mem-{nanos}-{tid:?}.emdb"));
+                p.push(format!("emdb-mem-{pid}-{counter}-{nanos}-{tid:?}.emdb"));
                 (p, true)
             }
         };
