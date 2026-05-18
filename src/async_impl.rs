@@ -804,4 +804,60 @@ impl AsyncNamespace {
         let iter = blocking(move || ns.iter_after(start)).await?;
         Ok(spawn_iter_stream(iter))
     }
+
+    // ---- TTL methods (mirror `AsyncEmdb` for namespace-scoped records) ----
+
+    /// Insert with TTL.
+    #[cfg(feature = "ttl")]
+    pub async fn insert_with_ttl<K, V>(&self, key: K, value: V, ttl: Ttl) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let ns = self.inner.clone();
+        let key = key.as_ref().to_vec();
+        let value = value.as_ref().to_vec();
+        blocking(move || ns.insert_with_ttl(key, value, ttl)).await
+    }
+
+    /// Expiration timestamp (Unix ms) for the key, if any.
+    #[cfg(feature = "ttl")]
+    pub async fn expires_at<K>(&self, key: K) -> Result<Option<u64>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let ns = self.inner.clone();
+        let key = key.as_ref().to_vec();
+        blocking(move || ns.expires_at(key)).await
+    }
+
+    /// Remaining TTL for the key, if any.
+    #[cfg(feature = "ttl")]
+    pub async fn ttl<K>(&self, key: K) -> Result<Option<Duration>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let ns = self.inner.clone();
+        let key = key.as_ref().to_vec();
+        blocking(move || ns.ttl(key)).await
+    }
+
+    /// Strip the expiration from the key.
+    #[cfg(feature = "ttl")]
+    pub async fn persist<K>(&self, key: K) -> Result<bool>
+    where
+        K: AsRef<[u8]>,
+    {
+        let ns = self.inner.clone();
+        let key = key.as_ref().to_vec();
+        blocking(move || ns.persist(key)).await
+    }
+
+    /// Sweep expired records in this namespace. Returns the count
+    /// removed.
+    #[cfg(feature = "ttl")]
+    pub async fn sweep_expired(&self) -> Result<usize> {
+        let ns = self.inner.clone();
+        blocking_infallible(move || ns.sweep_expired()).await
+    }
 }

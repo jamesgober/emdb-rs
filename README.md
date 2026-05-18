@@ -31,10 +31,23 @@ Windows where appropriate); emdb handles the engine-level concerns.
 
 ### Performance vs. peers
 
-5 M records, 24-byte random keys, 150-byte random values — same workload
-shape as redb's published bench. Lower is better; numbers in
-milliseconds. Run on a Windows 11 NVMe consumer box. Reproduce with
-`cargo bench --bench lmdb_style --features ttl,bench-compare`.
+5 M records, 24-byte random keys, 150-byte random values — same
+workload shape as redb's published bench. Numbers below are
+wall-time milliseconds (lower is better) captured **2026-05-04
+on emdb v0.9.0** against redb 2.6 + sled 0.34, on a Windows 11
+consumer NVMe machine (4-core class CPU, 32 GB RAM, TLC NVMe
+SSD). No source-logic changes have shifted the read/write hot
+paths in 0.9.1 – 0.9.10, so the numbers stand for the current
+release. Reproduce with:
+
+```powershell
+$env:EMDB_BENCH_RECORDS = "5000000"
+cargo bench --bench lmdb_style --features ttl,bench-compare
+```
+
+See [`docs/BENCH.md`](docs/BENCH.md) for the full methodology
++ recommended hardware reporting fields when posting your own
+numbers.
 
 | phase                       |          emdb |       redb  |      sled  |  emdb vs redb     |
 |-----------------------------|--------------:|------------:|-----------:|------------------:|
@@ -43,7 +56,7 @@ milliseconds. Run on a Windows 11 NVMe consumer box. Reproduce with
 | batch writes                |    **292 ms** |    5 970 ms |   1 286 ms |     20.4× faster  |
 | nosync writes               |    **127 ms** |    1 025 ms |     675 ms |      8.1× faster  |
 | random reads (1 M)          |    **322 ms** |    2 765 ms |   6 079 ms |      8.6× faster  |
-| random reads (4 threads)    |    **703 ms** |   11 210y ms |  22 884 ms |     15.9× faster  |
+| random reads (4 threads)    |    **703 ms** |   11 210 ms |  22 884 ms |     15.9× faster  |
 | random reads (8 threads)    |    **511 ms** |   13 026 ms |  23 392 ms | **25.5× faster**  |
 | removals                    |  **5 662 ms** |   33 348 ms |  25 631 ms |      5.9× faster  |
 | compaction                  |  **8 268 ms** |   12 540 ms |       N/A  |      1.5× faster  |
@@ -71,11 +84,12 @@ note on the column where the table doesn't tell the whole story:
 
 ### Read scaling under fan-out
 
-The MT random-read columns above show emdb scaling to **9.94 M
-reads/sec aggregate at 8 threads** on a 4-core consumer box, while
-redb stalls near 347 K/sec past one thread. The lock-free `Arc<Mmap>`
-read path plus the 64-shard hash index keep the hot path contention-
-free; past core count, shared memory bandwidth is the only cap.
+The MT random-read columns above show emdb scaling to **~9.78 M
+reads/sec aggregate at 8 threads** (5 M reads / 511 ms) on a
+4-core consumer box, while redb stalls near 384 K/sec past one
+thread (5 M reads / 13 026 ms). The lock-free `Arc<Mmap>` read
+path plus the 64-shard hash index keep the hot path contention-
+free; past core count, shared memory bandwidth is the cap.
 
 For more thread-count granularity, run
 `cargo bench --bench concurrent_reads`.
@@ -146,7 +160,7 @@ tuning notes.
 
 ## Status
 
-**v0.9.9.** Pre-1.0 audit fix-up release. The 0.9.x line is
+**v0.9.10.** Final pre-1.0 release — Tier 2 audit closure. The 0.9.x line is
 API-stable and on-disk-format-stable. The storage substrate is a
 [`fsys`](https://crates.io/crates/fsys) journal — lock-free LSN
 reservation, group-commit fsync, NVMe passthrough flush,
@@ -218,10 +232,10 @@ No further architectural changes are planned before 1.0.
 
 ```toml
 [dependencies]
-emdb = "0.9.9"
+emdb = "0.9.10"
 
 # All optional features
-emdb = { version = "0.9.9", features = ["ttl", "nested", "encrypt", "async"] }
+emdb = { version = "0.9.10", features = ["ttl", "nested", "encrypt", "async"] }
 ```
 
 MSRV: Rust 1.75.

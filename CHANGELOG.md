@@ -4,6 +4,156 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.10](https://github.com/jamesgober/emdb-rs/compare/v0.9.9...v0.9.10) — 2026-05-14
+
+**Final pre-1.0 release** — Tier 2 closure of the audit roadmap.
+0.9.10 lands the audit's "should-close-before-1.0" items: TTL
+on `Namespace`, 25 new edge-case tests for previously
+uncovered boundaries, and README hardware-spec / read-scaling
+honesty polish. After 0.9.10 ships clean the next decision is
+1.0.0 — pure version freeze, no further code.
+
+On-disk format unchanged. v0.9.x databases open unchanged on
+0.9.10.
+
+### `Namespace` and `AsyncNamespace` gain the TTL surface
+
+Pre-0.9.10 the docs claimed `Namespace` exposed "the same
+surface as `Emdb`" but in fact every TTL method
+(`insert_with_ttl`, `expires_at`, `ttl`, `persist`,
+`sweep_expired`) lived only on `Emdb`. Namespace-scoped TTL
+records were inserted at TTL=0 unconditionally — the
+`default_ttl` builder setting did not flow through to
+`Namespace::insert` / `insert_many`, and `Namespace::get` did
+not filter expired records at all (it called the engine's
+raw `get` rather than `get_with_meta` with expiry check).
+
+This release closes the gap fully:
+
+- `Namespace::insert` and `Namespace::insert_many` now inherit
+  the parent database's `default_ttl` exactly the same way
+  `Emdb::insert` and `Emdb::insert_many` do.
+- `Namespace::get` now filters expired records lazily — same
+  semantics as `Emdb::get`.
+- `Namespace::insert_with_ttl(key, value, ttl)` lets callers
+  override per-record.
+- `Namespace::expires_at(key)` returns the absolute expiry
+  timestamp (or `None` for missing keys / 0 for no-TTL).
+- `Namespace::ttl(key)` returns the remaining `Duration`.
+- `Namespace::persist(key)` strips the TTL, returning whether
+  a TTL was previously set.
+- `Namespace::sweep_expired()` evicts expired records *only
+  within this namespace* — does not touch siblings or the
+  default namespace.
+
+`AsyncNamespace` picks up the matching async wrappers
+(`insert_with_ttl`, `expires_at`, `ttl`, `persist`,
+`sweep_expired`), each routing through `spawn_blocking` like
+the rest of the async surface.
+
+API.md's namespace section is updated to describe the now-
+accurate "same surface" claim and call out the TTL methods
+explicitly.
+
+### 25 new tests — Tier 2 edge-case sweep
+
+[`tests/namespace_ttl.rs`](tests/namespace_ttl.rs) — 10 tests:
+
+- `insert_with_ttl_expires_lazily_on_namespace_get`
+- `ttl_never_records_survive_on_namespace`
+- `namespace_insert_inherits_parent_default_ttl`
+- `namespace_insert_many_inherits_parent_default_ttl`
+- `expires_at_and_ttl_return_correct_values`
+- `persist_strips_ttl_from_namespace_record`
+- `sweep_expired_only_evicts_records_in_this_namespace`
+- 3 async parity tests on `AsyncNamespace`
+
+[`tests/edge_cases.rs`](tests/edge_cases.rs) — 15 tests
+covering every boundary the audit flagged:
+
+| Category | Test | What it locks down |
+|---|---|---|
+| Empty / binary keys | `insert_many_accepts_empty_key` | Zero-length keys work via vectored append |
+| Empty / binary keys | `transaction_accepts_empty_value` | Zero-length values inside transactions |
+| Empty / binary keys | `empty_key_and_empty_value_round_trip` | `b""` key + `b""` value composes |
+| Empty / binary keys | `binary_key_with_high_bytes_round_trips` | Non-UTF8 keys round-trip cleanly |
+| Range edges | `range_with_empty_start_bound_yields_every_record_below_end` | `b""..end` is a valid bound |
+| Range edges | `range_scan_crosses_tombstones_correctly` | Tombstones are skipped, not yielded |
+| Range edges | `range_prefix_with_binary_non_utf8_prefix` | Prefix iteration on raw bytes works |
+| TTL composition | `ttl_via_insert_many_inherits_default_ttl` | Default TTL flows through vectored insert |
+| TTL composition | `compact_drops_expired_records` | `sweep_expired` + `compact` reclaim space |
+| Crash recovery | `ttl_records_survive_drop_and_reopen` | TTL metadata persists across reopens |
+| Crash recovery | `encrypted_db_with_ttl_survives_drop_and_reopen` | Encrypted DB + TTL + checkpoint + reopen |
+| Async edges | `empty_namespace_iter_stream_terminates_cleanly` | Empty stream returns `None` correctly |
+| Async edges | `keys_stream_on_empty_db_terminates` | Empty key-stream terminates |
+| Async edges | `stream_cancelled_via_select_does_not_panic` | Stream drop under `tokio::select!` cancel |
+| Async edges | `range_stream_on_empty_db_terminates` | Empty range-stream behaves correctly |
+
+### README polish
+
+- Reconciled the 9.94 M vs 9.78 M reads/sec discrepancy: math
+  is `5_000_000 reads / 0.511 s = 9.78 M reads/sec`. README
+  now matches `docs/BENCH.md`. Also includes the redb
+  comparison number (384 K/sec at 8 threads, computed the
+  same way).
+- Hardware spec sharpened: "Windows 11 NVMe consumer box"
+  expanded to "Windows 11 consumer NVMe machine (4-core class
+  CPU, 32 GB RAM, TLC NVMe SSD)" with the capture date and
+  emdb version. Cross-links to
+  [`docs/BENCH.md`](docs/BENCH.md) for the full methodology
+  fields recommended when reporting numbers from other
+  hardware.
+- Fixed a stray `y` typo in the redb 4-thread cell
+  (`11 210y ms` → `11 210 ms`).
+
+### Tests
+
+201 → **226 unit + integration tests** (was 201 in 0.9.9), plus
+22 doctests, plus 23 async streaming tests. All feature combos
+(`--no-default-features`, `ttl`,
+`ttl,nested,encrypt`, `async ttl`, `--all-features`) green.
+Clippy clean (`--all-features --all-targets -D warnings`), fmt
+clean, release build clean, doc build clean.
+
+### Internals — module map
+
+| Module | Change |
+|---|---|
+| [`src/namespace.rs`](src/namespace.rs) | Added 5 TTL methods + `compute_default_expires_at` helper. `insert` / `insert_many` now flow `default_ttl` through. `get` now filters expired records lazily. |
+| [`src/async_impl.rs`](src/async_impl.rs) | Added 5 async TTL methods on `AsyncNamespace`. |
+| [`docs/API.md`](docs/API.md) | Namespace section updated to describe the now-accurate TTL surface. |
+| [`README.md`](README.md) | Status → 0.9.10. Hardware spec + read-scaling math reconciled with BENCH.md. Install pins → 0.9.10. |
+| [`tests/namespace_ttl.rs`](tests/namespace_ttl.rs) | New file — 10 tests. |
+| [`tests/edge_cases.rs`](tests/edge_cases.rs) | New file — 15 tests. |
+
+### Breaking changes
+
+**One subtle behaviour change.** `Namespace::insert` and
+`Namespace::insert_many` previously stored every record at
+TTL=0 unconditionally; they now inherit `default_ttl` if the
+parent database was built with one. Code that relied on
+"namespace inserts ignore default_ttl" will see records expire
+where they previously didn't.
+
+This is the principled fix and matches the documented "same
+surface as Emdb" contract; downstream code that wants the old
+behaviour can call `Namespace::insert_with_ttl(k, v, Ttl::Never)`
+to opt out per record. Not gated as a breaking version bump
+because the previous behaviour was undocumented (and contradicted
+the docs).
+
+### Installation
+
+```toml
+[dependencies]
+emdb = "0.9.10"
+
+# All features
+emdb = { version = "0.9.10", features = ["ttl", "nested", "encrypt", "async"] }
+```
+
+MSRV: Rust 1.75.
+
 ## [0.9.9](https://github.com/jamesgober/emdb-rs/compare/v0.9.8...v0.9.9) — 2026-05-14
 
 **Pre-1.0 audit fix-up release.** After 0.9.8 shipped, ran a
