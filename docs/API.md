@@ -54,8 +54,8 @@ concurrently.
 - `Error::AlreadyLocked` — another process holds the lock. See
   [Lockfile recovery](#lockfile-recovery) for diagnosis.
 - `Error::MagicMismatch` / `Error::VersionMismatch` /
-  `Error::Corrupted` — the file exists but is not a valid v0.9
-  emdb database.
+  `Error::Corrupted` — the file exists but is not a valid
+  emdb v0.9+/v1.x database.
 
 **Examples**
 
@@ -1182,7 +1182,7 @@ let mut stream = db.iter_stream().await?;
 let mut processed = 0_u64;
 while let Some((_key, value)) = stream.next().await {
     // Process incrementally. Memory peak ≈ 64 × per-record bytes,
-    // not 10 000 × per-record bytes.
+    // not 10,000 × per-record bytes.
     processed += value.len() as u64;
 }
 println!("processed {processed} bytes");
@@ -1205,9 +1205,28 @@ println!("processed {processed} bytes");
 
 ### AsyncNamespace
 
-Same shape, scoped to one named namespace. Every method on
-`Namespace` has the same async mirror (eager + streaming).
-Construct via `AsyncEmdb::namespace(name).await`.
+Cheap-clone handle scoped to one named namespace inside an
+`AsyncEmdb`. Mirrors every method on the sync `Namespace`,
+threaded through `spawn_blocking`. Construct via
+`AsyncEmdb::namespace(name).await`.
+
+**Core KV** (eager): `insert`, `insert_many`, `get`, `remove`,
+`contains_key`, `len`, `is_empty`, `clear`.
+
+**Eager iteration**: `iter`, `keys`, `range`, `range_prefix`,
+`iter_from`, `iter_after`.
+
+**Streaming iteration** (returns `tokio_stream::wrappers::ReceiverStream`):
+`iter_stream`, `keys_stream`, `range_stream`,
+`range_prefix_stream`, `iter_from_stream`, `iter_after_stream`.
+
+**TTL** (`ttl` feature): `insert_with_ttl`, `expires_at`, `ttl`,
+`persist`, `sweep_expired` — same semantics as `Namespace` but
+async.
+
+**Plumbing**: `name() -> &str`, `sync_handle() -> crate::Namespace`
+(bridge to the sync surface for operations the async wrapper
+doesn't expose, e.g. zero-copy reads).
 
 ### Send + Clone
 
@@ -1245,16 +1264,22 @@ pub enum FlushPolicy {
 ### `Ttl`
 
 ```rust,ignore
+#[non_exhaustive]
 pub enum Ttl {
-    None,
+    /// Use the builder-configured `default_ttl`. Behaves as
+    /// `Ttl::Never` when no default was set.
     Default,
-    Duration(Duration),
-    ExpiresAt(u64),
+    /// Explicit no-expiration.
+    Never,
+    /// Expire after the given `Duration` from insertion.
+    After(Duration),
 }
 ```
 
 Per-record expiration, used by `insert_with_ttl`. `Ttl::Default`
-delegates to the builder's `default_ttl`.
+delegates to the builder's `default_ttl`; `Ttl::Never` overrides
+any default to give the record permanent residency; `Ttl::After`
+sets an absolute expiry of `now + duration`.
 
 ### `ValueRef`
 
@@ -1298,14 +1323,46 @@ won't break exhaustive matches.
 #[non_exhaustive]
 pub struct LockHolder {
     pub pid: u32,
-    pub acquired_at_ms: u64,
+    pub acquired_at_unix_millis: u64,
     pub schema_version: u32,
     pub crate_version: String,
 }
 ```
 
 Returned by `Emdb::lock_holder()`. Use to diagnose stale locks
-before calling `break_lock`.
+before calling `break_lock`. `acquired_at_unix_millis` is the
+wall-clock time at which the lock was acquired, in milliseconds
+since the Unix epoch.
+
+### Iterator types
+
+emdb's iteration methods return owned-iterator structs (one for the
+default namespace, one for named namespaces). Each implements the
+standard `Iterator` trait and decodes records lazily from a snapshot
+of offsets captured at construction time.
+
+**Default-namespace iterators** (returned by `Emdb` methods):
+
+| Type | Returned by | `Iterator::Item` |
+|---|---|---|
+| `EmdbIter` | `Emdb::iter()` | `(Vec<u8>, Vec<u8>)` |
+| `EmdbKeyIter` | `Emdb::keys()` | `Vec<u8>` |
+| `EmdbRangeIter` | `Emdb::range_iter()`, `Emdb::range_prefix_iter()`, `Emdb::iter_from()`, `Emdb::iter_after()` | `(Vec<u8>, Vec<u8>)` |
+
+**Namespace iterators** (returned by `Namespace` methods):
+
+| Type | Returned by | `Iterator::Item` |
+|---|---|---|
+| `NamespaceIter` | `Namespace::iter()` | `(Vec<u8>, Vec<u8>)` |
+| `NamespaceKeyIter` | `Namespace::keys()` | `Vec<u8>` |
+| `NamespaceRangeIter` | `Namespace::range_iter()`, `Namespace::range_prefix_iter()`, `Namespace::iter_from()`, `Namespace::iter_after()` | `(Vec<u8>, Vec<u8>)` |
+
+All six are `Send` and own their snapshot, so they can move freely
+across threads — but the underlying engine handle (`Arc<Inner>`) is
+shared, so dropping the source `Emdb` / `Namespace` does **not**
+invalidate an iterator that already took its snapshot. Records
+removed or overwritten after the snapshot was taken are skipped
+silently on `next()`.
 
 ### `Cipher` (`encrypt` feature)
 
@@ -1320,11 +1377,20 @@ pub enum Cipher {
 ### `EncryptionInput` (`encrypt` feature)
 
 ```rust,ignore
+#[non_exhaustive]
 pub enum EncryptionInput {
-    RawKey([u8; 32]),
+    /// Raw 32-byte AES-256 key. Used as-is.
+    Key([u8; 32]),
+    /// UTF-8 passphrase derived to a 32-byte key via Argon2id.
+    /// On a fresh database the salt is generated; on reopen it is
+    /// read from the metadata sidecar.
     Passphrase(String),
 }
 ```
+
+Used by the static encryption-admin methods
+(`Emdb::enable_encryption`, `Emdb::disable_encryption`,
+`Emdb::rotate_encryption_key`).
 
 Used by the static encryption-admin methods.
 
@@ -1339,7 +1405,7 @@ handle in production code:
 |---|---|---|
 | `Io(io::Error)` | Filesystem error (disk full, permission denied, etc.). | Inspect the inner `io::Error`. |
 | `AlreadyLocked` | `Emdb::open` saw a held lock. | See [Lockfile recovery](#lockfile-recovery). |
-| `MagicMismatch` | File at the path is not an emdb v0.9 database. | Confirm the path. v0.7/v0.8 files are not compatible with v0.9. |
+| `MagicMismatch` | File at the path is not an emdb v0.9+/v1.x database. | Confirm the path. v0.7/v0.8 files are not compatible with v0.9+/v1.x. |
 | `VersionMismatch { found, expected }` | File version doesn't match this emdb release. | Migrate via the previous emdb release. |
 | `Corrupted { offset, reason }` | Frame validation or CRC mismatch. | Restore from backup. fsys's frame format is CRC-32C protected; this fires on hardware-level corruption or external tampering. |
 | `InvalidConfig(reason)` | Builder configuration was inconsistent. | Fix the builder call site. |

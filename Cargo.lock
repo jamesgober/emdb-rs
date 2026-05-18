@@ -481,7 +481,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "emdb"
-version = "0.9.10"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -559,9 +559,9 @@ dependencies = [
 
 [[package]]
 name = "fsys"
-version = "0.9.8"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e8be20fb06beb39264fa266b57eb184892f8d39e7a8ccf853819815b186e4f6"
+checksum = "90c61a9e2d6547f9b187fc0438108a5274bf9c6a8d21d82c517d7825d901b2a5"
 dependencies = [
  "crc32c",
  "crossbeam-channel",

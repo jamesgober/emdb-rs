@@ -51,7 +51,7 @@ use crate::storage::meta::{self, MetaHeader};
 use crate::{Error, Result};
 
 /// fsys frame overhead: 4 magic + 4 length + 4 CRC = 12 bytes.
-/// Constant per fsys 0.9.x v1 journal frame format.
+/// Constant per fsys journal frame format (v1 wire format).
 const FSYS_FRAME_OVERHEAD: u64 = 12;
 /// Number of leading frame-header bytes before the payload starts.
 /// 4 magic + 4 length = 8 bytes preceding the payload.

@@ -1,6 +1,6 @@
 [package]
 name = "emdb"
-version = "0.9.10"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -44,7 +44,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 # emdb's storage layer wraps fsys's `JournalHandle` for the write
 # path; the read path keeps its own mmap over the journal file for
 # zero-copy lookups.
-fsys = "0.9.8"
+fsys = "1.0"
 crc32fast = "1.4"
 fs4 = "0.8"
 # Memory-mapped reads on every platform. mmap is the foundation of the
