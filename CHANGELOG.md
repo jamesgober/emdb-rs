@@ -4,6 +4,137 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0](https://github.com/jamesgober/emdb-rs/compare/v0.9.10...v1.0.0) — 2026-05-14
+
+**First stable release.** emdb 1.0 is a **stability commitment**,
+not a feature release. Every public item entering this version
+joins the SemVer + on-disk-format contract documented in
+[`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md). No source-logic
+changes from v0.9.10; this release is the freeze.
+
+The full v1.x surface is the cumulative shape that v0.9.0
+through v0.9.10 built up:
+
+- **Bitcask-style storage** on top of [`fsys`](https://crates.io/crates/fsys)
+  — lock-free LSN reservation, group-commit fsync, NVMe
+  passthrough flush, io_uring on Linux, `WRITE_THROUGH` on
+  Windows.
+- **64-shard sharded hash index** with seqlock-protected slots
+  (~8–12 ns uncontended `get`). Hash function is wyhash-style
+  + Murmur3 fmix64 finalizer (0 collisions on structured stress
+  patterns where FxHash produced 36%).
+- **Lock-free reads** via `Arc<Mmap>` zero-copy slices — scales
+  to ~9.78 M reads/sec aggregate at 8 threads.
+- **Vectored append** for `insert_many` / `transaction` /
+  compaction — one LSN reservation + one `pwrite` for the whole
+  batch.
+- **TTL** (`ttl` feature, default-on) — lazy + eager expiry on
+  both `Emdb` and `Namespace` (parity added in v0.9.10).
+- **Range scans** (opt-in via
+  `EmdbBuilder::enable_range_scans(true)`) — lock-free
+  `crossbeam_skiplist::SkipMap` secondary index, streaming
+  iterators with snapshot semantics.
+- **Encryption** (`encrypt` feature) — AES-256-GCM (default)
+  or ChaCha20-Poly1305, raw key or Argon2id passphrase, with
+  enable/disable/rotate admin paths (fixed in v0.9.9).
+- **Async surface** (`async` feature) — `AsyncEmdb` /
+  `AsyncNamespace` over `tokio::task::spawn_blocking`, with
+  six streaming-iterator variants backed by a bounded
+  `tokio::sync::mpsc` channel and proper consumer-drop
+  semantics.
+- **Operational APIs** — `flush`, `checkpoint`, `compact`,
+  `stats`, `backup_to`, `lock_holder` / `break_lock`.
+- **Transactions** with read-your-writes + rollback-on-`Err`
+  semantics (sync + async).
+- **Nested groups** (`nested` feature) — dotted-prefix `Focus`
+  handles over the default namespace.
+
+### What changed in this release
+
+- Version bump 0.9.10 → 1.0.0. No source-logic changes.
+- README reframed for v1.x — status section, stability prose,
+  deprecation notices for v0.9.3 and v0.9.8 (both have known
+  bugs fixed in later patches; v0.9.3 is yanked).
+- `docs/STABILITY-1.0.md` reframed from "pre-1.0 stabilization"
+  to "1.x is here." MSRV policy locked at Rust 1.75 for the
+  1.x line.
+- `docs/API.md` polish: corrected `Ttl` enum variants
+  (`Default` / `Never` / `After`, not `None` / `Default` /
+  `Duration` / `ExpiresAt` as the doc previously claimed);
+  corrected `LockHolder` field name to
+  `acquired_at_unix_millis`; corrected `EncryptionInput`
+  variant (`Key`, not `RawKey`); added explicit
+  `#[non_exhaustive]` annotations; added new "Iterator types"
+  section documenting `EmdbIter` / `EmdbKeyIter` /
+  `EmdbRangeIter` / `NamespaceIter` / `NamespaceKeyIter` /
+  `NamespaceRangeIter`; expanded the `AsyncNamespace` section
+  from a one-line stub to a full method listing.
+- Number formatting polished throughout the docs: all
+  benchmark numbers and structured-key counts now use US
+  English thousands-separators (`13,724 ms` instead of
+  `13 724 ms`).
+- Install pins bumped to 1.0 (`emdb = "1.0"`).
+
+### Yanked / deprecated releases
+
+| Version | Status | Reason |
+|---|---|---|
+| 0.9.3 | **Yanked** | TOCTOU race in the new primary index that could cause silent data loss under concurrent inserts hashing to the same probe bucket. Fixed in 0.9.4. |
+| 0.9.8 | **Deprecated** | `Emdb::disable_encryption` and `Emdb::rotate_encryption_key` were broken (`.meta` sidecar not moved during atomic rewrite). Fixed in 0.9.9. |
+
+### Stability contract
+
+See [`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md) for the
+full contract. Summary:
+
+- **API stable** for v1.x — every `pub` item documented in
+  [`docs/API.md`](docs/API.md) keeps its current
+  signature/behaviour. New items may be added in minor
+  releases. `#[non_exhaustive]` enums (notably `Error`) may
+  gain new variants in minor releases.
+- **On-disk format stable** for v1.x — files written by any
+  v1.x release open on any other v1.x release without
+  migration.
+- **MSRV locked at Rust 1.75** for the v1.x line. MSRV bumps
+  are minor-version events, never patch.
+- **Deprecation policy**: APIs marked `#[deprecated]` keep
+  working for at least one full minor cycle before removal in
+  the next major.
+
+### Tests
+
+- **226 unit + integration tests**
+- **22 doctests**
+- **23 async streaming tests**
+- All feature combos green: `--no-default-features`,
+  `--features ttl`, `--features ttl,nested,encrypt`,
+  `--features "async ttl"`, `--all-features`
+- fmt + clippy (`--all-features --all-targets -D warnings`) +
+  release build + doc build all clean
+
+### Breaking changes
+
+**None vs. v0.9.10.** v1.0 is the version-bump release that
+locks in the SemVer contract; no source-logic changes since
+v0.9.10. Users on v0.9.10 can upgrade with no code changes.
+
+Users on earlier 0.9.x versions should consult the individual
+release entries below for any subtle behaviour changes (most
+notably the v0.9.10 entry, which describes the `Namespace`
+TTL behaviour change).
+
+### Installation
+
+```toml
+[dependencies]
+emdb = "1.0"
+
+# All features
+emdb = { version = "1.0", features = ["ttl", "nested", "encrypt", "async"] }
+```
+
+MSRV: Rust 1.75.
+
 ## [0.9.10](https://github.com/jamesgober/emdb-rs/compare/v0.9.9...v0.9.10) — 2026-05-14
 
 **Final pre-1.0 release** — Tier 2 closure of the audit roadmap.

@@ -111,17 +111,18 @@ the live journal file.
 ### Frame format
 
 Each frame is a self-describing record. The layout is owned by
-fsys (`fsys::frame`), but emdb's record types embed inside the
-payload:
+fsys, but emdb's record types embed inside the payload:
 
 ```
-┌───────────┬──────────┬───────────────┬───────────┬──────────┐
-│ magic (4) │ flags(2) │ payload_len(4)│ payload   │ crc32c(4)│
-└───────────┴──────────┴───────────────┴───────────┴──────────┘
+┌──────────────────┬───────────────┬───────────┬──────────┐
+│ magic+ver (4)    │ payload_len(4)│ payload   │ crc32c(4)│
+└──────────────────┴───────────────┴───────────┴──────────┘
 ```
 
-The CRC covers the full frame including header bytes. fsys's
-decoder validates the magic + CRC before handing the payload to
+12-byte overhead per frame (magic+ver = `0x46535901`, big-endian
+on disk so a hexdump shows `46 53 59 01`). The trailing CRC-32C
+covers `magic_and_ver || length || payload`. fsys's decoder
+validates magic + length + CRC before handing the payload to
 emdb's decoder.
 
 ### Record payload
@@ -158,10 +159,12 @@ prefixes.
 emdb opens its journal through `fsys::JournalHandle`:
 
 ```rust,ignore
-let journal = fsys::JournalBuilder::new(path)
+let fs = fsys::builder()
     .tune_for(fsys::Workload::Database)
-    .write_lifetime_hint(fsys::WriteLifetimeHint::Long)
-    .open()?;
+    .build()?;
+let opts = fsys::JournalOptions::new()
+    .write_lifetime_hint(Some(fsys::WriteLifetimeHint::Long));
+let journal = fs.journal_with(path, opts)?;
 ```
 
 `tune_for(Workload::Database)` sets:
@@ -171,7 +174,7 @@ let journal = fsys::JournalBuilder::new(path)
 - 256-deep io_uring submission ring (Linux) — keeps the kernel
   fed without saturating it.
 - 4 K-deep batch queue — vectored `append_batch` can submit up
-  to 4 096 records in one syscall.
+  to 4,096 records in one syscall.
 
 `write_lifetime_hint(Long)` tells the kernel/SSD firmware that
 journal data is durable-write data, not temp-file churn — modern
@@ -240,8 +243,8 @@ const PRIME_2: u64 = 0xe703_7ed1_a0b4_28db;
 Two 64-bit primes multiplied against alternating 8-byte halves
 of each 16-byte block; tail handling for 8 / 4 / per-byte;
 three rounds of `fmix64` at the end. On the v0.9.4 stress key
-pattern (`"stress-key-{idx:08}"` × 64 000) it produces 0
-collisions; the previous FxHash had 22 956 collisions on the
+pattern (`"stress-key-{idx:08}"` × 64,000) it produces 0
+collisions; the previous FxHash had 22,956 collisions on the
 same pattern. See the [v0.9.6 release
 notes](../.dev/release/v0.9.6.md) for the diagnosis trail.
 
@@ -411,19 +414,24 @@ most `log₂(N)` growth events over N inserts.
 
 ### Group commit
 
-When `FlushPolicy::Group` is configured, `flush()` calls don't
-each `fdatasync` independently. Instead:
+In v1.x every `flush()` call goes through fsys's group-commit
+coordinator, regardless of `FlushPolicy`. The mechanic:
 
-1. Caller A calls `flush()`. It's elected leader; it starts a
-   short rendezvous window.
+1. Caller A calls `flush()`. fsys elects it leader for the
+   coalesce window around the in-flight sync syscall.
 2. Callers B, C, D call `flush()` during the window; they
-   register as followers.
-3. The leader issues one `fdatasync` covering all four
-   callers' pending writes.
-4. All four `flush()` futures resolve together.
+   register as followers behind the leader's sync.
+3. The leader issues one `fdatasync` (or platform equivalent —
+   `FlushFileBuffers` on Windows, `F_FULLFSYNC` on macOS)
+   covering all four callers' pending writes.
+4. All four `flush()` calls return together.
 
-The bench `benches/group_commit.rs` measures **8.06× speedup**
-on 8 producer threads × 200 writes/thread vs `OnEachFlush`.
+`FlushPolicy::OnEachFlush` (default) and `FlushPolicy::Group`
+are functionally identical here — both route through the same
+coordinator. `FlushPolicy::Group` is retained only for source
+compatibility with v0.8.x callers; new code should write
+`OnEachFlush`. The bench `benches/group_commit.rs` exists to
+detect future regressions in the coalescer's behaviour.
 
 ---
 

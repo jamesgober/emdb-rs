@@ -150,7 +150,7 @@ let db = Emdb::builder()
     .build()?;
 ```
 
-**Functionally identical to `OnEachFlush` in 0.9.x.** Both
+**Functionally identical to `OnEachFlush` in v1.x.** Both
 share fsys's coalescer; the separate variant is kept for
 source compatibility with v0.8.x callers who wrote
 `FlushPolicy::Group { max_batch, wait_ns }`. The previous

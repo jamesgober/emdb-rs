@@ -51,18 +51,18 @@ numbers.
 
 | phase                       |          emdb |       redb  |      sled  |  emdb vs redb     |
 |-----------------------------|--------------:|------------:|-----------:|------------------:|
-| bulk load                   | **13 724 ms** |   43 660 ms |  31 116 ms |      3.2× faster  |
+| bulk load                   | **13,724 ms** |   43,660 ms |  31,116 ms |      3.2× faster  |
 | individual writes (fsync/op)|    **406 ms** |      544 ms |     429 ms |      1.3× faster  |
-| batch writes                |    **292 ms** |    5 970 ms |   1 286 ms |     20.4× faster  |
-| nosync writes               |    **127 ms** |    1 025 ms |     675 ms |      8.1× faster  |
-| random reads (1 M)          |    **322 ms** |    2 765 ms |   6 079 ms |      8.6× faster  |
-| random reads (4 threads)    |    **703 ms** |   11 210 ms |  22 884 ms |     15.9× faster  |
-| random reads (8 threads)    |    **511 ms** |   13 026 ms |  23 392 ms | **25.5× faster**  |
-| removals                    |  **5 662 ms** |   33 348 ms |  25 631 ms |      5.9× faster  |
-| compaction                  |  **8 268 ms** |   12 540 ms |       N/A  |      1.5× faster  |
+| batch writes                |    **292 ms** |    5,970 ms |   1,286 ms |     20.4× faster  |
+| nosync writes               |    **127 ms** |    1,025 ms |     675 ms |      8.1× faster  |
+| random reads (1 M)          |    **322 ms** |    2,765 ms |   6,079 ms |      8.6× faster  |
+| random reads (4 threads)    |    **703 ms** |   11,210 ms |  22,884 ms |     15.9× faster  |
+| random reads (8 threads)    |    **511 ms** |   13,026 ms |  23,392 ms | **25.5× faster**  |
+| removals                    |  **5,662 ms** |   33,348 ms |  25,631 ms |      5.9× faster  |
+| compaction                  |  **8,268 ms** |   12,540 ms |       N/A  |      1.5× faster  |
 | uncompacted size            |  **1.10 GiB** |    4.00 GiB |   2.15 GiB |     3.6× smaller  |
 | compacted size              |  **508 MiB**  |    1.64 GiB |       N/A  |     3.3× smaller  |
-| random range reads          |      opt-in   |    2 376 ms |   6 133 ms | see note 1        |
+| random range reads          |      opt-in   |    2,376 ms |   6,133 ms | see note 1        |
 
 emdb now wins every column. The single-thread `individual writes`
 phase — where v0.8.x was 39× behind redb because each `db.flush()`
@@ -87,7 +87,7 @@ note on the column where the table doesn't tell the whole story:
 The MT random-read columns above show emdb scaling to **~9.78 M
 reads/sec aggregate at 8 threads** (5 M reads / 511 ms) on a
 4-core consumer box, while redb stalls near 384 K/sec past one
-thread (5 M reads / 13 026 ms). The lock-free `Arc<Mmap>` read
+thread (5 M reads / 13,026 ms). The lock-free `Arc<Mmap>` read
 path plus the 64-shard hash index keep the hot path contention-
 free; past core count, shared memory bandwidth is the cap.
 
@@ -97,7 +97,7 @@ For more thread-count granularity, run
 ### Group commit: multi-threaded per-record durability
 
 Concurrent `flush()` calls share a single `fdatasync` automatically
-in 0.9.x — fsys's internal group-commit coordinator coalesces
+in v1.x — fsys's internal group-commit coordinator coalesces
 in-flight flushes around any active sync syscall, with no tuning
 knobs. The shape that benefits is N independent producer threads
 each writing one record then calling `flush` for per-record
@@ -105,7 +105,7 @@ durability: instead of paying N syncs, the coalescer collapses
 them into one.
 
 `FlushPolicy::OnEachFlush` (the default) and `FlushPolicy::Group`
-are functionally identical in 0.9.x; both route through the same
+are functionally identical in v1.x; both route through the same
 coordinator. The separate `Group` variant is retained only for
 source-compatibility with v0.8.x callers that wrote
 `FlushPolicy::Group { max_wait, max_batch }`. Those tuning knobs
@@ -160,8 +160,9 @@ tuning notes.
 
 ## Status
 
-**v0.9.10.** Final pre-1.0 release — Tier 2 audit closure. The 0.9.x line is
-API-stable and on-disk-format-stable. The storage substrate is a
+**v1.0.0.** First stable release. The 1.x line is
+API-stable and on-disk-format-stable per
+[`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md). The storage substrate is a
 [`fsys`](https://crates.io/crates/fsys) journal — lock-free LSN
 reservation, group-commit fsync, NVMe passthrough flush,
 io_uring on Linux — with `tune_for(Workload::Database)` preset
@@ -189,53 +190,62 @@ async-iterator variants (`iter_stream`, `keys_stream`,
 `iter_after_stream`) backed by a bounded
 `tokio::sync::mpsc` channel — memory in flight is bounded by
 the channel depth rather than the namespace size, and the
-blocking pump task respects consumer backpressure. **v0.9.8**
-is the polish + RC-prep release — docs refresh
-([ARCHITECTURE.md](docs/ARCHITECTURE.md),
-[PERFORMANCE.md](docs/PERFORMANCE.md),
-[PLATFORM-NOTES.md](docs/PLATFORM-NOTES.md),
-[EXAMPLES.md](docs/EXAMPLES.md),
-[STABILITY-1.0.md](docs/STABILITY-1.0.md)),
-9 new runnable examples, expanded doc-tests on every
-load-bearing public method, no source-logic changes.
+blocking pump task respects consumer backpressure. **v0.9.8 – v0.9.10**
+landed the polish + RC-prep work — docs refresh, 9 new runnable
+examples, expanded doc-tests on every load-bearing public method,
+two real bug fixes in the encryption-admin path (now fully tested),
+TTL surface on `Namespace`, and 25 edge-case tests covering
+boundaries that the early 0.9.x had not exercised.
 
-> **v0.9.3 users:** upgrade to v0.9.4 or later. v0.9.3 shipped
-> with a TOCTOU race in the new primary index that could cause
-> silent data loss under concurrent inserts hashing to the same
-> probe bucket. v0.9.4 fixes it. The on-disk journal is
-> unaffected; a clean restart rebuilds a correct in-memory index.
+> **v0.9.3 users (deprecated):** upgrade past v0.9.4. v0.9.3
+> shipped with a TOCTOU race in the new primary index that
+> could cause silent data loss under concurrent inserts hashing
+> to the same probe bucket. v0.9.4+ fixes it. The on-disk
+> journal is unaffected; a clean restart rebuilds a correct
+> in-memory index. v0.9.3 is yanked.
 
-The API surface from v0.8.5 carries over: optional at-rest
-encryption (AES-256-GCM or ChaCha20-Poly1305, raw key or
-Argon2id passphrase); optional sorted-iteration secondary index
-via `EmdbBuilder::enable_range_scans(true)`; three flush-policy
+> **v0.9.8 users (deprecated):** upgrade to v0.9.9+ if you use
+> `Emdb::disable_encryption` or `Emdb::rotate_encryption_key`.
+> Those paths were broken in v0.9.8 (the `.meta` sidecar was
+> not moved alongside the journal during the atomic rewrite,
+> so reopens failed `EncryptionKeyMismatch` after rotation).
+> Fixed in v0.9.9.
+
+The complete v1.x API surface: optional at-rest encryption
+(AES-256-GCM or ChaCha20-Poly1305, raw key or Argon2id
+passphrase); optional sorted-iteration secondary index via
+`EmdbBuilder::enable_range_scans(true)`; three flush-policy
 variants (`OnEachFlush`, `Group`, `WriteThrough`); streaming
-`iter` / `keys` / `range`; cursor-style `iter_from` / `iter_after`;
-zero-copy `get_zerocopy`; atomic `backup_to(path)`; point-in-time
-`stats()`; stale-lockfile recovery (`lock_holder` + `break_lock`).
-The `async` feature exposes both eager async iteration and
-streaming `*_stream` variants over a bounded backpressured
-channel; pump tasks honour consumer drops so dropping a stream
-early halts decode immediately.
+`iter` / `keys` / `range`; cursor-style `iter_from` /
+`iter_after`; zero-copy `get_zerocopy`; atomic
+`backup_to(path)`; point-in-time `stats()`; stale-lockfile
+recovery (`lock_holder` + `break_lock`); namespaces with full
+TTL parity to the top-level handle; transactions with
+read-your-writes + rollback-on-Err semantics. The `async`
+feature mirrors all of the above through tokio's
+`spawn_blocking`, plus six streaming variants
+(`iter_stream`, `keys_stream`, `range_stream`,
+`range_prefix_stream`, `iter_from_stream`,
+`iter_after_stream`) backed by a bounded
+`tokio::sync::mpsc` channel; pump tasks honour consumer drops
+so dropping a stream early halts decode immediately.
 
-Pre-1.0. The remaining work before v1.0:
-
-- 5 M end-to-end bench re-capture on bare-metal Linux +
-  Windows NVMe (full Criterion sample counts).
-- Lock-free index migration (arc-swap + dual-write protocol).
-- Automated migration tool for v0.7 / v0.8 → v0.9 databases.
-- `docs/STABILITY-1.0.md` SemVer commitment doc.
-
-No further architectural changes are planned before 1.0.
+**Stability contract.** v1.x is the first stable release line.
+The on-disk format is frozen for v1.x; every patch and minor
+release is a drop-in upgrade from any prior v1.x. New
+features arrive as minor bumps (1.1, 1.2, …) without breaking
+existing code. Breaking changes require a 2.0. See
+[`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md) for the full
+SemVer + MSRV + deprecation policy.
 
 ## Installation
 
 ```toml
 [dependencies]
-emdb = "0.9.10"
+emdb = "1.0"
 
 # All optional features
-emdb = { version = "0.9.10", features = ["ttl", "nested", "encrypt", "async"] }
+emdb = { version = "1.0", features = ["ttl", "nested", "encrypt", "async"] }
 ```
 
 MSRV: Rust 1.75.

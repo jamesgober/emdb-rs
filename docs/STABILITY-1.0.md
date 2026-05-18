@@ -4,11 +4,10 @@ This document defines what emdb commits to preserving across
 the 1.x release line, what it explicitly does not commit to,
 and how breaking changes will be communicated.
 
-The 0.9.x line is **API-stable and on-disk-format-stable** —
-every 0.9.x release is a drop-in upgrade from any prior 0.9.x.
-0.9.7 and 0.9.8 are the last 0.9.x releases planned before 1.0;
-the 1.0 commitment below makes the 0.9.x guarantees explicit
-and durable.
+The 1.x line is **API-stable and on-disk-format-stable** —
+every 1.x release is a drop-in upgrade from any prior 1.x. 1.0
+is the first stable release, making these guarantees explicit
+and durable going forward.
 
 ---
 
@@ -31,19 +30,18 @@ and durable.
 ## What 1.0 means
 
 emdb 1.0 is a **stability commitment**, not a feature release.
-The 0.9.x line has been carrying the engineering work; 1.0 is
-the version that says "this is the surface, we'll keep it,
-build production code against it."
+The v0.9.x line carried the engineering work leading to 1.0;
+1.0 is the version that says "this is the stable surface,
+we'll keep it, build production code against it."
 
-The substantive engineering — the lock-free engine, the sharded
+All substantive engineering — the lock-free engine, the sharded
 index, the journal substrate via fsys, the async surface, the
-streaming iterators — is all already in the 0.9.x line by the
-time 1.0 ships. 1.0 itself adds **no new features**. It is the
-point where:
+streaming iterators — shipped in the v0.9.x series. 1.0 itself
+adds **no new features**. It is the point where:
 
 - Every public item enters the SemVer contract below.
 - The on-disk format is frozen for the 1.x line.
-- Breaking changes start to need a major-version bump.
+- Breaking changes require a major-version bump.
 - The MSRV bump policy applies (see below).
 
 ---
@@ -176,7 +174,7 @@ covered by the stability contract.
 ## MSRV policy
 
 Minimum Supported Rust Version is **Rust 1.75** through the
-0.9.x line and at least the start of the 1.x line.
+1.x line.
 
 The MSRV-bump policy:
 
