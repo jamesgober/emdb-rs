@@ -4,9 +4,18 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "ttl")]
+use std::time::Duration;
+
 use crate::db::Inner;
 use crate::storage::Engine;
 use crate::Result;
+
+#[cfg(feature = "ttl")]
+use crate::ttl::{
+    expires_from_ttl, is_expired, now_unix_millis, record_new, record_set_persist, remaining_ttl,
+    Ttl,
+};
 
 /// Cheap-clone handle scoped to one named namespace inside a single
 /// [`crate::Emdb`].
@@ -33,29 +42,74 @@ impl Namespace {
     }
 
     /// Insert or replace a key/value pair.
+    ///
+    /// Records inherit the parent database's `default_ttl` (when the
+    /// `ttl` feature is on and a default was configured at builder
+    /// time); use [`Self::insert_with_ttl`] to override per-record.
     pub fn insert(&self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
         let key = key.into();
         let value = value.into();
-        self.engine().insert(self.ns_id, &key, &value, 0)
+        let expires_at = self.compute_default_expires_at()?;
+        self.engine().insert(self.ns_id, &key, &value, expires_at)
     }
 
-    /// Insert many key/value pairs in one vectored journal-append pass.
+    /// Insert many key/value pairs in one vectored journal-append
+    /// pass. All records receive the parent database's `default_ttl`.
     pub fn insert_many<I, K, V>(&self, items: I) -> Result<()>
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
+        let expires_at = self.compute_default_expires_at()?;
         let owned: Vec<(Vec<u8>, Vec<u8>, u64)> = items
             .into_iter()
-            .map(|(k, v)| (k.as_ref().to_vec(), v.as_ref().to_vec(), 0))
+            .map(|(k, v)| (k.as_ref().to_vec(), v.as_ref().to_vec(), expires_at))
             .collect();
         self.engine().insert_many(self.ns_id, owned)
     }
 
+    /// Compute the absolute expiry-timestamp from the parent database's
+    /// `default_ttl` setting. Returns 0 when the feature is off or no
+    /// default was configured (i.e., "never expires"). Mirrors the
+    /// helper on `Emdb` so a namespace inherits the same default-TTL
+    /// semantics.
+    #[cfg(feature = "ttl")]
+    fn compute_default_expires_at(&self) -> Result<u64> {
+        let now = now_unix_millis();
+        Ok(expires_from_ttl(Ttl::Default, self.inner.default_ttl, now)?.unwrap_or(0))
+    }
+
+    #[cfg(not(feature = "ttl"))]
+    #[allow(clippy::unnecessary_wraps)]
+    fn compute_default_expires_at(&self) -> Result<u64> {
+        Ok(0)
+    }
+
     /// Fetch a value by key.
+    ///
+    /// Under the `ttl` feature, records whose `expires_at` has passed
+    /// are filtered out (returns `Ok(None)`) — the same lazy-expiry
+    /// behaviour as [`crate::Emdb::get`].
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
-        self.engine().get(self.ns_id, key.as_ref())
+        let key = key.as_ref();
+        #[cfg(feature = "ttl")]
+        {
+            match self.engine().get_with_meta(self.ns_id, key)? {
+                None => Ok(None),
+                Some((value, expires_at)) => {
+                    if expires_at != 0 && is_expired(Some(expires_at), now_unix_millis()) {
+                        Ok(None)
+                    } else {
+                        Ok(Some(value))
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "ttl"))]
+        {
+            self.engine().get(self.ns_id, key)
+        }
     }
 
     /// Zero-copy fetch: returns a [`crate::ValueRef`] reading
@@ -196,6 +250,100 @@ impl Namespace {
     pub fn iter_after(&self, start: impl AsRef<[u8]>) -> Result<NamespaceRangeIter> {
         let start = start.as_ref().to_vec();
         self.range_iter((std::ops::Bound::Excluded(start), std::ops::Bound::Unbounded))
+    }
+
+    // ---- TTL methods (mirror `Emdb` for namespace-scoped records) ----
+
+    /// Insert a record with an explicit TTL. Overrides any
+    /// `default_ttl` configured on the parent database.
+    ///
+    /// See [`crate::Emdb::insert_with_ttl`] for the full semantics.
+    #[cfg(feature = "ttl")]
+    pub fn insert_with_ttl(
+        &self,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+        ttl: Ttl,
+    ) -> Result<()> {
+        let key = key.into();
+        let value = value.into();
+        let now = now_unix_millis();
+        let expires_at = expires_from_ttl(ttl, self.inner.default_ttl, now)?.unwrap_or(0);
+        self.engine().insert(self.ns_id, &key, &value, expires_at)
+    }
+
+    /// Absolute expiry timestamp (Unix milliseconds) for a key, if any.
+    /// Returns `Ok(None)` when the key is missing or when the record
+    /// has no TTL.
+    #[cfg(feature = "ttl")]
+    pub fn expires_at(&self, key: impl AsRef<[u8]>) -> Result<Option<u64>> {
+        let raw = self
+            .engine()
+            .get_with_meta(self.ns_id, key.as_ref())?
+            .map(|(_, expires_at)| expires_at);
+        // Translate the engine's "no TTL = 0" sentinel into `None` so
+        // callers can distinguish "missing key" from "key has no TTL"
+        // by inspecting which arm of the outer Option fires.
+        Ok(match raw {
+            None => None,
+            Some(0) => Some(0),
+            Some(exp) => Some(exp),
+        })
+    }
+
+    /// Remaining duration until a key expires, if it has a TTL.
+    /// Returns `Ok(None)` when the key is missing, has no TTL, or has
+    /// already expired.
+    #[cfg(feature = "ttl")]
+    pub fn ttl(&self, key: impl AsRef<[u8]>) -> Result<Option<Duration>> {
+        let exp = self.expires_at(key)?;
+        match exp {
+            Some(deadline) if deadline > 0 => Ok(remaining_ttl(deadline, now_unix_millis())),
+            _ => Ok(None),
+        }
+    }
+
+    /// Strip the TTL from a record (re-insert with `expires_at = 0`).
+    /// Returns `Ok(true)` if the record existed and previously had a
+    /// TTL.
+    #[cfg(feature = "ttl")]
+    pub fn persist(&self, key: impl AsRef<[u8]>) -> Result<bool> {
+        let key = key.as_ref();
+        let value = match self.engine().get(self.ns_id, key)? {
+            Some(v) => v,
+            None => return Ok(false),
+        };
+        let prev_exp = self.expires_at(key)?.unwrap_or(0);
+        let had_ttl = prev_exp != 0;
+        self.engine().insert(self.ns_id, key, &value, 0)?;
+        let mut probe = record_new(value, if had_ttl { Some(prev_exp) } else { None });
+        let _flipped = record_set_persist(&mut probe);
+        Ok(had_ttl)
+    }
+
+    /// Sweep every expired record in this namespace, returning the
+    /// count evicted. Errors during sweep are swallowed so callers can
+    /// use this in best-effort background loops.
+    ///
+    /// Scoped to this namespace only — does not touch sibling
+    /// namespaces or the default namespace. Mirrors
+    /// [`crate::Emdb::sweep_expired`] for namespaces.
+    #[cfg(feature = "ttl")]
+    pub fn sweep_expired(&self) -> usize {
+        let snapshot = match self.engine().collect_records(self.ns_id) {
+            Ok(snap) => snap,
+            Err(_) => return 0,
+        };
+        let now = now_unix_millis();
+        let mut evicted = 0;
+        for (key, _value, expires_at) in snapshot {
+            if expires_at != 0 && is_expired(Some(expires_at), now) {
+                if let Ok(Some(_)) = self.engine().remove(self.ns_id, &key) {
+                    evicted += 1;
+                }
+            }
+        }
+        evicted
     }
 }
 

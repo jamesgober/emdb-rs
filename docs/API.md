@@ -619,13 +619,20 @@ namespace).
 
 ### `Namespace` methods
 
-A `Namespace` exposes the same surface as `Emdb` for KV
-operations: `insert`, `insert_many`, `get`, `get_zerocopy`,
+A `Namespace` exposes the same KV + iteration surface as
+`Emdb`: `insert`, `insert_many`, `get`, `get_zerocopy`,
 `remove`, `contains_key`, `len`, `is_empty`, `clear`, `iter`,
-`keys`, `range`, `range_iter`, `range_prefix`, `range_prefix_iter`,
-`iter_from`, `iter_after`. Plus:
+`keys`, `range`, `range_iter`, `range_prefix`,
+`range_prefix_iter`, `iter_from`, `iter_after`. Plus:
 
 - `name() -> &str` — the namespace name.
+
+Under the `ttl` feature, the same TTL surface is available
+scoped to the namespace: `insert_with_ttl`, `expires_at`,
+`ttl`, `persist`, `sweep_expired`. `insert` / `insert_many`
+inherit the parent database's `default_ttl` (when configured),
+and `get` filters expired records lazily — same semantics as
+the top-level `Emdb` calls.
 
 There is **no** namespace-scoped `flush()`, `checkpoint()`,
 `stats()`, `compact()`, etc. — those are file-wide operations
