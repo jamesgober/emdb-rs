@@ -249,6 +249,162 @@ fn test_valid_namespace_histories_still_open() -> emdb::Result<()> {
     Ok(())
 }
 
+/// Frame payloads of a plaintext journal, in log order.
+fn plain_payloads(path: &Path) -> Vec<Vec<u8>> {
+    let bytes = std::fs::read(path).expect("read journal");
+    let mut out = Vec::new();
+    let mut off = 0;
+    while off + 12 <= bytes.len() {
+        let magic = u32::from_be_bytes(bytes[off..off + 4].try_into().expect("4 bytes"));
+        if magic != FSYS_MAGIC {
+            break;
+        }
+        let len = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().expect("4 bytes")) as usize;
+        out.push(bytes[off + 8..off + 8 + len].to_vec());
+        off += 12 + len;
+    }
+    out
+}
+
+/// `(ns_id, name)` of a plaintext namespace-name payload.
+fn namespace_record(payload: &[u8]) -> Option<(u32, Vec<u8>)> {
+    if payload.first() != Some(&0x02) {
+        return None;
+    }
+    let id = u32::from_le_bytes(payload[1..5].try_into().expect("4 bytes"));
+    Some((id, payload[9..].to_vec()))
+}
+
+/// `drop_namespace` writes a remove record for every key and only
+/// then the empty-name record that unbinds the id. A re-created
+/// namespace with the same name gets a new id: ids are never reused
+/// within one log.
+#[test]
+fn test_drop_namespace_log_order_and_fresh_id_on_recreate() -> emdb::Result<()> {
+    let path = tmp_path("ns-drop-log");
+    cleanup(&path);
+    {
+        let db = Emdb::open(&path)?;
+        let a = db.namespace("a")?;
+        a.insert("k1", "v1")?;
+        a.insert("k2", "v2")?;
+        assert!(db.drop_namespace("a")?);
+        db.namespace("a")?.insert("k3", "v3")?;
+        db.flush()?;
+    }
+    let payloads = plain_payloads(&path);
+    let bindings: Vec<(usize, u32, Vec<u8>)> = payloads
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| namespace_record(p).map(|(id, name)| (i, id, name)))
+        .collect();
+    assert_eq!(bindings.len(), 3, "bind, unbind, bind: {bindings:?}");
+    let (bind_at, old_id, _) = bindings[0].clone();
+    let (unbind_at, unbind_id, unbind_name) = bindings[1].clone();
+    let (_, new_id, new_name) = bindings[2].clone();
+    assert_eq!(unbind_id, old_id);
+    assert!(unbind_name.is_empty());
+    assert_ne!(new_id, old_id, "a re-created namespace reused its id");
+    assert_eq!(new_name, b"a");
+    let tombstones = payloads[bind_at + 1..unbind_at]
+        .iter()
+        .filter(|p| p.first() == Some(&0x01))
+        .count();
+    assert_eq!(tombstones, 2, "tombstones must precede the unbind record");
+
+    let db = Emdb::open(&path)?;
+    let a = db.namespace("a")?;
+    assert_eq!(a.get("k3")?, Some(b"v3".to_vec()));
+    assert_eq!(a.get("k1")?, None);
+    assert_eq!(a.len()?, 1);
+    drop(db);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn test_open_unbind_of_unbound_or_reserved_id_returns_corrupted() {
+    let path = tmp_path("ns-unbind-unbound");
+    cleanup(&path);
+    let cases: [(&str, Vec<Vec<u8>>); 4] = [
+        ("never bound", vec![plain_namespace_name(3, b"")]),
+        (
+            "unbound twice",
+            vec![
+                plain_namespace_name(1, b"a"),
+                plain_namespace_name(1, b""),
+                plain_namespace_name(1, b""),
+            ],
+        ),
+        ("default namespace", vec![plain_namespace_name(0, b"")]),
+        ("u32::MAX", vec![plain_namespace_name(u32::MAX, b"")]),
+    ];
+    for (context, payloads) in cases {
+        std::fs::write(&path, rebuild(&payloads)).expect("write");
+        assert_corrupted(Emdb::open(&path), context);
+        cleanup(&path);
+    }
+}
+
+/// emdb never binds an id again after unbinding it.
+#[test]
+fn test_open_rebinding_dropped_id_returns_corrupted() {
+    let path = tmp_path("ns-rebind-dropped");
+    cleanup(&path);
+    for name in [&b"a"[..], b"b"] {
+        let payloads = vec![
+            plain_namespace_name(1, b"a"),
+            plain_insert(1, b"k", b"v"),
+            plain_remove(1, b"k"),
+            plain_namespace_name(1, b""),
+            plain_namespace_name(1, name),
+        ];
+        std::fs::write(&path, rebuild(&payloads)).expect("write");
+        assert_corrupted(Emdb::open(&path), "rebinding a dropped id");
+        cleanup(&path);
+    }
+}
+
+/// emdb 1.0.2 skips the unbind record, still lists a dropped namespace
+/// under its old name and can write into it. Those records bind the
+/// id to the old name again instead of failing the open, unless the
+/// name now belongs to another namespace.
+#[test]
+fn test_open_records_after_unbind_from_older_release() -> emdb::Result<()> {
+    let path = tmp_path("ns-after-unbind");
+    cleanup(&path);
+    let payloads = vec![
+        plain_namespace_name(1, b"a"),
+        plain_insert(1, b"k", b"v"),
+        plain_remove(1, b"k"),
+        plain_namespace_name(1, b""),
+        plain_insert(1, b"k2", b"v2"),
+    ];
+    std::fs::write(&path, rebuild(&payloads))?;
+    {
+        let db = Emdb::open(&path)?;
+        let a = db.namespace("a")?;
+        assert_eq!(a.get("k2")?, Some(b"v2".to_vec()));
+        assert_eq!(a.get("k")?, None);
+        assert_eq!(db.list_namespaces()?, vec![String::new(), "a".to_string()]);
+    }
+    cleanup(&path);
+
+    let payloads = vec![
+        plain_namespace_name(1, b"a"),
+        plain_namespace_name(1, b""),
+        plain_namespace_name(2, b"a"),
+        plain_insert(1, b"k", b"v"),
+    ];
+    std::fs::write(&path, rebuild(&payloads))?;
+    assert_corrupted(
+        Emdb::open(&path),
+        "record for a dropped id whose name moved",
+    );
+    cleanup(&path);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Strict record decoding. Plaintext databases.
 // ---------------------------------------------------------------------
