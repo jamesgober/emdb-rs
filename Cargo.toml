@@ -133,6 +133,11 @@ bench-compare = ["dep:redb", "dep:sled"]
 bench-redis = ["dep:redis"]
 bench-rocksdb = ["dep:rocksdb"]
 
+[lints.rust]
+# `cfg(fuzzing)` is set by cargo-fuzz (see `fuzz/`). It gates the hidden
+# decoder entry points the fuzz targets call, which are not public API.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
 [profile.release]
 opt-level = 3
 lto = "fat"
