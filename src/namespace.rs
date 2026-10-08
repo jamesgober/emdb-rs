@@ -344,10 +344,6 @@ impl Iterator for NamespaceIter {
     fn next(&mut self) -> Option<Self::Item> {
         self.cursor.next_record()
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.cursor.size_hint()
-    }
 }
 
 /// Iterator over keys from [`Namespace::keys`].
@@ -362,10 +358,6 @@ impl Iterator for NamespaceKeyIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.cursor.next_key()
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.cursor.size_hint()
     }
 }
 

@@ -1103,10 +1103,6 @@ impl OffsetCursor {
         }
         None
     }
-
-    pub(crate) fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.offsets.len()))
-    }
 }
 
 /// First page size of a range iterator. Small so that `take(n)` for
@@ -1174,10 +1170,6 @@ impl Iterator for EmdbIter {
     fn next(&mut self) -> Option<Self::Item> {
         self.cursor.next_record()
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.cursor.size_hint()
-    }
 }
 
 /// Iterator over keys from [`Emdb::keys`].
@@ -1192,10 +1184,6 @@ impl Iterator for EmdbKeyIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.cursor.next_key()
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.cursor.size_hint()
     }
 }
 
