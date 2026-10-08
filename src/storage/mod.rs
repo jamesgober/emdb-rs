@@ -6,12 +6,12 @@
 //! This module is the entire on-disk backend; there is no alternate
 //! path. The public `Emdb` handle wraps a single [`Engine`] instance.
 
+pub(crate) mod arc_cell;
 pub(crate) mod engine;
 #[allow(dead_code)]
 pub(crate) mod flush;
 #[allow(dead_code)]
 pub(crate) mod format;
-#[allow(dead_code)]
 pub(crate) mod index;
 pub(crate) mod integrity;
 pub(crate) mod meta;

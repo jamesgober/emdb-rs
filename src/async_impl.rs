@@ -48,13 +48,15 @@
 //!   first await completes.
 //! - **Streaming** (`iter_stream`, `keys_stream`, `range_stream`,
 //!   `range_prefix_stream`, `iter_from_stream`, `iter_after_stream`)
-//!   — drives the sync iterator on a dedicated blocking task that
-//!   pushes items through a bounded `tokio::sync::mpsc` channel
-//!   (capacity 64). The async caller polls the returned
-//!   [`tokio_stream::wrappers::ReceiverStream`], applying natural
-//!   backpressure to the blocking pump task and bounding memory at
-//!   the channel depth × per-record size rather than the full
-//!   namespace footprint.
+//!   return a [`tokio_stream::wrappers::ReceiverStream`] fed through a
+//!   bounded `tokio::sync::mpsc` channel (capacity 64). A pump task
+//!   on the async runtime moves the sync iterator to the blocking pool
+//!   for one chunk of up to 64 items at a time and then forwards the
+//!   chunk with async sends. While the consumer is not polling, the
+//!   pump is parked on the channel and holds no blocking-pool thread,
+//!   so idle or slow streams cannot exhaust the pool. Memory in
+//!   flight is bounded by two chunks (the channel plus one produced
+//!   chunk), not by the namespace size.
 //!
 //! Pick streaming whenever the result set is large enough that
 //! materialising it before the first record is unacceptable, or
@@ -62,6 +64,18 @@
 //! them to a network socket, fold them into a running aggregate,
 //! etc.). Pick eager for small fixed-size queries where the
 //! channel/spawn cost outweighs the win.
+//!
+//! ## Cancellation
+//!
+//! Every operation runs as a `spawn_blocking` task, and tokio cannot
+//! stop a blocking task once it has been handed to the pool. Dropping
+//! (or timing out) the future of a write (`insert`, `insert_many`,
+//! `insert_with_ttl`, `remove`, `persist`, `clear`, `transaction`,
+//! `compact`, `sweep_expired`, ...) therefore does not undo it: the
+//! write may still be applied after the caller stopped waiting.
+//! Treat a cancelled write as "may or may not have happened" and read
+//! the key back if the outcome matters. Dropping a stream stops its
+//! pump after the chunk in progress.
 
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
@@ -111,42 +125,82 @@ where
 
 /// Backpressure depth for the async streaming-iterator channels.
 ///
-/// 64 owned records in flight is the right point on the
-/// memory/throughput curve for typical record sizes: large enough
-/// that the async consumer rarely starves the blocking pump task
-/// on a per-record basis, small enough that the absolute footprint
-/// stays bounded (≲ a few MiB for kilobyte records). Tuning this
-/// up doesn't help once the consumer is the bottleneck; tuning it
-/// down trades throughput for tighter memory.
+/// 64 owned records in flight keeps the consumer from starving on a
+/// per-record basis while bounding the footprint (a few MiB for
+/// kilobyte records). Tuning this up doesn't help once the consumer
+/// is the bottleneck; tuning it down trades throughput for memory.
 const STREAM_CHANNEL_CAPACITY: usize = 64;
 
-/// Drive a sync `Iterator` on tokio's blocking pool and surface its
-/// items as a [`tokio_stream::wrappers::ReceiverStream`]. The pump
-/// task halts the moment the consumer drops the stream
-/// (`blocking_send` returns `Err`); the iterator is dropped on the
-/// blocking thread, releasing its `Arc` references.
+/// Items produced per blocking-pool hop by a stream pump.
+const STREAM_CHUNK: usize = 64;
+
+/// Surface a sync `Iterator` as a
+/// [`tokio_stream::wrappers::ReceiverStream`].
+///
+/// The pump is an async task: it moves the iterator to the blocking
+/// pool to produce one chunk, then forwards the chunk with async
+/// `send`s. It never holds a blocking-pool thread while waiting for
+/// the consumer, and it stops when the consumer drops the stream or
+/// the iterator is exhausted. Must be called from within a tokio
+/// runtime (every caller is an `async fn` of this module).
 fn spawn_iter_stream<I, T>(iter: I) -> tokio_stream::wrappers::ReceiverStream<T>
 where
     I: Iterator<Item = T> + Send + 'static,
     T: Send + 'static,
 {
     let (tx, rx) = tokio::sync::mpsc::channel::<T>(STREAM_CHANNEL_CAPACITY);
-    // JoinHandle is intentionally dropped: the pump task is fire-and-forget
-    // and self-terminating (channel-closed-on-receiver-drop or iterator
-    // exhausted). No caller needs to .await the handle.
-    let _pump: tokio::task::JoinHandle<()> = spawn_blocking(move || {
-        for item in iter {
-            if tx.blocking_send(item).is_err() {
+    // The JoinHandle is dropped on purpose: the pump is self-terminating
+    // and nobody needs its result.
+    let _pump: tokio::task::JoinHandle<()> = tokio::spawn(pump_stream(iter, tx));
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
+/// Body of the pump task started by [`spawn_iter_stream`].
+async fn pump_stream<I, T>(mut iter: I, tx: tokio::sync::mpsc::Sender<T>)
+where
+    I: Iterator<Item = T> + Send + 'static,
+    T: Send + 'static,
+{
+    loop {
+        if tx.is_closed() {
+            break;
+        }
+        let produced = spawn_blocking(move || {
+            let chunk: Vec<T> = iter.by_ref().take(STREAM_CHUNK).collect();
+            (iter, chunk)
+        })
+        .await;
+        // A join error means the iterator panicked; it was dropped on
+        // the blocking thread and the stream simply ends.
+        let Ok((rest, chunk)) = produced else {
+            return;
+        };
+        iter = rest;
+        let exhausted = chunk.len() < STREAM_CHUNK;
+        let mut closed = false;
+        for item in chunk {
+            if tx.send(item).await.is_err() {
+                closed = true;
                 break;
             }
         }
-    });
-    tokio_stream::wrappers::ReceiverStream::new(rx)
+        if exhausted || closed {
+            break;
+        }
+    }
+    // Dropping the iterator can release the last handle to the
+    // database, whose drop does file I/O; keep that off the async
+    // worker threads.
+    let _release: tokio::task::JoinHandle<()> = spawn_blocking(move || drop(iter));
 }
 
 /// Cheap-clone async handle to an [`Emdb`]. Every method routes
 /// through `tokio::task::spawn_blocking` so emdb's blocking I/O
 /// never stalls the async-task scheduler.
+///
+/// **Cancellation:** dropping the future of a write does not cancel
+/// the write; the blocking task runs to completion and the write may
+/// still be applied. See the module documentation.
 ///
 /// **Cost model:** each call dispatches one `spawn_blocking` task
 /// (sub-microsecond on a warm pool) and clones key + value bytes
@@ -384,13 +438,13 @@ impl AsyncEmdb {
 
     /// Stream every `(key, value)` pair in the default namespace.
     ///
-    /// The snapshot is taken synchronously inside one
-    /// `spawn_blocking`, then a second `spawn_blocking` task pumps
-    /// records into a bounded mpsc channel (capacity 64) which is
-    /// wrapped as a [`tokio_stream::wrappers::ReceiverStream`].
-    /// Memory in flight is bounded by the channel depth, not the
-    /// namespace size. Dropping the stream halts the pump task on
-    /// the next send.
+    /// The iterator is created inside one `spawn_blocking`; an async
+    /// pump task then produces records on the blocking pool one chunk
+    /// (up to 64) at a time and feeds them into a bounded mpsc channel
+    /// (capacity 64) wrapped as a
+    /// [`tokio_stream::wrappers::ReceiverStream`]. An idle stream holds
+    /// no blocking-pool thread. Dropping the stream stops the pump.
+    /// Item semantics are those of [`Emdb::iter`].
     pub async fn iter_stream(
         &self,
     ) -> Result<tokio_stream::wrappers::ReceiverStream<(Vec<u8>, Vec<u8>)>> {

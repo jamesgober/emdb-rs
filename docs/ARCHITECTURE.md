@@ -64,7 +64,7 @@ the dead records.
                          │             │
                 ┌────────▼─────────────▼──────────────┐
                 │   storage::store                    │
-                │   - Arc<Mmap> for reads             │
+                │   - epoch-published Mmap for reads  │
                 │   - fsys::JournalHandle for writes  │
                 └──────────────────┬──────────────────┘
                                    │
@@ -122,8 +122,10 @@ operation. The only writers are:
 3. **Open**: fsys cuts a torn tail left by a crash (see
    [Crash recovery](#crash-recovery)).
 
-Reads are always from a memory-mapped view (`Arc<Mmap>`) over
-the live journal file.
+Reads are always from a memory-mapped view of the live journal
+file, published through an epoch cell (`storage/arc_cell.rs`):
+point reads borrow it without touching a reference count, and
+iterators and `ValueRef`s take an `Arc` of the mapping they read.
 
 ### Frame format
 
@@ -230,7 +232,8 @@ The substrate split makes a few things tractable:
 
 ## The in-memory index
 
-The hot data structure. One per namespace.
+The hot data structure. One per namespace. Never persisted: it is
+rebuilt by the recovery scan on every open.
 
 ### Sharded open addressing
 
@@ -239,43 +242,50 @@ seqlock-protected slots:
 
 ```
 Index
-├── shards[0..64]: Shard
-│   ├── slots: Vec<AtomicSlot>      ← open-addressing, linear probe
-│   ├── overflow: HashMap<u64, …>   ← cold path: 64-bit collisions
-│   └── record_count: CachePadded<AtomicUsize>
-└── hash_key(key) → KeyHash
-    → shard = hash & 63
-    → probe = (hash >> 6) % slots.len()
-```
+└── shards[0..64]: Shard
+    ├── table: Atomic<Table>        ← epoch-published; readers load it lock-free
+    │   └── slots: Box<[AtomicSlot]> (linear probing)
+    ├── writer: Mutex<counts>       ← one writer per shard at a time
+    ├── live: AtomicUsize           ← exact live-entry count (len())
+    └── overflow: RwLock<HashMap<u64, Vec<(key, offset)>>>  ← 64-bit collisions
 
-Each `AtomicSlot` is three atomics packed into one cache line:
+shard = hash & 63
+home  = (hash >> 6) & (capacity - 1)
+```
 
 ```
 AtomicSlot {
-    state: AtomicU8,    // EMPTY | OCCUPIED | TOMBSTONE | OVERFLOW
-    hash:  AtomicU64,   // KeyHash::hash
-    offset:AtomicU64,   // byte offset into the journal
-    seq:   AtomicU64,   // seqlock counter
+    seq:    AtomicU64,  // seqlock counter: even = stable, odd = writing
+    state:  AtomicU8,   // EMPTY | OCCUPIED | TOMBSTONE | OVERFLOW
+    hash:   AtomicU64,  // full 64-bit key hash
+    offset: AtomicU64,  // byte offset of the record's payload
 }
 ```
 
-### The hash function (v0.9.6)
+The home slot uses the bits above the shard selector. (Before
+1.0.3 it used the raw hash, whose low 6 bits are the same for
+every key in a shard, so only 1/64 of each table's slots could be
+a home slot.) A table starts at 16 slots per shard (32 KiB per
+namespace) and is rebuilt before an insert would take
+`occupied + tombstones` past 75% of capacity: doubled when more
+than half of it would be live, otherwise rehashed at the same size
+to purge tombstones.
 
-`hash_key` is a wyhash-style two-prime mixer with a Murmur3
-`fmix64` finalizer:
+### The hash function (1.0.3)
 
-```rust,ignore
-const PRIME_1: u64 = 0xa076_1d64_78bd_642f;
-const PRIME_2: u64 = 0xe703_7ed1_a0b4_28db;
-```
+`KeyHasher` is a folded-multiply hash (the `foldhash`/`ahash`
+fallback construction): 16-byte blocks are XORed with
+per-instance secrets and multiplied as 64x64->128 bits, and the
+halves of each product are folded together. The secrets are drawn
+from the OS-seeded `RandomState` every time a database is opened.
 
-Two 64-bit primes multiplied against alternating 8-byte halves
-of each 16-byte block; tail handling for 8 / 4 / per-byte;
-three rounds of `fmix64` at the end. On the v0.9.4 stress key
-pattern (`"stress-key-{idx:08}"` × 64,000) it produces 0
-collisions; the previous FxHash had 22,956 collisions on the
-same pattern. See the [v0.9.6 release
-notes](../.dev/release/v0.9.6.md) for the diagnosis trail.
+Without the secrets the high half of each product is
+unpredictable, so colliding key sets cannot be computed offline.
+The pre-1.0.3 mixer was unkeyed and algebraically invertible: an
+attacker could build 20,000 keys with one hash in milliseconds and
+drive every insert through the quadratic overflow path (reopen
+time went from 13 ms to 1.9 s). The keyed hash is not a MAC; it
+only makes placement unpredictable.
 
 ### Reads (seqlock)
 
@@ -288,62 +298,64 @@ loop {
     let hash   = slot.hash.load(Relaxed);
     let offset = slot.offset.load(Relaxed);
 
-    compiler_fence(Acquire);
-    let s1 = slot.seq.load(Acquire);    // strict Acquire — was Relaxed+fence pre-0.9.6
-    if s0 == s1 && s0 & 1 == 0 {
+    fence(Acquire);                     // pairs with the writer's fence(Release)
+    let s1 = slot.seq.load(Relaxed);
+    if s0 == s1 {
         return (state, hash, offset);
     }
-    // raced, retry
 }
 ```
 
-The trailing `seq.load(Acquire)` is the post-0.9.6 fix — under
-the formal memory model, the prior pattern allowed the Relaxed
-loads to be reordered past the Acquire fence in principle. The
-post-0.9.6 pattern is conservative and fast.
+A lookup pins the `crossbeam-epoch` epoch (a thread-local
+operation), loads the shard's table pointer and probes. It takes
+no lock and writes no shared cache line.
 
-### Writes (CAS-claim, then publish)
+### Writes (one writer per shard)
 
-Writers verify state under the seqlock, then bump `seq` to odd,
-write the fields, bump `seq` back to even. The seqlock-protected
-methods are:
+```rust,ignore
+let seq = slot.seq.load(Relaxed);
+slot.seq.store(seq + 1, Relaxed);       // odd: writing
+fence(Release);
+slot.state.store(state, Relaxed);
+slot.hash.store(hash, Relaxed);
+slot.offset.store(offset, Relaxed);
+slot.seq.store(seq + 2, Release);       // even: stable
+```
 
-| Method | Verify-then-write |
-|---|---|
-| `try_claim(hash, offset)` | slot must be EMPTY |
-| `try_update(hash, offset)` | slot must be OCCUPIED with matching hash |
-| `try_tombstone(hash)` | slot must be OCCUPIED with matching hash |
-| `try_promote_to_overflow(hash)` | slot must be OCCUPIED with matching hash |
-| `write_unconditional(state, hash, offset)` | bypass — used by reload |
+Every mutation of a shard (insert, overwrite, remove, overflow
+promotion, rebuild, clear) holds that shard's writer mutex for the
+duration of the slot update only (no I/O). With one writer per
+shard there is no claim-then-verify race: before 1.0.3, two
+concurrent inserts of one key racing a removal earlier in its
+probe chain could leave the key in two slots, and a later
+`remove` resurrected the stale copy.
 
-Each one is a TOCTOU-safe primitive: it reads the seqlock-
-protected state, verifies the precondition, and writes
-atomically if the slot hasn't changed. The v0.9.3 race that
-the v0.9.4 fix addressed was specifically a verify-then-write
-gap in the old `replace` method.
+Both fences are required. Without them, a reader on a
+weak-memory CPU (ARM, POWER) can combine field values from before
+and after an update and still see matching `seq` values. The
+1.0.2 reader used a `compiler_fence`, which constrains only the
+compiler. The protocol is checked by a `loom` model in
+`src/storage/index.rs` (`RUSTFLAGS="--cfg loom" cargo test
+--release --lib loom_`), which fails if either fence is removed,
+and by Miri.
+
+### Growth without stopping readers
+
+A rebuild allocates the new table, copies the live entries, and
+publishes it with one atomic pointer swap. Readers that already
+loaded the old table finish their probe on it (no writer touches
+it any more) and the old table is freed by the epoch collector
+once they have all unpinned. Readers never wait for a rebuild.
 
 ### Overflow handling
 
-When two distinct keys hash to the same 64-bit value (birthday-
-bound, expected 0 on well-distributed keys), the slot is
-promoted to `STATE_OVERFLOW` and a per-shard `HashMap<u64,
-Vec<(Vec<u8>, u64)>>` resolves the collision by raw key compare.
-The overflow path is correctness-critical but cold — a clean
-hash function (post-0.9.6) keeps it effectively unused.
-
-### Sharding
-
-Shard selection uses the low 6 bits of the hash. Each shard's
-slot table is independently lockable for resize, so concurrent
-writers across shards never contend on each other's growth
-events.
-
-Empirical contention curve (`benches/concurrent_reads.rs`):
-- 1 thread: ~10 ns / `get` (uncontended)
-- 4 threads: ~12 ns / `get`
-- 8 threads: ~14 ns / `get`
-- 16 threads on a 4-core box: shared memory bandwidth is the
-  cap, not lock contention.
+When two distinct keys share a 64-bit hash, both entries move into
+the shard's overflow map and the primary slot is marked
+`STATE_OVERFLOW`. The map is written (under the writer mutex) before
+the slot flips, and entries are deduplicated by key, so a reader
+sees either the old single entry or both. Lookups of an overflow
+hash take the map's read lock; nothing else touches it. With the
+keyed hash this path is effectively never taken.
 
 ---
 
@@ -351,28 +363,30 @@ Empirical contention curve (`benches/concurrent_reads.rs`):
 
 ```
 Emdb::get(key)
- ├─ ns_id = self.ns_id (default = 0)
- ├─ hash  = Index::hash_key(key)
- ├─ Index::get(ns_id, hash, key) → Option<u64>      (offset)
- │   - probe shard → slot → seqlock read
- │   - if OCCUPIED and offset != STATE_OVERFLOW: return offset
- │   - if OVERFLOW: walk overflow map by raw key compare
- │   - if EMPTY: return None
- │   - if TOMBSTONE in probe sequence: skip, continue probe
- └─ Engine::decode_owned_at(offset) → (key', value', expires)
-     - read frame at offset from Arc<Mmap>
-     - decode payload (Insert / Tombstone / Namespace)
-     - verify key matches the requested key
-     - if encryption is enabled, decrypt value
-     - if expires is set and past now, return None (lazy expiry)
+ ├─ ns = default namespace (borrowed, no lock) or map lookup (named)
+ ├─ guard = crossbeam_epoch::pin()                (thread-local)
+ ├─ hash  = KeyHasher::hash(key)
+ ├─ Index::get(hash, key) → Option<u64>           (offset)
+ │   - load shard table pointer, probe with seqlock reads
+ │   - OCCUPIED with matching hash: return offset
+ │   - OVERFLOW: read-lock the overflow map, compare raw keys
+ │   - EMPTY: return None; TOMBSTONE: keep probing
+ └─ decode the record at offset
+     - borrow the journal mapping under the guard (no Arc clone)
+     - decode payload, require Insert + same namespace + same key
+     - if encryption is enabled, decrypt
+     - if expires_at has passed, return None (lazy expiry)
      - return Some(value.to_vec())
 ```
 
 Two things to note:
 
-1. **The mmap is shared across all readers.** No reader takes a
-   lock on the journal file; `Arc<Mmap>` clones share the same
-   underlying pages. The kernel page cache does the rest.
+1. **The mmap is shared across all readers.** The current mapping
+   is published through an atomic pointer; readers borrow it under
+   an epoch guard without touching its reference count. A mapping
+   replaced by a remap or a compaction swap is released once every
+   reader that could still see it has unpinned, and all mappings
+   are released synchronously when the store closes.
 2. **The verify-key step on decode is what defends against hash
    collisions.** If two keys collide and the index returns the
    wrong offset, decode will see a key mismatch and return
@@ -382,14 +396,14 @@ Two things to note:
 ### Zero-copy reads (`get_zerocopy`)
 
 ```rust,ignore
-Emdb::get_zerocopy(key) → Option<ValueRef<'_>>
+Emdb::get_zerocopy(key) → Option<ValueRef>
 ```
 
-`ValueRef` borrows a slice directly into the `Arc<Mmap>` — no
-allocation, no decoding (beyond frame validation). The lifetime
-is tied to the underlying mmap; if compaction or growth swaps
-the mmap, existing `ValueRef`s are invalidated by Rust's
-borrow checker before the swap can happen.
+`ValueRef` points directly into the mapping: no allocation, no
+copy. It holds a strong reference to the mapping it was read from
+(taken from the borrowed mapping when the `ValueRef` is built), so
+it stays valid after a remap or a compaction swap replaces the
+store's current mapping.
 
 This is the fastest read path in the library. On a 24-byte key,
 150-byte value workload, `get_zerocopy` is roughly 2× faster
@@ -401,45 +415,59 @@ than `get` because it skips the `Vec<u8>` allocation.
 
 ```
 Emdb::insert(key, value)
- ├─ ns_id = self.ns_id
- ├─ hash  = Index::hash_key(key)
- ├─ encode payload (Insert frame)
- ├─ if encryption enabled, encrypt value
- ├─ JournalHandle::append(payload) → (lsn, offset)
+ ├─ hash = KeyHasher::hash(key)
+ ├─ lock the key's write stripe (1 of 1024, chosen by namespace + hash)
+ ├─ encode payload (Insert frame); encrypt if enabled
+ ├─ JournalHandle::append(payload) → offset
  │   - fsys reserves the LSN with one atomic fetch_add
  │   - pwrite the frame at the reserved byte range
- │   - update fsys's resident buffer pool
- ├─ if FlushPolicy != Group: journal.flush()        (per-call durability)
- ├─ Index::insert_or_replace(ns_id, hash, key, offset)
- │   - probe to find slot for hash
- │   - if EMPTY: try_claim
- │   - if OCCUPIED + matching hash: try_update
- │   - if OCCUPIED + different hash + tombstone available: claim tombstone
- │   - if hash collides post-claim: promote to OVERFLOW
- │   - on slot table near capacity: grow (per-shard lock)
- └─ if range_index enabled: SkipMap::insert(key, offset)
+ │   - Windows only: reservation + write run under an append-order mutex
+ ├─ Index::replace(hash, key, offset)               (shard writer mutex)
+ ├─ if range_index enabled: SkipMap::insert(key, offset)
+ └─ release the stripe
 ```
 
-### Why writes don't take a global lock
+### Per-key write stripes
 
-The hot append path is **lock-free**:
+Every write to a key (insert, remove, batch, transaction commit,
+TTL sweep, `persist`) holds the key's stripe from before the
+journal append until the hash index and the range index are
+updated. Consequences:
 
-- `fsys::JournalHandle::append` reserves its byte range via one
-  atomic `fetch_add` on the next-LSN counter; no writer mutex.
-- N concurrent appenders issue independent `pwrite`s to their
-  reserved byte ranges. The kernel handles the syscall-level
-  serialisation, not us.
-- The in-memory index is sharded; updates to different shards
-  are independent. Updates within a shard contend only via the
-  per-slot seqlock (tens of nanoseconds when uncontended).
-- The optional SkipMap is `crossbeam_skiplist::SkipMap`, which
-  is itself lock-free.
+- **Writes to one key are linearizable,** and they reach the log in
+  the same order as they reach memory. Before 1.0.3 the append and
+  the index update were separate steps, so two concurrent writes to
+  one key could be logged in one order and applied in the other:
+  up to 279 of 400 contended keys reopened with a different value
+  than the process had been serving, and two concurrent `remove`s
+  could both return `Some`.
+- **The range index agrees with the hash index** for every key once
+  the write returns.
+- **Batches** (`insert_many`, transaction commit) lock the stripes
+  of all their keys in ascending stripe order, so batches cannot
+  deadlock with each other or with single-key writes.
 
-The only place a write can block on a lock is **shard growth**
-— when a shard's slot table needs to double, it briefly holds
-the shard's write lock to swap in the new table. Growth is
-amortised: the slot table doubles each time, so a shard sees at
-most `log₂(N)` growth events over N inserts.
+Writes to different keys almost always hold different stripes and
+run in parallel. Readers never take stripes.
+
+Lock order, outermost first: stripes (ascending) → index shard
+writer mutex → store append-order mutex (Windows) → mmap refresh
+lock. No code path acquires them in another order.
+
+### Windows: ordered appends
+
+On NTFS, a write that starts beyond the end of valid data makes the
+file system zero-fill the gap below it synchronously, and the write
+that later fills the gap pays again. Lock-free LSN reservation lets
+concurrent appenders finish their writes out of order, so every
+inverted pair takes this path. Measured with plain `seek_write`, one
+thread writing 72-byte records in pairs, second first, drops from
+~635 K to ~10 K writes/s whether or not the file is mapped; two
+emdb writer threads collapsed from ~410 K to ~22 K inserts/s. On
+Windows the store therefore holds a mutex around the reservation
+and the write (not the fsync), which keeps file extension in order:
+2 writer threads now sustain ~370 K inserts/s. Linux and macOS keep
+the lock-free append.
 
 ### Group commit
 
@@ -474,9 +502,11 @@ per namespace. The SkipMap is:
   prefix scans.
 - **Lock-free** — inserts, removes, and range iteration are all
   concurrent-safe without any global lock.
-- **Pointer-stable** — range iterators take a snapshot of the
-  keys at construction, then resolve values through the mmap on
-  each `next()`.
+- **Consistent with the hash index**: it is updated under the
+  same per-key write stripe.
+- **Cursor-iterated**: range iterators keep only the last key
+  yielded and re-seek the skiplist for each page, then resolve
+  values through the mmap on each `next()`.
 
 ### Cost
 
@@ -501,9 +531,13 @@ matters — emdb's default open does not pay this tax.
 | `iter_from(start)` | lazy `EmdbRangeIter` (inclusive) |
 | `iter_after(start)` | lazy `EmdbRangeIter` (exclusive) |
 
-The lazy variants take a snapshot of `(key, offset)` pairs from
-the SkipMap and decode values lazily on each `next()` — useful
-for early-exit consumers that only read the first few records.
+The lazy variants are cursors: each refill seeks just past the last
+key yielded and takes a page of `(key, offset)` pairs (16 at
+first, doubling to 512); values are decoded on each `next()`.
+`iter_from(..).take(10)` over 1 M keys costs about 2 us (1.0.2
+copied the whole range first: 50-120 ms). Iteration is weakly
+consistent: ascending order, each key at most once, and keys
+changed ahead of the cursor may or may not be observed.
 
 ---
 
@@ -517,16 +551,22 @@ expiration check happens at decode time.
 
 ### Lazy expiration
 
-Reads check `expires_at` against the current wall clock; expired
-records return `None` from `get` and aren't yielded by iterators.
-The on-disk record isn't immediately removed; it stays in the
-journal until compaction sweeps it.
+Reads check `expires_at` against the current wall clock. Every
+read path treats an expired record as absent: `get`,
+`get_zerocopy`, `contains_key` (default and named namespaces),
+`iter`, `keys`, `range*`, `group`. `persist` refuses to clear the
+TTL of an expired record, so it cannot bring one back. `len()`
+still counts expired records until they are swept. The on-disk
+record stays in the journal until compaction.
 
 ### Eager expiration
 
-`Emdb::sweep_expired()` walks the index, removes expired
-entries, and writes tombstone frames so the expirations survive
-restart. The sweep is cooperative — it never blocks readers.
+`Emdb::sweep_expired()` walks the index decoding keys and expiry
+times only, then removes each expired entry with a
+compare-and-remove: the entry is removed (and a tombstone frame
+written, so the expiry survives restart) only if the key still
+points at the record the sweep saw. A key re-inserted while the
+sweep runs keeps its new value. The sweep never blocks readers.
 
 ### Why lazy + eager
 
@@ -790,7 +830,9 @@ creation) holds an engine-level write gate in shared mode for the
 duration of its append and index update; compaction takes the
 gate exclusively for the whole run:
 
-1. Take the write gate exclusively. Remove any stale
+1. Take the write gate exclusively (writers take it shared inside
+   the per-key stripe lock helpers, before the stripes, so a write
+   never holds it twice). Remove any stale
    `<path>.compact.tmp` and create it fresh (`create_new`).
 2. Snapshot the live offsets of every namespace.
 3. Copy each live record verbatim (encrypted records stay
@@ -803,16 +845,22 @@ gate exclusively for the whole run:
    If the rename fails, nothing has changed: the database keeps
    using the original file and the temporary is removed.
 6. Install the new journal handle, read handle and mapping, and
-   swap in the new indexes in one step. The journal handle that
-   wrote the temporary becomes the live journal, so later writes
-   land in the new file.
+   swap in the new namespace runtimes (indexes and skiplists), all
+   between the two increments of the file generation counter. The
+   journal handle that wrote the temporary becomes the live
+   journal, so later writes land in the new file.
 
 Readers are not blocked. A point read that raced the swap (old
-index offset, new file, or the reverse) is detected through a
-swap sequence number and retried. Iterators pin the mapping they
-were created from and keep yielding that snapshot; `ValueRef`s
-likewise stay valid. Peak memory is bounded by the batch size plus
-one offset per live record, not by the database size.
+index offset, new file, or the reverse) is detected through the
+generation counter (a seqlock: odd while a swap runs) and retried.
+`iter`/`keys` iterators pin the mapping they were created from and
+keep yielding that snapshot; `ValueRef`s likewise stay valid.
+Range iterators pin the mapping of each page they read; the next
+page notices the new generation and re-attaches to the namespace's
+new skiplist after the last key yielded, so a range iterator is
+weakly consistent across a compaction, as it is across writes.
+Peak memory is bounded by the batch size plus one offset per live
+record, not by the database size.
 
 ### Why not online compaction
 
@@ -839,21 +887,26 @@ real workload.
 - **`Emdb` is `Send + Sync + Clone`.** Clones share the
   underlying `Arc<Inner>` — pass clones across threads instead
   of sharing one handle through a `Mutex`.
-- **Reads scale to the core count.** The 64-shard index and the
-  shared `Arc<Mmap>` keep the hot read path lock-free past
-  shard-level granularity.
-- **Writes don't serialise on a writer mutex.** fsys's LSN
-  reservation is a single atomic; concurrent appenders issue
-  independent `pwrite`s.
+- **Reads scale with cores.** A default-namespace `get` takes no
+  lock and writes no shared cache line (epoch pin, seqlock probe,
+  borrowed mapping). Named namespaces add one read-lock and one
+  `Arc` clone for the namespace lookup.
+- **Writes to one key are linearizable** (per-key stripes); writes
+  to different keys run in parallel, except that Windows serialises
+  the journal append itself.
+- **Batches are not transactions.** `insert_many` and
+  `transaction` lock their keys' stripes for the commit, but readers
+  can see a commit partly applied and there is no read isolation.
 - **Compaction stops writers, not readers.** `clear`,
   `drop_namespace` and the snapshot phase of `backup_to` also take
-  the write gate exclusively; all other operations run
-  concurrently.
+  the write gate exclusively; every other write holds it shared, and
+  reads never take it.
 
-The bench `benches/concurrent_reads.rs` measures **9.94 M
-reads/sec aggregate at 8 threads on a 4-core consumer box** —
-the lock-free read path scales until shared memory bandwidth
-becomes the cap.
+Measured aggregate `get` throughput, default namespace, 100 K keys
+(`tests/perf_probe`-style loop, release build, 1/4/8 threads):
+Linux 16.8 M / 72.7 M / 131.7 M per second (1.0.2: 10.5 M / 10.9 M /
+9.9 M); Windows 9.2 M / 56.4 M / 118.5 M (1.0.2: 8.1 M / 14.5 M /
+15.4 M).
 
 ---
 

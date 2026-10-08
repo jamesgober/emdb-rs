@@ -1,21 +1,30 @@
 // Copyright 2026 James Gober. Licensed under Apache-2.0.
 
-//! Buffered batch transaction over an [`crate::Emdb`].
+//! Buffered write batch over an [`crate::Emdb`].
 //!
-//! A transaction stages writes in a Vec; on commit, every staged write
-//! is replayed against the engine under a single writer-mutex hold per
-//! record. Reads inside the transaction see staged writes via the
-//! overlay; on commit failure (closure returns Err), the staged writes
-//! are dropped.
+//! A transaction stages writes in an ordered map (the last staged
+//! write per key wins). Reads through the transaction see staged
+//! writes first and fall through to the live database. If the closure
+//! returns `Err`, the staged writes are dropped and nothing is
+//! written.
 //!
-//! Note: the new mmap+append architecture does **not** provide
-//! all-or-nothing batch atomicity. Individual records are atomic
-//! (per-record CRC) but a crash mid-commit leaves a prefix of the
-//! batch durable. Callers that need true atomicity must arrange it
-//! externally.
+//! On commit the staged writes become one engine write batch: the
+//! write lock of every staged key is taken (in ascending stripe
+//! order), all records are appended with one vectored journal write,
+//! and the in-memory index is updated before the locks are released.
+//! Any other write to one of those keys is therefore ordered entirely
+//! before or after the commit.
+//!
+//! That is the whole guarantee. There is no read isolation (reads in
+//! the closure see concurrent writes, so read-modify-write sequences
+//! can lose updates), no atomic visibility (other threads can see part
+//! of a commit while it is being applied), and no crash atomicity (a
+//! crash during the append can leave a prefix of the batch durable).
+//! See [`crate::Emdb::transaction`].
 
 use std::collections::BTreeMap;
 
+use crate::storage::engine::BatchOp;
 use crate::storage::DEFAULT_NAMESPACE_ID;
 use crate::{Emdb, Result};
 
@@ -28,7 +37,11 @@ enum Staged {
     Remove,
 }
 
-/// Closure-scoped transaction.
+/// Closure-scoped write batch handed to [`Emdb::transaction`].
+///
+/// Stages inserts and removes and offers read-your-writes reads. See
+/// [`Emdb::transaction`] for exactly what a commit guarantees; it is
+/// not an isolated transaction.
 pub struct Transaction<'db> {
     db: &'db Emdb,
     overlay: BTreeMap<Vec<u8>, Staged>,
@@ -47,10 +60,7 @@ impl<'db> Transaction<'db> {
         let key = key.into();
         let value = value.into();
         #[cfg(feature = "ttl")]
-        let expires_at = {
-            let now = now_unix_millis();
-            expires_from_ttl(Ttl::Default, self.db.inner.default_ttl, now)?.unwrap_or(0)
-        };
+        let expires_at = self.db.inner.default_expires_at()?;
         #[cfg(not(feature = "ttl"))]
         let expires_at = 0_u64;
         let _previous = self
@@ -77,7 +87,9 @@ impl<'db> Transaction<'db> {
         Ok(())
     }
 
-    /// Stage a remove.
+    /// Stage a remove. Returns the value visible to this transaction
+    /// right now (staged or live); the key may still change before the
+    /// commit.
     pub fn remove(&mut self, key: impl Into<Vec<u8>>) -> Result<Option<Vec<u8>>> {
         let key = key.into();
         let prev_visible = self.get(&key)?;
@@ -85,7 +97,8 @@ impl<'db> Transaction<'db> {
         Ok(prev_visible)
     }
 
-    /// Read with read-your-writes semantics.
+    /// Read with read-your-writes semantics: a staged write for `key`
+    /// wins, otherwise the live database is read (no snapshot).
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
         if let Some(staged) = self.overlay.get(key) {
@@ -107,24 +120,17 @@ impl<'db> Transaction<'db> {
         if staged.is_empty() {
             return Ok(());
         }
-
-        let engine = &self.db.inner.engine;
-        // Bulk-route inserts via insert_many; removes go individually
-        // because the engine's remove path returns the previous value.
-        let mut bulk_inserts: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
-        for (key, staged) in staged {
-            match staged {
-                Staged::Insert { value, expires_at } => {
-                    bulk_inserts.push((key, value, expires_at));
-                }
-                Staged::Remove => {
-                    let _ = engine.remove(DEFAULT_NAMESPACE_ID, &key)?;
-                }
-            }
-        }
-        if !bulk_inserts.is_empty() {
-            engine.insert_many(DEFAULT_NAMESPACE_ID, bulk_inserts)?;
-        }
-        Ok(())
+        let ops: Vec<BatchOp> = staged
+            .into_iter()
+            .map(|(key, staged)| match staged {
+                Staged::Insert { value, expires_at } => BatchOp::Insert {
+                    key,
+                    value,
+                    expires_at,
+                },
+                Staged::Remove => BatchOp::Remove { key },
+            })
+            .collect();
+        self.db.inner.engine.write_batch(DEFAULT_NAMESPACE_ID, ops)
     }
 }

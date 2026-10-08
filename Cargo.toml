@@ -66,9 +66,18 @@ parking_lot = "0.12"
 # concurrent range iteration with no lock contention.
 crossbeam-skiplist = "0.1"
 # crossbeam-utils — `CachePadded<T>` for false-sharing elimination on
-# the hot atomics (per-namespace `record_count`, `Store::mmap_len`).
+# the hot atomics (`Store::mmap_len`, the swap generation, the index
+# shards and the per-key write stripes).
 # Already pulled in transitively through fsys.
 crossbeam-utils = { version = "0.8", default-features = false }
+# crossbeam-epoch: epoch-based memory reclamation for the lock-free
+# read path: index shard tables and the journal mmap are published
+# through atomic pointers and retired tables / mappings are freed only
+# after every reader that could still see them has unpinned. Already
+# in the dependency graph through `crossbeam-skiplist` (no new crate);
+# declared directly because emdb now calls it. 0.9.21 is the first
+# release without RUSTSEC-2026-0204; MSRV 1.61.
+crossbeam-epoch = { version = "0.9.21", default-features = false, features = ["std"] }
 # Optional at-rest AES-256-GCM encryption. 0.10.3 is the floor for
 # RUSTSEC-2023-0096 (plaintext exposed on tag verification failure).
 # The `zeroize` feature wipes the derived GHASH key on construction.
@@ -129,6 +138,13 @@ tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-t
 tokio-stream = { version = "0.1", default-features = false }
 futures-util = { version = "0.3", default-features = false }
 
+# loom: exhaustive interleaving checker for the index seqlock model
+# (`src/storage/index.rs`, `mod loom_model`). Only compiled when the
+# crate is built with `RUSTFLAGS="--cfg loom"`; normal builds and
+# downstream users never compile it.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
 [features]
 default = ["ttl"]
 ttl = []
@@ -160,7 +176,8 @@ bench-rocksdb = ["dep:rocksdb"]
 [lints.rust]
 # `cfg(fuzzing)` is set by cargo-fuzz (see `fuzz/`). It gates the hidden
 # decoder entry points the fuzz targets call, which are not public API.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+# `cfg(loom)` is set by RUSTFLAGS for the loom model run only.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(loom)"] }
 
 [profile.release]
 opt-level = 3
@@ -188,6 +205,10 @@ harness = false
 
 [[bench]]
 name = "index_hotpath"
+harness = false
+
+[[bench]]
+name = "concurrent_writes"
 harness = false
 
 [[bench]]

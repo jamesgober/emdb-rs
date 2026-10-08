@@ -25,13 +25,19 @@
 //! engine-level concerns (per-namespace sharded indices,
 //! encryption, range scans, TTL).
 //!
-//! **Reads** are lock-free — the 64-shard primary index plus the
-//! `Arc<Mmap>` zero-copy read path scale to many millions of
-//! operations per second on a single open handle. **Writes** are
-//! lock-free via fsys's atomic LSN reservation; no writer mutex
-//! on the hot append path. Producers can still batch through
-//! [`Emdb::insert_many`] or [`Emdb::transaction`] when group
-//! semantics matter.
+//! **Reads** of the default namespace take no lock and write no
+//! shared cache line: the 64-shard primary index is probed with
+//! seqlock reads and the journal mapping is borrowed under an epoch
+//! guard, so aggregate `get` throughput grows with reader threads.
+//! **Writes** to one key are linearizable: each write holds a
+//! per-key stripe lock across the journal append and the index
+//! update, so the log and memory agree on the order of writes to
+//! every key. Writes to different keys proceed in parallel (index
+//! shards are updated under short per-shard writer locks; on Windows
+//! the journal append itself is serialised, see
+//! `docs/PLATFORM-NOTES.md`). Producers can batch through
+//! [`Emdb::insert_many`] or [`Emdb::transaction`]; neither is an
+//! isolated or crash-atomic transaction (see [`Emdb::transaction`]).
 //!
 //! ## Quick start
 //!
@@ -106,15 +112,24 @@
 //!
 //! [`Emdb::iter`] / [`Emdb::keys`] yield records lazily, decoding one
 //! record per `next()` call from a snapshot of offsets captured at
-//! construction time. Memory use scales with the offset count, not
-//! the total value size.
+//! construction time: each record is yielded with the value it had
+//! when the iterator was created. Memory use scales with the offset
+//! count, not the total value size.
 //!
 //! Range queries are opt-in via
 //! [`EmdbBuilder::enable_range_scans`]; once enabled,
-//! [`Emdb::range_iter`] / [`Emdb::range_prefix_iter`] return streaming
-//! iterators backed by a lock-free `crossbeam_skiplist::SkipMap`
-//! secondary index — inserts and range scans run concurrently
-//! without a global lock.
+//! [`Emdb::range_iter`] / [`Emdb::range_prefix_iter`] return cursors
+//! over a lock-free `crossbeam_skiplist::SkipMap` secondary index.
+//! They hold no snapshot, so `iter_from(k).take(10)` costs a seek
+//! plus ten records however large the range is. A compaction while
+//! a range iterator runs is transparent: it continues after its last
+//! key in the compacted file.
+//!
+//! With the `ttl` feature, every read path (`get`, `contains_key`,
+//! iterators, ranges) treats records whose TTL has passed as absent;
+//! [`Emdb::len`] counts them until [`Emdb::sweep_expired`] removes
+//! them. Iterators skip records that fail to decode without reporting
+//! an error.
 //!
 //! ## Group-commit durability
 //!

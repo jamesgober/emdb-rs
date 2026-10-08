@@ -146,15 +146,30 @@ impl<'a> Focus<'a> {
 
     /// Iterates all keys under the current focus prefix.
     ///
+    /// A focus with an empty prefix (`db.focus("")`) is the root of
+    /// the key space: [`Self::set`] and [`Self::get`] use bare keys,
+    /// so this yields every record in the default namespace.
+    ///
     /// # Errors
     ///
-    /// Returns an error when lock acquisition fails.
+    /// Returns an error when the snapshot of record offsets cannot be
+    /// taken.
     pub fn iter(&self) -> Result<impl Iterator<Item = (Vec<u8>, Vec<u8>)>> {
-        let items = self.db.group(self.prefix.as_str())?.collect::<Vec<_>>();
+        let items: Vec<_> = if self.prefix.is_empty() {
+            self.db.iter()?.collect()
+        } else {
+            self.db.group(self.prefix.as_str())?.collect()
+        };
         Ok(items.into_iter())
     }
 
     /// Deletes every key under the current focus prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPath`] for a focus with an empty prefix
+    /// (it would delete the whole default namespace; use
+    /// [`Emdb::clear`] for that), or an error from the deletes.
     pub fn delete_all(&self) -> Result<usize> {
         self.db.delete_group(self.prefix.as_str())
     }
@@ -221,6 +236,23 @@ mod tests {
         let grouped = db.group("product");
         assert!(grouped.is_ok());
         assert_eq!(grouped.map_or(0, Iterator::count), 1);
+    }
+
+    #[test]
+    fn test_focus_empty_prefix_iterates_bare_keys() {
+        let db = Emdb::open_in_memory();
+        let root = db.focus("");
+        assert!(root.set("name", "james").is_ok());
+        assert!(db.insert("nested.key", "v").is_ok());
+        assert!(matches!(root.get("name"), Ok(Some(v)) if v == b"james"));
+        let mut keys: Vec<Vec<u8>> = match root.iter() {
+            Ok(iter) => iter.map(|(k, _)| k).collect(),
+            Err(err) => panic!("iter failed: {err}"),
+        };
+        keys.sort();
+        assert_eq!(keys, vec![b"name".to_vec(), b"nested.key".to_vec()]);
+        assert!(matches!(root.delete_all(), Err(crate::Error::InvalidPath)));
+        assert!(matches!(db.len(), Ok(2)));
     }
 
     #[cfg(feature = "ttl")]

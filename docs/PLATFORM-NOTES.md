@@ -112,6 +112,24 @@ emdb's behaviour is the same.
 return — no separate `FlushFileBuffers` needed. Functionally
 equivalent to Linux's `RWF_DSYNC`.
 
+### Concurrent appends are ordered
+
+NTFS handles a write that starts beyond the end of valid data by
+zero-filling the gap below it synchronously; the write that later
+fills the gap pays again. With lock-free LSN reservation,
+concurrent appenders finish their writes out of order, and every
+inverted pair takes this slow path. Measured with plain
+`seek_write` on Windows 11: one thread writing 72-byte records in
+pairs, second record first, managed ~10 K writes/s against
+~635 K in order, with or without a mapping of the file. emdb 1.0.2
+with two writer threads fell from ~410 K to ~22 K inserts/s.
+
+From 1.0.3 the store takes a mutex around the LSN reservation and
+the write on Windows only (the fsync stays outside it, so group
+commit still coalesces). Fresh-key inserts on the reference machine:
+~390 K/s with 1 thread, ~370 K/s with 2, ~190 K/s with 4-8 (1.0.2:
+~410 K, ~22 K, ~20 K). Linux and macOS keep the lock-free append.
+
 ### `MoveFileExW(REPLACE_EXISTING)`
 
 Metadata sidecar updates go through fsys's atomic replace, which

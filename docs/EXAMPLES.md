@@ -201,12 +201,18 @@ do between records.
 
 ### `transaction(|tx| { ... })`
 
-Best for: writes that must be atomic — either all succeed or
-none are observable.
+Best for: a group of writes that should be all-or-nothing with
+respect to the closure's own logic (return `Err` and nothing is
+written), with read-your-writes inside the closure.
 
 - Buffers all writes in memory until the closure returns.
-- One LSN reservation + one `pwrite` at commit time.
-- Roll back by returning `Err` from the closure.
+- One LSN reservation + one `pwrite` at commit time, with the
+  write locks of every touched key held, so other writers to those
+  keys are ordered before or after the whole commit.
+- Not isolated: reads in the closure see the live database, and
+  readers can see a commit partly applied. Not crash-atomic: a
+  crash mid-commit can leave a prefix durable. See
+  `Emdb::transaction`.
 
 ### Loop
 
@@ -218,8 +224,8 @@ decide + write patterns).
   concurrently.
 
 **Rule of thumb:**
-- Atomic batch → `transaction`.
-- Non-atomic batch → `insert_many`.
+- Batch with staging, rollback and read-your-writes → `transaction`.
+- Plain batch → `insert_many`.
 - Per-record decision logic → loop.
 
 ---

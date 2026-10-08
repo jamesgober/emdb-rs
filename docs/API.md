@@ -371,13 +371,17 @@ enabled.
 ### `iter() -> Result<EmdbIter>`
 
 Streaming iterator over `(key, value)` pairs in unspecified
-order. Captures a snapshot of offsets at construction time —
-records inserted after `iter()` returns may or may not appear,
-records removed after `iter()` returns may still appear (with
-their pre-removal value).
-
-Each `next()` decodes one record on demand, so memory use scales
+order. `iter()` snapshots the file offsets of every live record;
+each `next()` decodes one of them on demand, so memory use scales
 with the offset count rather than total value size.
+
+Because the snapshot points into the append-only log, every
+snapshotted record is yielded with the value it had when `iter()`
+was called, even if it is overwritten or removed while you iterate.
+Keys inserted after `iter()` returns are not yielded. With the
+`ttl` feature, records whose TTL has passed when `next()` reaches
+them are skipped. Records that fail to decode are skipped silently
+(a `try_iter` that surfaces errors is planned for 1.1).
 
 ```rust
 use emdb::Emdb;
@@ -397,9 +401,9 @@ assert_eq!(count, 2);
 
 ### `keys() -> Result<EmdbKeyIter>`
 
-Streaming iterator over keys only. Doesn't decode values — the
-right choice when you want the key set and don't care about
-values.
+Streaming iterator over keys only. Same snapshot semantics as
+`iter()`, but values are never decoded or copied: the right choice
+when you want the key set and don't care about values.
 
 ```rust
 use emdb::Emdb;
@@ -417,9 +421,11 @@ assert_eq!(keys.len(), 2);
 
 Range methods require `EmdbBuilder::enable_range_scans(true)` at
 open time. They are backed by a parallel lock-free
-`crossbeam_skiplist::SkipMap` per namespace — inserts and range
-iteration run concurrently without a global lock. See the README
-for the memory-cost trade-off.
+`crossbeam_skiplist::SkipMap` per namespace, so inserts and range
+iteration run concurrently without a global lock. Every write
+updates the skiplist under the same per-key lock as the hash index,
+so the two indexes agree for every key once the write returns. See
+the README for the memory-cost trade-off.
 
 #### `range<R>(range) -> Result<Vec<(Vec<u8>, Vec<u8>)>>`
 
@@ -447,7 +453,17 @@ inclusive, full, or unbounded.
 
 #### `range_iter<R>(range) -> Result<EmdbRangeIter>`
 
-Streaming variant. Same semantics as `range`, but yields lazily.
+Streaming variant. Same results as `range`, but it is a cursor
+over the sorted index rather than a snapshot: each refill seeks
+just past the last key yielded and reads a small page (16 entries
+at first, doubling up to 512). `take(n)` therefore costs one seek
+plus `n` records regardless of the range size (about 2 us for
+`iter_from(..).take(10)` over 1 M keys, against 50-120 ms in 1.0.2,
+which copied the whole range first). Keys come out in ascending
+order, each at most once; keys inserted or removed ahead of the
+cursor while it runs may or may not be seen. A `compact()` while it
+runs is transparent: it continues after its last key in the
+compacted file.
 
 ```rust,no_run
 use emdb::Emdb;
@@ -526,15 +542,31 @@ assert_eq!(pages, 5);
 
 ### `transaction<F, T>(f) -> Result<T>`
 
-Run a closure with exclusive write access. Inside the closure,
-inserts and removes are staged in a [`Transaction`](#transaction)
-and applied atomically when the closure returns `Ok`. If the
-closure returns `Err`, the staged changes are discarded.
+Run a closure that stages a write batch. Inside the closure,
+inserts and removes are staged in a [`Transaction`](#transaction);
+when the closure returns `Ok` they are committed as one batch, and
+when it returns `Err` they are discarded.
 
-emdb transactions are write-only and serialise with one another;
-they do not provide MVCC snapshots for readers. Other readers
-see the prior state until the transaction commits, then the
-post-commit state.
+This is a buffered write batch, not an isolated transaction.
+Guaranteed:
+
+- Nothing staged is written if the closure returns `Err`.
+- Reads through `tx` see the batch's own staged writes.
+- The commit holds the write lock of every key it touches while it
+  appends the batch (one journal write) and updates the index, so
+  any other write to one of those keys, including another
+  transaction's, happens entirely before or after the commit.
+
+Not guaranteed:
+
+- Isolation. `tx.get` reads the live database; another thread can
+  change a key between that read and the commit, so
+  read-modify-write logic (counters, balance transfers) can lose
+  updates under concurrency. Serialise such updates yourself.
+- Atomic visibility. Other threads can observe some of the batch's
+  keys updated and others not yet while the commit is applying.
+- Crash atomicity. A crash during the commit's journal write can
+  leave a prefix of the batch durable.
 
 ```rust
 use emdb::Emdb;
@@ -573,8 +605,8 @@ methods:
   TTL.
 - `remove(key)` — stage a removal. Returns the staged-or-
   underlying prior value.
-- `get(key)` — read the live database, taking staged writes
-  into account.
+- `get(key)`: read the live database (no snapshot), taking
+  staged writes into account.
 - `contains_key(key)` — same, key-only.
 
 The transaction is dropped on return: there is no explicit
@@ -1379,8 +1411,10 @@ since the Unix epoch.
 
 emdb's iteration methods return owned-iterator structs (one for the
 default namespace, one for named namespaces). Each implements the
-standard `Iterator` trait and decodes records lazily from a snapshot
-of offsets captured at construction time.
+standard `Iterator` trait and decodes records lazily. `iter`/`keys`
+types walk a snapshot of offsets captured at construction time; the
+range types are cursors over the live sorted index (see
+[`range_iter`](#range_iterrrange---resultemdbrangeiter)).
 
 **Default-namespace iterators** (returned by `Emdb` methods):
 
@@ -1398,12 +1432,13 @@ of offsets captured at construction time.
 | `NamespaceKeyIter` | `Namespace::keys()` | `Vec<u8>` |
 | `NamespaceRangeIter` | `Namespace::range_iter()`, `Namespace::range_prefix_iter()`, `Namespace::iter_from()`, `Namespace::iter_after()` | `(Vec<u8>, Vec<u8>)` |
 
-All six are `Send` and own their snapshot, so they can move freely
-across threads — but the underlying engine handle (`Arc<Inner>`) is
-shared, so dropping the source `Emdb` / `Namespace` does **not**
-invalidate an iterator that already took its snapshot. Records
-removed or overwritten after the snapshot was taken are skipped
-silently on `next()`.
+All six are `Send` and hold a shared handle to the engine, so they
+can move freely across threads, and dropping the source `Emdb` /
+`Namespace` does **not** invalidate an iterator. Snapshot iterators
+yield each snapshotted record with its value at snapshot time, even
+if it is removed or overwritten afterwards. All six skip records
+whose TTL has passed (`ttl` feature) and skip records that fail to
+decode without reporting an error.
 
 ### `Cipher` (`encrypt` feature)
 

@@ -19,13 +19,18 @@
 //! ## Concurrency
 //!
 //! - **Writes**: `fsys::JournalHandle` does lock-free LSN
-//!   reservation + concurrent `pwrite`. The handle sits behind a
-//!   `RwLock` only so compaction can install the handle for the
-//!   rewritten file; appends take the lock shared.
-//! - **Reads**: `Arc<Mmap>` over the journal file. Readers get a
-//!   cheap clone of the Arc; the kernel keeps a mapping alive even
-//!   after the writer grows the file or compaction replaces it, so
-//!   readers holding an old snapshot continue uninterrupted.
+//!   reservation + concurrent `pwrite`, except on Windows, where
+//!   appends are serialised to keep file extension in offset order
+//!   (see `SERIALIZE_APPENDS`). The handle sits behind a `RwLock`
+//!   only so compaction can install the handle for the rewritten
+//!   file; appends take the lock shared.
+//! - **Reads**: a read-only mapping of the journal file, published
+//!   through an [`ArcCell`]. Hot-path readers borrow it under an epoch
+//!   guard ([`Store::mapped`]) without touching a reference count;
+//!   the store re-maps when a read needs bytes past the current
+//!   mapping. A mapping stays valid while a reader (or an iterator or
+//!   `ValueRef` holding an `Arc` of it) uses it, even after the file
+//!   grows or compaction replaces it.
 //! - **Swaps**: compaction replaces the journal, the read file and
 //!   the mapping together between [`Store::begin_swap`] and
 //!   [`Store::end_swap`]. `swap_seq` is odd while a swap is in
@@ -50,11 +55,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crossbeam_epoch::Guard;
 use crossbeam_utils::CachePadded;
 use memmap2::{Mmap, MmapOptions};
 use parking_lot::{Mutex, RwLock};
 
 use crate::error::from_fsys;
+use crate::storage::arc_cell::{ArcCell, MmapView};
 use crate::storage::flush::FlushPolicy;
 use crate::storage::format;
 use crate::storage::meta::{self, MetaHeader};
@@ -73,6 +80,24 @@ const FSYS_POST_PAYLOAD_BYTES: u64 = 4;
 /// Largest payload one fsys v1 frame can carry (256 MiB - 1).
 pub(crate) const FSYS_MAX_PAYLOAD: u64 = (1 << 28) - 1;
 
+/// Whether journal appends are serialised so that file-extending
+/// writes reach the OS in offset order.
+///
+/// On NTFS a write that starts beyond the current end of valid data
+/// makes the file system zero-fill the gap below it synchronously, and
+/// the later write that fills the gap pays again. Concurrent appends
+/// reserve their offsets in one order and finish their writes in
+/// another, so every out-of-order pair hits this path: measured with
+/// plain `seek_write`, a single thread writing 72-byte records in
+/// pairs, second record first, drops from ~635 K to ~10 K writes/s,
+/// mapped or not, and 2 to 8 emdb writer threads collapsed to 9-20 K
+/// inserts/s. Taking a mutex around the reservation and the write
+/// keeps extensions in order. The sync for
+/// [`FlushPolicy::WriteThrough`] stays outside the lock, so group
+/// commit still coalesces fsyncs. Other platforms keep the lock-free
+/// append path.
+const SERIALIZE_APPENDS: bool = cfg!(windows);
+
 /// Storage substrate handle.
 ///
 /// Held inside an `Arc<Store>` by [`crate::storage::engine::Engine`];
@@ -88,17 +113,20 @@ pub(crate) struct Store {
     /// fsys top-level handle for sidecar (meta-file) writes and for
     /// the journals compaction and backup write.
     fs: fsys::Handle,
-    /// Read-only `File` retained for re-mmap on file growth.
-    /// Lock order: `read_file` before `mmap`. Both refresh and swap
-    /// hold both locks while they install a mapping, so a refresh
-    /// can never install a mapping of a file a swap already retired.
+    /// Read-only `File` retained for re-mmap on file growth. Every
+    /// replacement of `mmap` happens while this lock is held, so a
+    /// refresh can never install a mapping of a file a swap already
+    /// retired, and two refreshes cannot replace a longer mapping with
+    /// a shorter one.
     read_file: Mutex<File>,
-    /// Atomically-swapped read mapping. Readers grab a snapshot
-    /// via `Arc::clone`.
-    mmap: RwLock<Arc<Mmap>>,
-    /// Byte length covered by the active mapping. Updated under the
-    /// mmap write lock. `CachePadded` so the read-path load does not
-    /// false-share with neighbouring fields.
+    /// Atomically-swapped read mapping. Hot-path readers borrow it
+    /// under an epoch guard ([`Self::mapped`]) without touching a
+    /// shared counter; it is replaced when the journal extends past
+    /// the current mapping length or the file is swapped.
+    mmap: ArcCell<Mmap>,
+    /// Byte length covered by the active mapping. Updated while
+    /// `read_file` is locked. `CachePadded` so the read-path load does
+    /// not false-share with neighbouring fields.
     mmap_len: CachePadded<AtomicU64>,
     /// Swap sequence: even while stable, odd while compaction is
     /// replacing the file. Doubles as the file generation counter.
@@ -115,6 +143,8 @@ pub(crate) struct Store {
     /// `true` when this open created the data file, so
     /// [`Self::finish_open`] syncs the directory entry.
     created: bool,
+    /// Orders journal appends when [`SERIALIZE_APPENDS`] is set.
+    append_order: Mutex<()>,
 }
 
 impl std::fmt::Debug for Store {
@@ -187,13 +217,14 @@ impl Store {
             journal: RwLock::new(None),
             fs,
             read_file: Mutex::new(read_file),
-            mmap: RwLock::new(Arc::new(initial_mmap)),
+            mmap: ArcCell::new(Arc::new(initial_mmap)),
             mmap_len: CachePadded::new(AtomicU64::new(mmap_len)),
             swap_seq: CachePadded::new(AtomicU64::new(0)),
             policy,
             meta: RwLock::new(meta),
             meta_deferred: AtomicBool::new(meta_deferred),
             created,
+            append_order: Mutex::new(()),
         })
     }
 
@@ -205,14 +236,13 @@ impl Store {
     /// shrink a file that has a mapped view, and on Unix touching a
     /// mapped page past the new end raises `SIGBUS`, so the read
     /// mapping is dropped for the duration of the open and rebuilt
-    /// afterwards.
-    pub(crate) fn open_journal(&self) -> Result<()> {
-        {
-            let file_guard = self.read_file.lock();
-            let mut mmap_guard = self.mmap.write();
-            *mmap_guard = Arc::new(empty_mapping(&file_guard)?);
-            self.mmap_len.store(0, Ordering::Release);
-        }
+    /// afterwards. Takes `&mut self` (the engine is not shared yet) so
+    /// the old mapping is released at once rather than when the epoch
+    /// collector gets to it.
+    pub(crate) fn open_journal(&mut self) -> Result<()> {
+        let empty = empty_mapping(self.read_file.get_mut())?;
+        self.mmap.set_mut(Arc::new(empty));
+        self.mmap_len.store(0, Ordering::Release);
 
         // Long write-lifetime hint (Linux NVMe `F_SET_RW_HINT`) so the
         // SSD groups journal data into long-lived NAND blocks. No-op
@@ -275,46 +305,60 @@ impl Store {
         &self.fs
     }
 
-    /// Current mapping, without any refresh.
-    fn current_mmap(&self) -> Arc<Mmap> {
-        Arc::clone(&self.mmap.read())
-    }
-
-    /// Borrow a read mapping that covers at least up to byte
-    /// `end_offset`. Refreshes the mapping once when the current one
-    /// is shorter. Callers that read a record should use
-    /// [`Self::mmap_for_payload`], which also covers the record's
-    /// end.
-    pub(crate) fn mmap_covering(&self, end_offset: u64) -> Result<Arc<Mmap>> {
-        let cur_len = self.mmap_len.load(Ordering::Acquire);
-        if end_offset > cur_len {
-            self.refresh_mmap()?;
-        }
-        Ok(self.current_mmap())
-    }
-
-    /// Borrow a read mapping that covers the whole payload starting
-    /// at `payload_start`, including its last byte.
+    /// Hot-path read accessor: borrow a mapping that covers at least
+    /// `end_offset` bytes, valid while `guard` (and `self`) live.
     ///
-    /// Reads the payload length from the fsys frame header in front
-    /// of `payload_start` and refreshes the mapping when the payload
-    /// ends past it. A mapping taken while a large append was still
-    /// being written can cover a record's start but not its end;
-    /// checking only the first byte would then report an
-    /// acknowledged record as missing.
-    pub(crate) fn mmap_for_payload(&self, payload_start: u64) -> Result<Arc<Mmap>> {
-        let mmap = self.mmap_covering(payload_start)?;
-        let Ok(start) = usize::try_from(payload_start) else {
-            return Ok(mmap);
-        };
-        if let Ok(len) = format::payload_len_at(&mmap, start) {
-            let end = payload_start.saturating_add(len as u64);
-            if end > mmap.len() as u64 {
-                self.refresh_mmap()?;
-                return Ok(self.current_mmap());
-            }
+    /// Takes no lock and performs no shared-counter write when the
+    /// current mapping is long enough. Coverage is checked against
+    /// the borrowed mapping's own length, so the result is consistent
+    /// even while another thread is mid-refresh. When the mapping is
+    /// too short it is refreshed once; the caller must still bound
+    /// its reads by `bytes().len()`.
+    #[inline]
+    pub(crate) fn mapped<'a>(&'a self, end_offset: u64, guard: &'a Guard) -> Result<MmapView<'a>> {
+        let view = self.mmap.load(guard);
+        if view.bytes().len() as u64 >= end_offset {
+            return Ok(view);
         }
-        Ok(mmap)
+        self.refresh_mmap()?;
+        Ok(self.mmap.load(guard))
+    }
+
+    /// Borrow a mapping that covers the whole payload starting at
+    /// `payload_start`, including its last byte, together with the
+    /// payload. `Ok(None)` when no complete payload is framed there.
+    ///
+    /// A mapping taken while a large append was still being written
+    /// can cover a record's start but not its end; checking only the
+    /// first byte would then report an acknowledged record as missing.
+    /// When the payload does not fit the current mapping, the read is
+    /// retried once against a mapping that covers the journal tail,
+    /// which every acknowledged record ends before.
+    pub(crate) fn payload<'a>(
+        &'a self,
+        payload_start: u64,
+        guard: &'a Guard,
+    ) -> Result<Option<(&'a [u8], MmapView<'a>)>> {
+        let Ok(start) = usize::try_from(payload_start) else {
+            return Ok(None);
+        };
+        let view = self.mapped(payload_start.saturating_add(1), guard)?;
+        if let Ok(payload) = format::payload_at(view.bytes(), start) {
+            return Ok(Some((payload, view)));
+        }
+        let view = self.mapped(self.tail(), guard)?;
+        Ok(format::payload_at(view.bytes(), start)
+            .ok()
+            .map(|payload| (payload, view)))
+    }
+
+    /// A strong reference to a mapping that covers every record whose
+    /// append completed before this call: the journal tail at the time
+    /// of the call. Iterators pin it so their offsets stay readable
+    /// after a compaction replaced the file.
+    pub(crate) fn pinned_mapping(&self) -> Result<Arc<Mmap>> {
+        let guard = crossbeam_epoch::pin();
+        Ok(self.mapped(self.tail(), &guard)?.to_arc())
     }
 
     /// Start a read that resolves an index offset against a mapping.
@@ -371,9 +415,8 @@ impl Store {
         };
         {
             let mut file_guard = self.read_file.lock();
-            let mut mmap_guard = self.mmap.write();
             let new_len = mmap.len() as u64;
-            *mmap_guard = Arc::new(mmap);
+            self.mmap.store(Arc::new(mmap));
             *file_guard = read_file;
             self.mmap_len.store(new_len, Ordering::Release);
         }
@@ -399,11 +442,14 @@ impl Store {
         let journal = guard
             .as_ref()
             .ok_or(Error::InvalidConfig(JOURNAL_NOT_OPEN))?;
-        let end_lsn = journal.append(payload).map_err(from_fsys)?.as_u64();
+        let end_lsn = {
+            let _ordered = SERIALIZE_APPENDS.then(|| self.append_order.lock());
+            journal.append(payload).map_err(from_fsys)?.as_u64()
+        };
         let payload_start = end_lsn - FSYS_POST_PAYLOAD_BYTES - payload_len;
 
         // The mmap is not refreshed here: readers refresh lazily via
-        // `mmap_for_payload` (one remap per read after a write burst,
+        // `payload` (one remap per read after a write burst,
         // not one per append).
         if matches!(self.policy, FlushPolicy::WriteThrough) {
             journal
@@ -448,7 +494,10 @@ impl Store {
         let journal = guard
             .as_ref()
             .ok_or(Error::InvalidConfig(JOURNAL_NOT_OPEN))?;
-        let end_lsn = journal.append_batch(&payloads).map_err(from_fsys)?.as_u64();
+        let end_lsn = {
+            let _ordered = SERIALIZE_APPENDS.then(|| self.append_order.lock());
+            journal.append_batch(&payloads).map_err(from_fsys)?.as_u64()
+        };
         let starts = batch_payload_starts(end_lsn, &payloads);
 
         if matches!(self.policy, FlushPolicy::WriteThrough) {
@@ -514,22 +563,24 @@ impl Store {
     /// Refresh the mmap from the read file's current size.
     ///
     /// Holds the `read_file` lock while it installs the new mapping
-    /// (lock order `read_file` then `mmap`, the same as
-    /// [`Self::install_file`]), so a refresh racing a compaction
-    /// swap cannot install a mapping of the retired file. Never
-    /// replaces a mapping with a shorter one: two concurrent
-    /// refreshes may finish in either order.
+    /// (as [`Self::install_file`] does), so a refresh racing a
+    /// compaction swap cannot install a mapping of the retired file.
+    /// Never replaces a mapping with a shorter one: two refreshes may
+    /// queue on the lock in either order.
     fn refresh_mmap(&self) -> Result<()> {
         let file_guard = self.read_file.lock();
+        if (file_guard.metadata()?.len()) <= self.mmap_len.load(Ordering::Acquire) {
+            // Another refresh already covered the file as it is now.
+            return Ok(());
+        }
         // SAFETY: same invariants as the initial mmap in
         // `open_with_policy`: `file_guard` keeps the file open, the
         // mapping covers the file's size at map time, and nothing
         // shrinks the file while a mapping is installed.
         let new_mmap = unsafe { Mmap::map(&*file_guard)? };
         let new_len = new_mmap.len() as u64;
-        let mut mmap_guard = self.mmap.write();
-        if new_len > mmap_guard.len() as u64 {
-            *mmap_guard = Arc::new(new_mmap);
+        if new_len > self.mmap_len.load(Ordering::Acquire) {
+            self.mmap.store(Arc::new(new_mmap));
             self.mmap_len.store(new_len, Ordering::Release);
         }
         Ok(())
@@ -537,14 +588,12 @@ impl Store {
 
     /// Replace the mapping with one of the file's exact current size,
     /// shorter or not. Used after fsys's open may have cut a tail.
-    fn remap_exact(&self) -> Result<()> {
-        let file_guard = self.read_file.lock();
+    fn remap_exact(&mut self) -> Result<()> {
         // SAFETY: as in `refresh_mmap`; fsys's open has finished
         // cutting the tail, so the file only grows from here.
-        let new_mmap = unsafe { Mmap::map(&*file_guard)? };
+        let new_mmap = unsafe { Mmap::map(&*self.read_file.get_mut())? };
         let new_len = new_mmap.len() as u64;
-        let mut mmap_guard = self.mmap.write();
-        *mmap_guard = Arc::new(new_mmap);
+        self.mmap.set_mut(Arc::new(new_mmap));
         self.mmap_len.store(new_len, Ordering::Release);
         Ok(())
     }

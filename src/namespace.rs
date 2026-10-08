@@ -7,15 +7,12 @@ use std::sync::Arc;
 #[cfg(feature = "ttl")]
 use std::time::Duration;
 
-use crate::db::Inner;
+use crate::db::{expiry_clock, Inner, OffsetCursor, RangeState};
 use crate::storage::Engine;
 use crate::Result;
 
 #[cfg(feature = "ttl")]
-use crate::ttl::{
-    expires_from_ttl, is_expired, now_unix_millis, record_new, record_set_persist, remaining_ttl,
-    Ttl,
-};
+use crate::ttl::{expires_from_ttl, is_expired, now_unix_millis, remaining_ttl, Ttl};
 
 /// Cheap-clone handle scoped to one named namespace inside a single
 /// [`crate::Emdb`].
@@ -76,8 +73,7 @@ impl Namespace {
     /// semantics.
     #[cfg(feature = "ttl")]
     fn compute_default_expires_at(&self) -> Result<u64> {
-        let now = now_unix_millis();
-        Ok(expires_from_ttl(Ttl::Default, self.inner.default_ttl, now)?.unwrap_or(0))
+        self.inner.default_expires_at()
     }
 
     #[cfg(not(feature = "ttl"))]
@@ -108,14 +104,18 @@ impl Namespace {
         }
         #[cfg(not(feature = "ttl"))]
         {
-            self.engine().get(self.ns_id, key)
+            Ok(self
+                .engine()
+                .get_with_meta(self.ns_id, key)?
+                .map(|(value, _)| value))
         }
     }
 
     /// Zero-copy fetch: returns a [`crate::ValueRef`] reading
     /// directly from the kernel-managed mmap region. See
     /// [`crate::Emdb::get_zerocopy`] for the trade-offs and the
-    /// encrypted-database fallback behaviour.
+    /// encrypted-database fallback behaviour. Records whose TTL has
+    /// passed are reported as absent, the same as [`Self::get`].
     ///
     /// # Errors
     ///
@@ -124,7 +124,9 @@ impl Namespace {
         Ok(self
             .engine()
             .get_zerocopy(self.ns_id, key.as_ref())?
-            .map(|(v, _)| v))
+            .and_then(|(value, expires_at)| {
+                crate::storage::engine::is_live(expires_at, expiry_clock()).then_some(value)
+            }))
     }
 
     /// Remove a key, returning the previous value if any.
@@ -132,12 +134,15 @@ impl Namespace {
         self.engine().remove(self.ns_id, key.as_ref())
     }
 
-    /// Returns whether the key has a live record.
+    /// Returns whether the key has a live record. Records whose TTL
+    /// has passed are reported as absent, the same as [`Self::get`].
     pub fn contains_key(&self, key: impl AsRef<[u8]>) -> Result<bool> {
-        Ok(self.engine().get(self.ns_id, key.as_ref())?.is_some())
+        self.engine()
+            .contains_live(self.ns_id, key.as_ref(), expiry_clock())
     }
 
-    /// Live record count.
+    /// Record count. Same semantics as [`crate::Emdb::len`]: records
+    /// whose TTL has passed are counted until they are swept.
     pub fn len(&self) -> Result<usize> {
         let count = self.engine().record_count(self.ns_id)?;
         usize::try_from(count).map_err(|_| {
@@ -155,21 +160,22 @@ impl Namespace {
         self.engine().clear_namespace(self.ns_id)
     }
 
-    /// Iterate over `(key, value)` pairs in this namespace.
-    ///
-    /// The iterator snapshots live record offsets at the time of
-    /// this call and decodes records lazily on `next()`. Memory
-    /// use scales with offset count, not total value size.
+    /// Iterate over `(key, value)` pairs in this namespace. Same
+    /// snapshot, expiry and error semantics as [`crate::Emdb::iter`].
     pub fn iter(&self) -> Result<NamespaceIter> {
         let offsets = self.engine().snapshot_offsets(self.ns_id)?;
-        Ok(NamespaceIter::new(Arc::clone(&self.inner), offsets))
+        Ok(NamespaceIter {
+            cursor: OffsetCursor::new(Arc::clone(&self.inner), self.ns_id, offsets),
+        })
     }
 
-    /// Iterate every live key in this namespace. Same lazy
-    /// semantics as [`Self::iter`].
+    /// Iterate every live key in this namespace. Same semantics as
+    /// [`Self::iter`]; values are not decoded.
     pub fn keys(&self) -> Result<NamespaceKeyIter> {
         let offsets = self.engine().snapshot_offsets(self.ns_id)?;
-        Ok(NamespaceKeyIter::new(Arc::clone(&self.inner), offsets))
+        Ok(NamespaceKeyIter {
+            cursor: OffsetCursor::new(Arc::clone(&self.inner), self.ns_id, offsets),
+        })
     }
 
     /// Range-scan keys in this namespace, returning `(key, value)`
@@ -184,7 +190,7 @@ impl Namespace {
     where
         R: std::ops::RangeBounds<Vec<u8>>,
     {
-        self.engine().range_scan(self.ns_id, range)
+        self.engine().range_scan(self.ns_id, range, expiry_clock())
     }
 
     /// Range-scan all keys with a given prefix in this namespace.
@@ -201,9 +207,9 @@ impl Namespace {
         }
     }
 
-    /// Streaming range scan: same semantics as [`Self::range`] but
-    /// returns an iterator that decodes values lazily on `next()`.
-    /// See [`crate::Emdb::range_iter`] for details.
+    /// Streaming range scan: same results as [`Self::range`] but
+    /// returns a lazy cursor. See [`crate::Emdb::range_iter`] for the
+    /// cost and consistency guarantees.
     ///
     /// # Errors
     ///
@@ -212,8 +218,10 @@ impl Namespace {
     where
         R: std::ops::RangeBounds<Vec<u8>>,
     {
-        let pairs = self.engine().snapshot_range_offsets(self.ns_id, range)?;
-        Ok(NamespaceRangeIter::new(Arc::clone(&self.inner), pairs))
+        let cursor = self.engine().range_cursor(self.ns_id, range)?;
+        Ok(NamespaceRangeIter {
+            state: RangeState::new(Arc::clone(&self.inner), self.ns_id, cursor),
+        })
     }
 
     /// Streaming variant of [`Self::range_prefix`].
@@ -303,22 +311,14 @@ impl Namespace {
         }
     }
 
-    /// Strip the TTL from a record (re-insert with `expires_at = 0`).
-    /// Returns `Ok(true)` if the record existed and previously had a
-    /// TTL.
+    /// Strip the TTL from a record (rewrite it with no expiry).
+    /// Returns `Ok(true)` if the record was live and had a TTL. Same
+    /// semantics as [`crate::Emdb::persist`]: an expired record is
+    /// never brought back.
     #[cfg(feature = "ttl")]
     pub fn persist(&self, key: impl AsRef<[u8]>) -> Result<bool> {
-        let key = key.as_ref();
-        let value = match self.engine().get(self.ns_id, key)? {
-            Some(v) => v,
-            None => return Ok(false),
-        };
-        let prev_exp = self.expires_at(key)?.unwrap_or(0);
-        let had_ttl = prev_exp != 0;
-        self.engine().insert(self.ns_id, key, &value, 0)?;
-        let mut probe = record_new(value, if had_ttl { Some(prev_exp) } else { None });
-        let _flipped = record_set_persist(&mut probe);
-        Ok(had_ttl)
+        self.engine()
+            .clear_expiry(self.ns_id, key.as_ref(), now_unix_millis())
     }
 
     /// Sweep every expired record in this namespace, returning the
@@ -330,122 +330,52 @@ impl Namespace {
     /// [`crate::Emdb::sweep_expired`] for namespaces.
     #[cfg(feature = "ttl")]
     pub fn sweep_expired(&self) -> usize {
-        let snapshot = match self.engine().collect_records(self.ns_id) {
-            Ok(snap) => snap,
-            Err(_) => return 0,
-        };
-        let now = now_unix_millis();
-        let mut evicted = 0;
-        for (key, _value, expires_at) in snapshot {
-            if expires_at != 0 && is_expired(Some(expires_at), now) {
-                if let Ok(Some(_)) = self.engine().remove(self.ns_id, &key) {
-                    evicted += 1;
-                }
-            }
-        }
-        evicted
+        crate::db::sweep_namespace(self.engine(), self.ns_id)
     }
 }
 
 /// Iterator over `(key, value)` pairs from [`Namespace::iter`].
 ///
-/// Decodes records lazily from a snapshot of offsets captured at
-/// `iter()` time.
+/// Same semantics as [`crate::EmdbIter`].
 pub struct NamespaceIter {
-    inner: Arc<Inner>,
-    offsets: std::vec::IntoIter<u64>,
-    view: crate::storage::ReadView,
-}
-
-impl NamespaceIter {
-    fn new(inner: Arc<Inner>, (offsets, view): (Vec<u64>, crate::storage::ReadView)) -> Self {
-        Self {
-            inner,
-            offsets: offsets.into_iter(),
-            view,
-        }
-    }
+    cursor: OffsetCursor,
 }
 
 impl Iterator for NamespaceIter {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        for offset in self.offsets.by_ref() {
-            match self.inner.engine.decode_owned_in(&self.view, offset) {
-                Ok(Some((key, value, _))) => return Some((key, value)),
-                Ok(None) => continue,
-                Err(_) => continue,
-            }
-        }
-        None
+        self.cursor.next_record()
     }
 }
 
 /// Iterator over keys from [`Namespace::keys`].
+///
+/// Same semantics as [`crate::EmdbKeyIter`].
 pub struct NamespaceKeyIter {
-    inner: Arc<Inner>,
-    offsets: std::vec::IntoIter<u64>,
-    view: crate::storage::ReadView,
-}
-
-impl NamespaceKeyIter {
-    fn new(inner: Arc<Inner>, (offsets, view): (Vec<u64>, crate::storage::ReadView)) -> Self {
-        Self {
-            inner,
-            offsets: offsets.into_iter(),
-            view,
-        }
-    }
+    cursor: OffsetCursor,
 }
 
 impl Iterator for NamespaceKeyIter {
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        for offset in self.offsets.by_ref() {
-            match self.inner.engine.decode_owned_in(&self.view, offset) {
-                Ok(Some((key, _value, _))) => return Some(key),
-                Ok(None) => continue,
-                Err(_) => continue,
-            }
-        }
-        None
+        self.cursor.next_key()
     }
 }
 
 /// Streaming range iterator returned by
 /// [`Namespace::range_iter`] / [`Namespace::range_prefix_iter`].
+///
+/// Same semantics as [`crate::EmdbRangeIter`].
 pub struct NamespaceRangeIter {
-    inner: Arc<Inner>,
-    pairs: std::vec::IntoIter<(Vec<u8>, u64)>,
-    view: crate::storage::ReadView,
-}
-
-impl NamespaceRangeIter {
-    fn new(
-        inner: Arc<Inner>,
-        (pairs, view): (Vec<(Vec<u8>, u64)>, crate::storage::ReadView),
-    ) -> Self {
-        Self {
-            inner,
-            pairs: pairs.into_iter(),
-            view,
-        }
-    }
+    state: RangeState,
 }
 
 impl Iterator for NamespaceRangeIter {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        for (key, offset) in self.pairs.by_ref() {
-            match self.inner.engine.read_value_in(&self.view, offset, &key) {
-                Ok(Some((value, _expires))) => return Some((key, value)),
-                Ok(None) => continue,
-                Err(_) => continue,
-            }
-        }
-        None
+        self.state.next_pair()
     }
 }
