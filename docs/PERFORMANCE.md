@@ -36,8 +36,13 @@ and contention; these are order-of-magnitude pricing.
 | `get` (hot key, no decode) | ~30 ns | 1 hash + 1 seqlock read + 1 `Vec::from(&[u8])` alloc |
 | `get` (cold key, mmap miss) | 1 page-fault + decode | Kernel fetches from SSD; ~30 µs page-fault, ~1 µs decode |
 | `get_zerocopy` | ~15 ns | Same hot path; no `Vec` allocation |
-| `contains_key` | ~10 ns | No decode at all — index probe only |
-| `len` | ~5 ns | `CachePadded<AtomicUsize>` read |
+| `contains_key` | ~`get` minus the copy | Index probe + key/expiry check; the value is never copied |
+| `len` | ~30 ns | Sum of the index's 64 per-shard live counters |
+
+Default-namespace reads take no lock and write no shared cache
+line (epoch pin, seqlock probe, borrowed mapping), so aggregate
+throughput grows with reader threads. Named-namespace reads add one
+`RwLock` read and one `Arc` clone for the namespace lookup.
 
 The `get_zerocopy` 2× win vs `get` is real and reproducible on
 small values. For large values (≥ 1 KiB) the alloc cost stops
@@ -47,7 +52,7 @@ dominating; the two paths converge.
 
 | Operation | Cost | Notes |
 |---|---|---|
-| `insert` (no flush) | ~500 ns | 1 hash + 1 frame encode + 1 LSN reserve + 1 `pwrite` |
+| `insert` (no flush) | ~500 ns | 1 hash + per-key stripe lock + 1 frame encode + 1 LSN reserve + 1 `pwrite` + shard-locked index update |
 | `insert` (fsync) | adds fsync latency | NVMe: 50–500 µs; spinning disk: 5–50 ms |
 | `insert_many` (per record) | ~150 ns | Vectored append amortises overhead |
 | `remove` | ~500 ns | Same shape as `insert` (writes tombstone) |
@@ -58,13 +63,15 @@ dominating; the two paths converge.
 
 | Operation | Cost | Notes |
 |---|---|---|
-| `range(R)` | snapshot SkipMap + N decodes | Snapshot is O(matches), each decode is one mmap read |
-| `range_iter(R)` | snapshot SkipMap + lazy decode | Same snapshot; consumer pays decode per `.next()` |
+| `range(R)` | N skiplist steps + N decodes | Walks the range in pages; each decode is one mmap read |
+| `range_iter(R)` | 1 seek per page + lazy decode | No up-front copy; consumer pays per `.next()` |
 | `range_prefix(p)` | same as `range` | Internally builds `[p, p++)` range |
 
-The SkipMap snapshot is the load-bearing cost. For a 1 M-record
-namespace scanning 10 K records, expect ~1–2 ms snapshot +
-10 K × ~1 µs decode = ~12 ms.
+Range iterators are cursors: the first page is 16 entries and
+pages double up to 512, so `iter_from(k).take(10)` over a 1 M-key
+namespace takes about 2 us (1.0.2 copied the whole range first:
+50 ms on Linux, 120 ms on Windows). Scanning 10 K records costs
+roughly 10 K x ~1 us decode.
 
 ### Async overhead
 
@@ -84,8 +91,9 @@ use the sync surface via `AsyncEmdb::sync_handle()`.
 ## When emdb is fastest
 
 - **Read-heavy concurrent workloads.** Lock-free reads + shared
-  mmap scale linearly with core count until memory bandwidth
-  saturates. Comparative bench: 9.94 M reads/sec at 8 threads.
+  mmap scale with core count until memory bandwidth saturates.
+  Measured (100 K keys, 8 reader threads): ~130 M gets/sec on
+  Linux, ~118 M on Windows.
 - **Bulk loading.** `insert_many` routes through fsys's
   vectored `append_batch` — one LSN reservation + one `pwrite`
   for the entire batch. Comparative bench: 3.2× faster than
@@ -317,8 +325,10 @@ for _ in 0..num_cpus::get() {
 }
 ```
 
-No special configuration needed. The lock-free read path scales
-to the core count. Use `get_zerocopy` instead of `get` if values
+No special configuration needed. The default-namespace read path
+takes no locks and scales with core count; prefer the default
+namespace for the hottest read traffic, since named namespaces add a
+lookup lock per call. Use `get_zerocopy` instead of `get` if values
 are small (≤ 256 bytes) and the workload is tight enough that
 the `Vec` alloc shows up in profiles.
 
