@@ -248,20 +248,17 @@ Both are operational APIs.
 
 ### `checkpoint()`
 
-What it does: writes a recovery-start LSN snapshot to
-`<path>.meta`. On next open, recovery starts from the
-checkpoint instead of the journal start — proportional to time
-saved by skipping pre-checkpoint frames.
+What it does: syncs the journal (like `flush()`) and rewrites
+`<path>.meta`. It does not shorten the next open, which always
+replays the whole journal (earlier documentation said otherwise).
 
 When to call:
-- After a large bulk-load (so the next open doesn't replay it).
-- Before a long-running idle period (so a crash during idle
-  doesn't pay the replay cost).
-- On a slow timer (every few minutes) for long-uptime
-  processes.
+- Before shutdown, when you need an error if the data did not
+  reach disk (dropping the last handle flushes as a best effort
+  but cannot report failure).
 
-Cost: a few `pwrite`s + one fsync of the metadata sidecar.
-Negligible.
+Cost: one journal sync plus an atomic rewrite of the 112-byte
+sidecar.
 
 ### `compact()`
 
@@ -273,11 +270,12 @@ When to call:
 - When journal size grows substantially larger than live-data
   size (3×+ is a reasonable trigger).
 - During scheduled maintenance windows.
-- Never during a latency-critical period — compaction is
-  stop-the-world for writers (briefly).
+- Never during a latency-critical period: writers wait for the
+  whole compaction.
 
-Cost: proportional to live-data size, not journal size. Writers
-block briefly at the rename; readers see no interruption.
+Cost: proportional to live-data size, not journal size, with
+memory bounded by a few MiB of batches. Readers, open iterators
+and `ValueRef`s see no interruption.
 
 For long-running services, a daily or weekly compaction is
 usually enough.
