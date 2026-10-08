@@ -54,7 +54,7 @@
 //!     let db = Emdb::open(&path)?;
 //!     db.insert("name", "emdb")?;
 //!     db.flush()?;        // make record bytes durable
-//!     db.checkpoint()?;   // persist tail_hint for fast reopen
+//!     db.checkpoint()?;   // sync the journal and rewrite the sidecar
 //! }
 //! let db = Emdb::open(&path)?;
 //! assert_eq!(db.get("name")?, Some(b"emdb".to_vec()));
@@ -165,8 +165,8 @@
 //! - [`Emdb::lock_holder`] / [`Emdb::break_lock`] — diagnose and
 //!   recover from stuck advisory lockfiles when a holder dies
 //!   without releasing.
-//! - [`Emdb::checkpoint`] — explicit fast-reopen checkpoint that
-//!   persists the file header's `tail_hint`.
+//! - [`Emdb::checkpoint`]: sync the journal and rewrite the `.meta`
+//!   sidecar. It does not shorten the next open's recovery scan.
 //!
 //! ## Async surface
 //!
@@ -266,7 +266,6 @@ mod db;
 #[cfg(feature = "encrypt")]
 #[allow(dead_code)]
 mod encryption;
-#[cfg(feature = "encrypt")]
 mod encryption_admin;
 mod error;
 mod lockfile;

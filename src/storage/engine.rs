@@ -1645,6 +1645,39 @@ impl Engine {
         Ok(out)
     }
 
+    /// Stream every live record in `ns_id` to `sink` in batches of
+    /// about [`REWRITE_CHUNK_BYTES`]. Records are read from a mapping
+    /// pinned at the start, so the batches form one consistent
+    /// snapshot. Unlike [`Self::collect_records`], a live index entry
+    /// that does not decode is an error, not a skipped record.
+    #[cfg(feature = "encrypt")]
+    pub(crate) fn for_each_record_batch<F>(&self, ns_id: u32, mut sink: F) -> Result<()>
+    where
+        F: FnMut(Vec<RecordSnapshot>) -> Result<()>,
+    {
+        let (offsets, view) = self.snapshot_offsets(ns_id)?;
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0_usize;
+        for offset in offsets {
+            let triple = self
+                .decode_owned_in(&view, offset)?
+                .ok_or(Error::Corrupted {
+                    offset,
+                    reason: "live index entry does not hold an insert record",
+                })?;
+            batch_bytes += triple.0.len() + triple.1.len();
+            batch.push(triple);
+            if batch_bytes >= REWRITE_CHUNK_BYTES {
+                sink(std::mem::take(&mut batch))?;
+                batch_bytes = 0;
+            }
+        }
+        if !batch.is_empty() {
+            sink(batch)?;
+        }
+        Ok(())
+    }
+
     /// Decode an insert payload (`[tag][body]`) into an owned
     /// `(key, value, expires_at)` triple, decrypting it on encrypted
     /// databases. `Ok(None)` for other record kinds.

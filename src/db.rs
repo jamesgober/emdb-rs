@@ -176,6 +176,9 @@ impl Emdb {
         };
 
         let lock_file = LockFile::acquire(path.as_path())?;
+        // Complete an encryption admin rewrite a crash interrupted
+        // before anything reads the files it renames.
+        crate::encryption_admin::finish_interrupted_rewrite(&path)?;
 
         let engine_config = EngineConfig {
             path: path.clone(),

@@ -1,7 +1,8 @@
 // Copyright 2026 James Gober. Licensed under Apache-2.0.
 
 //! Kill-the-child crash tests. A child process (this test binary,
-//! re-entered through `child_entry`) runs a write or compaction loop and is killed (`SIGKILL` / `TerminateProcess`) at a
+//! re-entered through `child_entry`) runs a write, compaction or key
+//! rotation loop and is killed (`SIGKILL` / `TerminateProcess`) at a
 //! varying point. The parent then reopens the database and checks
 //! that every acknowledged write is present, every acknowledged
 //! delete stays deleted, and the open never refuses a crash artifact
@@ -70,6 +71,8 @@ fn child_entry() {
         "writes" => child_writes(&path, start),
         "concurrent" => child_concurrent(&path, start),
         "compact" => child_compact(&path, start),
+        #[cfg(feature = "encrypt")]
+        "rotate" => child_rotate(&path),
         other => panic!("unknown child mode {other}"),
     }
 }
@@ -138,6 +141,37 @@ fn child_compact(path: &Path, start: u32) {
         db.flush().expect("flush");
         say(&format!("POST {n}"));
         n += 1;
+    }
+}
+
+#[cfg(feature = "encrypt")]
+fn child_rotate(path: &Path) {
+    use emdb::EncryptionInput;
+    say("READY");
+    let mut current = if Emdb::builder()
+        .path(path)
+        .encryption_key([1_u8; 32])
+        .build()
+        .is_ok()
+    {
+        [1_u8; 32]
+    } else {
+        [2_u8; 32]
+    };
+    loop {
+        let next = if current[0] == 1 {
+            [2_u8; 32]
+        } else {
+            [1_u8; 32]
+        };
+        Emdb::rotate_encryption_key(
+            path,
+            EncryptionInput::Key(current),
+            EncryptionInput::Key(next),
+        )
+        .expect("rotate");
+        current = next;
+        say(&format!("ROT {}", current[0]));
     }
 }
 
@@ -326,5 +360,44 @@ fn test_kill_during_compaction_keeps_live_set() {
             !files.iter().any(|f| f.contains(".corrupt-")),
             "round {round}: unexpected corrupt sidecar: {files:?}"
         );
+    }
+}
+
+#[cfg(feature = "encrypt")]
+#[test]
+fn test_kill_during_key_rotation_never_loses_data() {
+    if std::env::var("EMDB_CRASH_CHILD").is_ok() {
+        return;
+    }
+    let dir = Dir::new("rotate");
+    let path = dir.0.join("db.emdb");
+    {
+        let db = Emdb::builder()
+            .path(&path)
+            .encryption_key([1_u8; 32])
+            .build()
+            .expect("create");
+        for i in 0..200_u32 {
+            db.insert(format!("k{i}"), "v").expect("insert");
+        }
+        db.flush().expect("flush");
+    }
+    for round in 0..rounds(10) {
+        let mut child = spawn_child("rotate", &path, 0);
+        let reader = read_until(&mut child, |line| line.ends_with("READY"));
+        let drain = std::thread::spawn(move || reader.lines().count());
+        std::thread::sleep(Duration::from_millis(u64::from(round * 7 % 61)));
+        kill(child);
+        let _lines = drain.join().expect("drain");
+        let files = dir.files();
+        let opened = [[1_u8; 32], [2_u8; 32]].iter().find_map(|key| {
+            Emdb::builder()
+                .path(&path)
+                .encryption_key(*key)
+                .build()
+                .ok()
+                .map(|db| db.len().expect("len"))
+        });
+        assert_eq!(opened, Some(200), "round {round}: files={files:?}");
     }
 }
