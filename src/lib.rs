@@ -29,10 +29,15 @@
 //! shared cache line: the 64-shard primary index is probed with
 //! seqlock reads and the journal mapping is borrowed under an epoch
 //! guard, so aggregate `get` throughput grows with reader threads.
+//! A read that overlaps the moment [`Emdb::compact`] swaps files is
+//! detected through a generation counter and retried.
 //! **Writes** to one key are linearizable: each write holds a
 //! per-key stripe lock across the journal append and the index
 //! update, so the log and memory agree on the order of writes to
-//! every key. Writes to different keys proceed in parallel (index
+//! every key. Every write also holds an engine write gate in shared
+//! mode, which only compaction, `clear`, `drop_namespace` and the
+//! snapshot step of `backup_to` take exclusively. Writes to different
+//! keys proceed in parallel (index
 //! shards are updated under short per-shard writer locks; on Windows
 //! the journal append itself is serialised, see
 //! `docs/PLATFORM-NOTES.md`). Producers can batch through
