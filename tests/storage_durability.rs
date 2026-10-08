@@ -780,18 +780,11 @@ fn test_open_in_memory_leaves_no_files() {
         db.flush().expect("flush");
         path = db.path().to_path_buf();
     }
-    let name = path
-        .file_name()
-        .expect("name")
-        .to_string_lossy()
-        .into_owned();
-    let left: Vec<String> = std::fs::read_dir(std::env::temp_dir())
-        .expect("read temp dir")
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with(&name))
-        .collect();
-    assert!(left.is_empty(), "ephemeral db left files: {left:?}");
+    // The database lives in its own temp directory; the whole
+    // directory goes when the last handle drops.
+    let dir = path.parent().expect("ephemeral dir");
+    assert!(!path.exists(), "ephemeral db file left behind");
+    assert!(!dir.exists(), "ephemeral dir {dir:?} left behind");
 }
 
 #[test]
