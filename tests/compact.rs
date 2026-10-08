@@ -23,6 +23,18 @@ fn cleanup(path: &std::path::Path) {
     let _ = std::fs::remove_file(format!("{display}.lock"));
     let _ = std::fs::remove_file(format!("{display}.compact.tmp"));
     let _ = std::fs::remove_file(format!("{display}.compact.tmp.lock"));
+    // fsys 1.1.3+ saves a corrupt journal tail to `<file>.corrupt-<offset>`
+    // (plus `.1`, `.2`, ... on collisions) before truncating it.
+    if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
+        let prefix = format!("{}.corrupt-", name.to_string_lossy());
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
 }
 
 #[test]

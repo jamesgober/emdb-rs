@@ -216,6 +216,8 @@ fn compact_drops_expired_records() {
 // Crash recovery composition (file-backed reopens)
 // =============================================================
 
+// Only the `ttl` and `async` recovery tests below use these helpers.
+#[cfg(any(feature = "ttl", feature = "async"))]
 fn tmp_path(label: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
@@ -226,12 +228,25 @@ fn tmp_path(label: &str) -> std::path::PathBuf {
     p
 }
 
+#[cfg(any(feature = "ttl", feature = "async"))]
 fn cleanup(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
     let display = path.display();
     let _ = std::fs::remove_file(format!("{display}.lock"));
     let _ = std::fs::remove_file(format!("{display}.meta"));
     let _ = std::fs::remove_file(format!("{display}.compact.tmp"));
+    // fsys 1.1.3+ saves a corrupt journal tail to `<file>.corrupt-<offset>`
+    // (plus `.1`, `.2`, ... on collisions) before truncating it.
+    if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
+        let prefix = format!("{}.corrupt-", name.to_string_lossy());
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "ttl")]

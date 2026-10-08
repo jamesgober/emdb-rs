@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1](https://github.com/jamesgober/emdb-rs/compare/v1.0.0...v1.0.1) - 2026-10-08
+
+**Storage-layer update.** Moves emdb onto fsys 1.1.3, which fixes
+data-integrity bugs in the journal emdb is built on, and clears two
+RUSTSEC advisories in the dependency tree. No emdb API change; the
+on-disk format is unchanged and every 1.0.0 database opens as before.
+
+### Fixed
+
+- **fsys `1.0` -> `1.1.3`.** Picks up the fsys 1.1.1 to 1.1.3 fixes
+  that apply to emdb's journal: Linux Direct-IO writes that could land
+  in the wrong file once an fd number was reused (io_uring fixed-file
+  cache), log-buffer rotation gaps the reader could not skip, a
+  `sync_through` frontier that could cover unwritten bytes, failed
+  flushes and fsyncs that were silently survived, missing data fences
+  on macOS and Windows, and async cancellation that could free buffers
+  the kernel was still using. See the
+  [fsys CHANGELOG](https://github.com/jamesgober/fsys-rs/blob/main/CHANGELOG.md).
+- **Corrupt journal tails still recover the valid prefix.** fsys 1.1.3
+  opens a journal whose tail is corrupt by copying the discarded bytes
+  to a `<file>.corrupt-<offset>` sidecar next to the database, then
+  truncating to the last valid record. emdb's
+  `valid_prefix_then_garbage_recovers_only_the_prefix` behavior is
+  unchanged from 1.0.0; new writes now land after the recovered
+  prefix instead of after the garbage.
+
+### Security
+
+- **`crossbeam-epoch` 0.9.18 -> 0.9.21**
+  ([RUSTSEC-2026-0204](https://rustsec.org/advisories/RUSTSEC-2026-0204.html)),
+  reached through `crossbeam-skiplist`.
+- **`memmap2` >= 0.9.11**
+  ([RUSTSEC-2026-0186](https://rustsec.org/advisories/RUSTSEC-2026-0186.html)).
+  emdb only maps whole files and was not exposed; the requirement keeps
+  downstream lockfiles off the affected releases.
+
 ## [1.0.0](https://github.com/jamesgober/emdb-rs/compare/v0.9.10...v1.0.0) — 2026-05-14
 
 **First stable release.** emdb 1.0 is a **stability commitment**,
