@@ -1,6 +1,6 @@
 [package]
 name = "emdb"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -33,7 +33,10 @@ homepage = "https://github.com/jamesgober/emdb-rs"
 
 # Configuration for docs.rs
 [package.metadata.docs.rs]
-all-features = true
+# Document the user-facing features only. `all-features` also enabled the
+# benchmark-only `bench-*` features, and `bench-rocksdb` compiles
+# RocksDB's C++ sources, which fail on docs.rs's toolchain.
+features = ["ttl", "nested", "encrypt", "async"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
