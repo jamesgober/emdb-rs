@@ -264,7 +264,6 @@ mod builder;
 mod data_dir;
 mod db;
 #[cfg(feature = "encrypt")]
-#[allow(dead_code)]
 mod encryption;
 #[cfg(feature = "encrypt")]
 mod encryption_admin;
