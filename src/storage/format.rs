@@ -112,16 +112,6 @@ pub(crate) enum OwnedRecord {
     },
 }
 
-impl OwnedRecord {
-    pub(crate) fn ns_id(&self) -> u32 {
-        match self {
-            Self::Insert { ns_id, .. }
-            | Self::Remove { ns_id, .. }
-            | Self::NamespaceName { ns_id, .. } => *ns_id,
-        }
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────
 // Primitive read/write helpers.
 // ─────────────────────────────────────────────────────────────────

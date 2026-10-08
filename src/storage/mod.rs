@@ -8,9 +8,10 @@
 
 pub(crate) mod arc_cell;
 pub(crate) mod engine;
-#[allow(dead_code)]
 pub(crate) mod flush;
-#[allow(dead_code)]
+// The encrypted-record decoder and its types are only reached with the
+// `encrypt` feature (and from the fuzz targets).
+#[cfg_attr(not(feature = "encrypt"), allow(dead_code))]
 pub(crate) mod format;
 pub(crate) mod index;
 pub(crate) mod integrity;
