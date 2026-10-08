@@ -12,10 +12,10 @@ pub(crate) mod engine;
 pub(crate) mod flush;
 #[allow(dead_code)]
 pub(crate) mod format;
-#[allow(dead_code)]
 pub(crate) mod index;
 #[allow(dead_code)]
 pub(crate) mod meta;
+pub(crate) mod mmap_cell;
 #[allow(dead_code)]
 pub(crate) mod store;
 

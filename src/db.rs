@@ -2,6 +2,7 @@
 
 //! `Emdb` — the public database handle.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,14 +11,12 @@ use std::time::Duration;
 
 use crate::builder::EmdbBuilder;
 use crate::lockfile::LockFile;
+use crate::storage::engine::{is_live, RangeCursor};
 use crate::storage::{Engine, EngineConfig, DEFAULT_NAMESPACE_ID};
 use crate::Result;
 
 #[cfg(feature = "ttl")]
-use crate::ttl::{
-    expires_from_ttl, is_expired, now_unix_millis, record_new, record_set_persist, remaining_ttl,
-    Ttl,
-};
+use crate::ttl::{expires_from_ttl, is_expired, now_unix_millis, remaining_ttl, Ttl};
 
 #[cfg(feature = "encrypt")]
 use crate::encryption::EncryptionInput;
@@ -377,11 +376,23 @@ impl Emdb {
     }
 
     /// Returns whether a key has a live record.
+    ///
+    /// Records whose TTL has passed are reported as absent, the same
+    /// as [`Self::get`]. Only the key and expiry are decoded; the value
+    /// is not copied.
     pub fn contains_key(&self, key: impl AsRef<[u8]>) -> Result<bool> {
-        Ok(self.get(key)?.is_some())
+        self.inner
+            .engine
+            .contains_live(DEFAULT_NAMESPACE_ID, key.as_ref(), expiry_clock())
     }
 
-    /// Number of live records in the default namespace.
+    /// Number of records in the default namespace.
+    ///
+    /// The count comes from the in-memory index and is exact with
+    /// respect to completed writes. With the `ttl` feature, records
+    /// whose TTL has passed are still counted until they are removed
+    /// by [`Self::sweep_expired`] (or a `remove`); `get`, `contains_key`
+    /// and the iterators already treat them as absent.
     pub fn len(&self) -> Result<usize> {
         let count = self.inner.engine.record_count(DEFAULT_NAMESPACE_ID)?;
         usize::try_from(count)
@@ -467,25 +478,39 @@ impl Emdb {
         self.inner.engine.checkpoint()
     }
 
-    /// Iterator over `(key, value)` pairs in the default namespace.
+    /// Iterator over `(key, value)` pairs in the default namespace,
+    /// in no particular order.
     ///
-    /// The iterator captures a snapshot of live record offsets at
-    /// the time of this call and decodes each record lazily on
-    /// `next()`. Memory use is `O(N)` for `N` record offsets — it
-    /// does *not* eagerly materialise every value. Records inserted
-    /// after the snapshot is taken are not visible; records removed
-    /// after the snapshot are skipped on decode.
+    /// The call snapshots the file offsets of every record that is
+    /// live at that moment (`O(N)` memory for `N` offsets); `next()`
+    /// decodes one record at a time, so values are never all resident
+    /// at once.
+    ///
+    /// Because the snapshot holds offsets into the append-only log,
+    /// the iterator yields each snapshotted record with the value it
+    /// had when `iter()` was called, even if the key is overwritten or
+    /// removed while iterating. Keys inserted after the call are not
+    /// yielded. With the `ttl` feature, records whose TTL has passed
+    /// by the time `next()` reaches them are skipped.
+    ///
+    /// A record that fails to decode (I/O or corruption) is skipped
+    /// silently; use [`Self::get`] on a specific key to see the error.
     pub fn iter(&self) -> Result<EmdbIter> {
         let offsets = self.inner.engine.snapshot_offsets(DEFAULT_NAMESPACE_ID)?;
-        Ok(EmdbIter::new(Arc::clone(&self.inner), offsets))
+        Ok(EmdbIter {
+            cursor: OffsetCursor::new(Arc::clone(&self.inner), DEFAULT_NAMESPACE_ID, offsets),
+        })
     }
 
     /// Iterator over keys in the default namespace.
     ///
-    /// Same lazy snapshot semantics as [`Self::iter`].
+    /// Same snapshot, expiry and error semantics as [`Self::iter`].
+    /// Values are not decoded.
     pub fn keys(&self) -> Result<EmdbKeyIter> {
         let offsets = self.inner.engine.snapshot_offsets(DEFAULT_NAMESPACE_ID)?;
-        Ok(EmdbKeyIter::new(Arc::clone(&self.inner), offsets))
+        Ok(EmdbKeyIter {
+            cursor: OffsetCursor::new(Arc::clone(&self.inner), DEFAULT_NAMESPACE_ID, offsets),
+        })
     }
 
     /// Range-scan keys in the default namespace, returning `(key, value)`
@@ -518,19 +543,23 @@ impl Emdb {
     where
         R: std::ops::RangeBounds<Vec<u8>>,
     {
-        self.inner.engine.range_scan(DEFAULT_NAMESPACE_ID, range)
+        self.inner
+            .engine
+            .range_scan(DEFAULT_NAMESPACE_ID, range, expiry_clock())
     }
 
-    /// Streaming range scan: same semantics as [`Self::range`] but
-    /// returns an iterator that decodes values lazily on `next()`.
-    /// Use this when only the first few elements are needed (e.g.
-    /// "find the next 10 keys at or after this prefix") so the cost
-    /// of decoding the rest of the range is never paid.
+    /// Streaming range scan: same results as [`Self::range`], but
+    /// returns an iterator that walks the sorted index lazily. Use it
+    /// when only the first few elements are needed ("the next 10 keys
+    /// at or after this prefix"): the cost is one index seek plus the
+    /// elements actually consumed, independent of the range size.
     ///
-    /// The iterator snapshots `(key, offset)` pairs from the
-    /// secondary lock-free `SkipMap` index; subsequent inserts that
-    /// fall within the range are not visible. Values are read through
-    /// the mmap on demand.
+    /// The iterator is a cursor over the live sorted index, not a
+    /// snapshot. Keys come out in ascending order, each at most once.
+    /// Keys inserted or removed ahead of the cursor while it runs may
+    /// or may not be observed; keys behind the cursor are not
+    /// revisited. With the `ttl` feature, records whose TTL has passed
+    /// are skipped. A record that fails to decode is skipped silently.
     ///
     /// # Errors
     ///
@@ -539,11 +568,13 @@ impl Emdb {
     where
         R: std::ops::RangeBounds<Vec<u8>>,
     {
-        let pairs = self
+        let cursor = self
             .inner
             .engine
-            .snapshot_range_offsets(DEFAULT_NAMESPACE_ID, range)?;
-        Ok(EmdbRangeIter::new(Arc::clone(&self.inner), pairs))
+            .range_cursor(DEFAULT_NAMESPACE_ID, range)?;
+        Ok(EmdbRangeIter {
+            state: RangeState::new(Arc::clone(&self.inner), DEFAULT_NAMESPACE_ID, cursor),
+        })
     }
 
     /// Range-scan all keys with a given prefix in the default namespace.
@@ -643,49 +674,33 @@ impl Emdb {
         }
     }
 
-    /// Remove the TTL from a record (re-insert with `expires_at = 0`).
-    /// Returns true if the record existed and previously had a TTL.
+    /// Remove the TTL from a record (rewrite it with no expiry).
+    /// Returns true if the record was live and had a TTL.
+    ///
+    /// A record whose TTL has already passed is left alone and `false`
+    /// is returned: an expired key is never brought back. The check
+    /// and the rewrite run under the key's write lock, so a concurrent
+    /// write to the same key is ordered before or after the whole
+    /// call.
     #[cfg(feature = "ttl")]
     pub fn persist(&self, key: impl AsRef<[u8]>) -> Result<bool> {
-        let key = key.as_ref();
-        let value = match self.inner.engine.get(DEFAULT_NAMESPACE_ID, key)? {
-            Some(v) => v,
-            None => return Ok(false),
-        };
-        let prev_exp = self
-            .inner
-            .engine_expires_at(DEFAULT_NAMESPACE_ID, key)?
-            .unwrap_or(0);
-        let had_ttl = prev_exp != 0;
         self.inner
             .engine
-            .insert(DEFAULT_NAMESPACE_ID, key, &value, 0)?;
-        // Use Record helpers so the warning policy stays satisfied.
-        let mut probe = record_new(value, if had_ttl { Some(prev_exp) } else { None });
-        let _flipped = record_set_persist(&mut probe);
-        Ok(had_ttl)
+            .clear_expiry(DEFAULT_NAMESPACE_ID, key.as_ref(), now_unix_millis())
     }
 
     /// Remove every record whose TTL has expired. Returns the count
     /// of evicted records. Errors during sweep are swallowed (returning
     /// the partial count) so callers can use this in best-effort
     /// background loops.
+    ///
+    /// The sweep scans keys and expiry times only (values are not
+    /// loaded) and removes a record only if it is still the key's
+    /// current record, so a key re-inserted while the sweep runs keeps
+    /// its new value.
     #[cfg(feature = "ttl")]
     pub fn sweep_expired(&self) -> usize {
-        let snapshot = match self.inner.engine.collect_records(DEFAULT_NAMESPACE_ID) {
-            Ok(snap) => snap,
-            Err(_) => return 0,
-        };
-        let now = now_unix_millis();
-        let mut evicted = 0;
-        for (key, _value, expires_at) in snapshot {
-            if expires_at != 0 && is_expired(Some(expires_at), now) {
-                if let Ok(Some(_)) = self.inner.engine.remove(DEFAULT_NAMESPACE_ID, &key) {
-                    evicted += 1;
-                }
-            }
-        }
-        evicted
+        sweep_namespace(&self.inner.engine, DEFAULT_NAMESPACE_ID)
     }
 
     /// Read the metadata of whoever currently holds the advisory
@@ -842,8 +857,7 @@ impl Emdb {
 
     #[cfg(feature = "ttl")]
     fn compute_default_expires_at(&self) -> Result<u64> {
-        let now = now_unix_millis();
-        Ok(expires_from_ttl(Ttl::Default, self.inner.default_ttl, now)?.unwrap_or(0))
+        self.inner.default_expires_at()
     }
 
     // ---- namespace operations ----
@@ -889,15 +903,35 @@ impl Emdb {
 
     // ---- transaction (simple buffered batch) ----
 
-    /// Run a closure inside a buffered batch. The batch is committed
-    /// when the closure returns `Ok(_)`; staged writes are dropped
-    /// when it returns `Err(_)`.
+    /// Run a closure inside a buffered write batch. The batch is
+    /// committed when the closure returns `Ok(_)`; staged writes are
+    /// dropped when it returns `Err(_)`.
     ///
-    /// Note: the new mmap+append architecture does not provide
-    /// **atomic** batches — individual records are atomic (per-record
-    /// CRC) but a crash mid-commit leaves a prefix of the batch
-    /// durable. This is a deliberate trade-off for write throughput.
-    /// Callers that need true all-or-nothing must use external means.
+    /// This is a write batch, not an isolated transaction. What it
+    /// guarantees:
+    ///
+    /// - **Rollback:** if the closure returns `Err`, nothing it staged
+    ///   is written.
+    /// - **Read-your-writes:** reads through the
+    ///   [`crate::Transaction`] see the batch's own staged writes.
+    /// - **Per-key ordering at commit:** the commit holds the write
+    ///   lock of every key it touches while it appends and applies the
+    ///   batch, so any other write to one of those keys happens
+    ///   entirely before or entirely after the commit.
+    ///
+    /// What it does not guarantee:
+    ///
+    /// - **Isolation:** reads inside the closure see the live
+    ///   database, and nothing stops another thread from changing a
+    ///   key between that read and the commit. A read-modify-write
+    ///   (such as incrementing a counter) can lose updates under
+    ///   concurrency; serialise such updates yourself.
+    /// - **Atomic visibility:** other threads can observe some of the
+    ///   batch's keys updated and others not yet updated while the
+    ///   commit is applying.
+    /// - **Crash atomicity:** the batch is one journal append, but a
+    ///   crash during it can leave a prefix of the batch durable
+    ///   (each record is individually checksummed).
     ///
     /// # Examples
     ///
@@ -976,110 +1010,215 @@ impl Inner {
     }
 }
 
-/// Iterator over `(key, value)` pairs from [`Emdb::iter`].
-///
-/// Decodes records lazily from the snapshot of offsets captured at
-/// `iter()` time. Skips offsets whose record can no longer be
-/// decoded as a live `Insert` (overwritten in place or otherwise
-/// invalidated since the snapshot).
-pub struct EmdbIter {
+#[cfg(feature = "ttl")]
+impl Inner {
+    /// Absolute expiry for a write that uses the default TTL, or 0
+    /// when no default is configured. The clock is only read when a
+    /// default TTL exists.
+    pub(crate) fn default_expires_at(&self) -> Result<u64> {
+        match self.default_ttl {
+            None => Ok(0),
+            Some(_) => Ok(
+                expires_from_ttl(Ttl::Default, self.default_ttl, now_unix_millis())?.unwrap_or(0),
+            ),
+        }
+    }
+}
+
+/// Current time for expiry checks on read paths, or 0 (no expiry
+/// filtering) when the `ttl` feature is off.
+#[inline]
+pub(crate) fn expiry_clock() -> u64 {
+    #[cfg(feature = "ttl")]
+    {
+        now_unix_millis()
+    }
+    #[cfg(not(feature = "ttl"))]
+    {
+        0
+    }
+}
+
+/// Remove every expired record of `ns_id` that is still its key's
+/// current record. Shared by [`Emdb::sweep_expired`] and
+/// [`crate::Namespace::sweep_expired`]. Errors end the sweep early;
+/// the count so far is returned.
+#[cfg(feature = "ttl")]
+pub(crate) fn sweep_namespace(engine: &crate::storage::Engine, ns_id: u32) -> usize {
+    let Ok(expired) = engine.expired_entries(ns_id, now_unix_millis()) else {
+        return 0;
+    };
+    let mut evicted = 0;
+    for (key, offset) in expired {
+        match engine.remove_if_unchanged(ns_id, &key, offset) {
+            Ok(true) => evicted += 1,
+            Ok(false) => {}
+            Err(_) => break,
+        }
+    }
+    evicted
+}
+
+/// State shared by the offset-snapshot iterators ([`EmdbIter`],
+/// [`EmdbKeyIter`] and their namespace counterparts).
+pub(crate) struct OffsetCursor {
     inner: Arc<Inner>,
+    ns_id: u32,
     offsets: std::vec::IntoIter<u64>,
 }
 
-impl EmdbIter {
-    fn new(inner: Arc<Inner>, offsets: Vec<u64>) -> Self {
+impl OffsetCursor {
+    pub(crate) fn new(inner: Arc<Inner>, ns_id: u32, offsets: Vec<u64>) -> Self {
         Self {
             inner,
+            ns_id,
             offsets: offsets.into_iter(),
         }
     }
+
+    /// Next live `(key, value)`. Undecodable and expired records are
+    /// skipped.
+    pub(crate) fn next_record(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        for offset in self.offsets.by_ref() {
+            if let Ok(Some((key, value, expires_at))) =
+                self.inner.engine.decode_owned_at(self.ns_id, offset)
+            {
+                if is_live(expires_at, expiry_clock()) {
+                    return Some((key, value));
+                }
+            }
+        }
+        None
+    }
+
+    /// Next live key. Values are not decoded.
+    pub(crate) fn next_key(&mut self) -> Option<Vec<u8>> {
+        for offset in self.offsets.by_ref() {
+            if let Ok(Some((key, expires_at))) = self.inner.engine.decode_key_at(self.ns_id, offset)
+            {
+                if is_live(expires_at, expiry_clock()) {
+                    return Some(key);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.offsets.len()))
+    }
+}
+
+/// First page size of a range iterator. Small so that `take(n)` for
+/// small `n` touches only a few index entries.
+const FIRST_RANGE_PAGE: usize = 16;
+/// Upper bound of the page size, reached by doubling, so long scans
+/// amortise the per-page index seek.
+const MAX_RANGE_PAGE: usize = 512;
+
+/// State shared by the range iterators ([`EmdbRangeIter`] and
+/// [`crate::NamespaceRangeIter`]).
+pub(crate) struct RangeState {
+    inner: Arc<Inner>,
+    ns_id: u32,
+    cursor: RangeCursor,
+    page: VecDeque<(Vec<u8>, u64)>,
+    page_size: usize,
+}
+
+impl RangeState {
+    pub(crate) fn new(inner: Arc<Inner>, ns_id: u32, cursor: RangeCursor) -> Self {
+        Self {
+            inner,
+            ns_id,
+            cursor,
+            page: VecDeque::new(),
+            page_size: FIRST_RANGE_PAGE,
+        }
+    }
+
+    /// Next live `(key, value)` in ascending key order.
+    pub(crate) fn next_pair(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        loop {
+            if self.page.is_empty() {
+                self.cursor.fill(&mut self.page, self.page_size);
+                self.page_size = (self.page_size * 2).min(MAX_RANGE_PAGE);
+            }
+            let (key, offset) = self.page.pop_front()?;
+            if let Ok(Some((value, expires_at))) = self
+                .inner
+                .engine
+                .read_value_with_meta_at(self.ns_id, offset, &key)
+            {
+                if is_live(expires_at, expiry_clock()) {
+                    return Some((key, value));
+                }
+            }
+        }
+    }
+}
+
+/// Iterator over `(key, value)` pairs from [`Emdb::iter`].
+///
+/// Walks a snapshot of record offsets taken when the iterator was
+/// created and decodes one record per `next()`. See [`Emdb::iter`]
+/// for exactly which records are yielded. Records that fail to decode
+/// are skipped without an error.
+pub struct EmdbIter {
+    cursor: OffsetCursor,
 }
 
 impl Iterator for EmdbIter {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        for offset in self.offsets.by_ref() {
-            match self.inner.engine.decode_owned_at(offset) {
-                Ok(Some((key, value, _))) => return Some((key, value)),
-                Ok(None) => continue,
-                Err(_) => continue,
-            }
-        }
-        None
+        self.cursor.next_record()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.cursor.size_hint()
     }
 }
 
 /// Iterator over keys from [`Emdb::keys`].
 ///
-/// Same lazy semantics as [`EmdbIter`]; values are decoded then
-/// discarded so the cost is one decode per key.
+/// Same snapshot semantics as [`EmdbIter`]; only keys are decoded.
 pub struct EmdbKeyIter {
-    inner: Arc<Inner>,
-    offsets: std::vec::IntoIter<u64>,
-}
-
-impl EmdbKeyIter {
-    fn new(inner: Arc<Inner>, offsets: Vec<u64>) -> Self {
-        Self {
-            inner,
-            offsets: offsets.into_iter(),
-        }
-    }
+    cursor: OffsetCursor,
 }
 
 impl Iterator for EmdbKeyIter {
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        for offset in self.offsets.by_ref() {
-            match self.inner.engine.decode_owned_at(offset) {
-                Ok(Some((key, _value, _))) => return Some(key),
-                Ok(None) => continue,
-                Err(_) => continue,
-            }
-        }
-        None
+        self.cursor.next_key()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.cursor.size_hint()
     }
 }
 
-/// Streaming range iterator returned by [`Emdb::range_iter`] and
-/// [`Emdb::range_prefix_iter`].
+/// Streaming range iterator returned by [`Emdb::range_iter`],
+/// [`Emdb::range_prefix_iter`], [`Emdb::iter_from`] and
+/// [`Emdb::iter_after`].
 ///
-/// The iterator carries a snapshot of `(key, offset)` pairs taken
-/// from the namespace's lock-free `SkipMap` secondary index at
-/// construction time. Each `next()` consumes one pair, decodes the
-/// value via the shared mmap, and yields `(key, value)`. No lock is
-/// held across iteration (the snapshot is materialised eagerly into
-/// an owned vector). Pairs whose backing record has been overwritten
-/// between snapshot and decode are skipped.
+/// A cursor over the namespace's lock-free sorted index: each refill
+/// seeks the index just past the last key yielded and takes a small
+/// page of `(key, offset)` pairs (16 at first, doubling up to 512),
+/// and each `next()` decodes one value from the mmap. No lock is held
+/// between calls. See [`Emdb::range_iter`] for the consistency
+/// guarantees. Records that fail to decode are skipped without an
+/// error.
 pub struct EmdbRangeIter {
-    inner: Arc<Inner>,
-    pairs: std::vec::IntoIter<(Vec<u8>, u64)>,
-}
-
-impl EmdbRangeIter {
-    fn new(inner: Arc<Inner>, pairs: Vec<(Vec<u8>, u64)>) -> Self {
-        Self {
-            inner,
-            pairs: pairs.into_iter(),
-        }
-    }
+    state: RangeState,
 }
 
 impl Iterator for EmdbRangeIter {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        for (key, offset) in self.pairs.by_ref() {
-            match self.inner.engine.read_value_with_meta_at(offset, &key) {
-                Ok(Some((value, _expires))) => return Some((key, value)),
-                Ok(None) => continue,
-                Err(_) => continue,
-            }
-        }
-        None
+        self.state.next_pair()
     }
 }
 

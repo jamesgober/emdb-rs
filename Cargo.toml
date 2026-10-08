@@ -69,6 +69,14 @@ crossbeam-skiplist = "0.1"
 # the hot atomics (per-namespace `record_count`, `Store::mmap_len`).
 # Already pulled in transitively through fsys.
 crossbeam-utils = { version = "0.8", default-features = false }
+# crossbeam-epoch: epoch-based memory reclamation for the lock-free
+# read path: index shard tables and the journal mmap are published
+# through atomic pointers and retired tables / mappings are freed only
+# after every reader that could still see them has unpinned. Already
+# in the dependency graph through `crossbeam-skiplist` (no new crate);
+# declared directly because emdb now calls it. 0.9.21 is the first
+# release without RUSTSEC-2026-0204; MSRV 1.61.
+crossbeam-epoch = { version = "0.9.21", default-features = false, features = ["std"] }
 # Optional at-rest AES-256-GCM encryption.
 aes-gcm = { version = "0.10", optional = true, default-features = false, features = ["aes", "alloc"] }
 # ChaCha20-Poly1305 AEAD as an alternative to AES-GCM.
@@ -115,6 +123,17 @@ tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-t
 tokio-stream = { version = "0.1", default-features = false }
 futures-util = { version = "0.3", default-features = false }
 
+# loom: exhaustive interleaving checker for the index seqlock model
+# (`src/storage/index.rs`, `mod loom_model`). Only compiled when the
+# crate is built with `RUSTFLAGS="--cfg loom"`; normal builds and
+# downstream users never compile it.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+# `cfg(loom)` is set by RUSTFLAGS for the loom model run only.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [features]
 default = ["ttl"]
 ttl = []
@@ -159,6 +178,10 @@ harness = false
 
 [[bench]]
 name = "index_hotpath"
+harness = false
+
+[[bench]]
+name = "concurrent_writes"
 harness = false
 
 [[bench]]

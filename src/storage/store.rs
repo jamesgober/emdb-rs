@@ -21,11 +21,12 @@
 //! - **Writes**: `fsys::JournalHandle` does lock-free LSN
 //!   reservation + concurrent `pwrite`. The hot append path holds
 //!   no mutex.
-//! - **Reads**: `Arc<Mmap>` over the journal file. Readers get a
-//!   cheap clone of the Arc; the kernel keeps the mapping alive
-//!   even after the writer grows the file (we re-map post-append
-//!   when the journal extends past the current mapping; old
-//!   readers holding the old Arc continue uninterrupted).
+//! - **Reads**: a read-only mapping of the journal file, published
+//!   through [`MmapCell`]. Hot-path readers borrow it under an epoch
+//!   guard ([`Store::mapped`]) without touching a reference count;
+//!   the store re-maps when a read needs bytes past the current
+//!   mapping, and readers still on the old mapping continue
+//!   uninterrupted until they unpin.
 //! - **Sync**: `flush()` calls `journal.sync_through(latest_lsn)`.
 //!   fsys coalesces concurrent sync requests into a single
 //!   `fdatasync` (or NVMe passthrough flush where supported).
@@ -42,12 +43,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crossbeam_epoch::Guard;
 use crossbeam_utils::CachePadded;
 use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
 
 use crate::storage::flush::FlushPolicy;
 use crate::storage::meta::{self, MetaHeader};
+use crate::storage::mmap_cell::{MmapCell, MmapView};
 use crate::{Error, Result};
 
 /// fsys frame overhead: 4 magic + 4 length + 4 CRC = 12 bytes.
@@ -79,10 +82,11 @@ pub(crate) struct Store {
     /// Mutex-guarded so we can re-stat + remap atomically without
     /// racing concurrent writers' growth.
     read_file: Mutex<File>,
-    /// Atomically-swapped read mapping. Readers grab a snapshot
-    /// via `Arc::clone`; writes remap when the journal extends
-    /// past the current mapping length.
-    mmap: RwLock<Arc<Mmap>>,
+    /// Atomically-swapped read mapping. Hot-path readers borrow it
+    /// under an epoch guard ([`Self::mapped`]) without touching a
+    /// shared counter; it is replaced when the journal extends past
+    /// the current mapping length or the file is swapped.
+    mmap: MmapCell,
     /// Tracks the byte length covered by the active mapping.
     /// Updated under the mmap write-lock when remapping. Read
     /// lock-free on the writer's append fast path to decide
@@ -207,7 +211,7 @@ impl Store {
             journal,
             fs,
             read_file: Mutex::new(read_file),
-            mmap: RwLock::new(Arc::new(initial_mmap)),
+            mmap: MmapCell::new(Arc::new(initial_mmap)),
             mmap_len: CachePadded::new(AtomicU64::new(mmap_len)),
             policy,
             meta: Arc::new(RwLock::new(meta)),
@@ -246,7 +250,7 @@ impl Store {
     /// only when the requested offset is past the current
     /// mapping's end.
     pub(crate) fn mmap(&self) -> Result<Arc<Mmap>> {
-        Ok(Arc::clone(&self.mmap.read()))
+        Ok(self.mmap.load_full())
     }
 
     /// Borrow a read mapping that covers at least up to byte
@@ -263,7 +267,26 @@ impl Store {
         if end_offset > cur_len {
             self.refresh_mmap()?;
         }
-        Ok(Arc::clone(&self.mmap.read()))
+        Ok(self.mmap.load_full())
+    }
+
+    /// Hot-path read accessor: borrow a mapping that covers at least
+    /// `end_offset` bytes, valid while `guard` (and `self`) live.
+    ///
+    /// Takes no lock and performs no shared-counter write when the
+    /// current mapping is long enough. Coverage is checked against
+    /// the borrowed mapping's own length, so the result is consistent
+    /// even while another thread is mid-refresh. When the mapping is
+    /// too short it is refreshed once; the caller must still bound
+    /// its reads by `bytes().len()`.
+    #[inline]
+    pub(crate) fn mapped<'a>(&'a self, end_offset: u64, guard: &'a Guard) -> Result<MmapView<'a>> {
+        let view = self.mmap.load(guard);
+        if view.bytes().len() as u64 >= end_offset {
+            return Ok(view);
+        }
+        self.refresh_mmap()?;
+        Ok(self.mmap.load(guard))
     }
 
     /// Append a payload to the journal. Returns the byte offset
@@ -469,9 +492,6 @@ impl Store {
         // strong reference to the journal by replacing it with
         // a journal pointing at the new file.
 
-        // Lock the mmap so no concurrent readers grab the old
-        // Arc while we swap.
-        let mut mmap_guard = self.mmap.write();
         let mut file_guard = self.read_file.lock();
 
         // Drop the old read-file by replacing it with a placeholder
@@ -500,7 +520,7 @@ impl Store {
         // mapping covers the whole file at map time.
         let new_mmap = unsafe { Mmap::map(&*file_guard)? };
         let new_len = new_mmap.len() as u64;
-        *mmap_guard = Arc::new(new_mmap);
+        self.mmap.store(Arc::new(new_mmap));
         self.mmap_len.store(new_len, Ordering::Release);
 
         Ok(())
@@ -521,8 +541,7 @@ impl Store {
         let new_mmap = unsafe { Mmap::map(&*file_guard)? };
         let new_len = new_mmap.len() as u64;
         drop(file_guard);
-        let mut mmap_guard = self.mmap.write();
-        *mmap_guard = Arc::new(new_mmap);
+        self.mmap.store(Arc::new(new_mmap));
         self.mmap_len.store(new_len, Ordering::Release);
         Ok(())
     }

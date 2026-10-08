@@ -19,42 +19,42 @@
 //! On encrypted databases, AEAD encrypt/decrypt is added on top
 //! (~200-400ns extra per record on commodity AES-NI hardware).
 
-use std::collections::HashMap;
-use std::ops::{Bound, RangeBounds};
+use std::collections::{HashMap, VecDeque};
+use std::ops::{Bound, Deref, RangeBounds};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crossbeam_epoch::{self as epoch, Guard};
 use crossbeam_skiplist::SkipMap;
 use crossbeam_utils::CachePadded;
-use memmap2::Mmap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::storage::flush::FlushPolicy;
 use crate::storage::format::{self, RecordView};
 #[cfg(feature = "encrypt")]
 use crate::storage::format::{OwnedRecord, NONCE_LEN};
-use crate::storage::index::Index;
+use crate::storage::index::{Index, KeyCheck, KeyHash, KeyHasher};
 #[cfg(feature = "encrypt")]
 use crate::storage::meta::FLAG_CIPHER_CHACHA20;
 use crate::storage::meta::{self, MetaHeader, FLAG_ENCRYPTED};
+use crate::storage::mmap_cell::MmapView;
 use crate::storage::store::Store;
 use crate::{Error, Result};
 
 /// Default namespace id (the implicit unnamed namespace).
 pub(crate) const DEFAULT_NAMESPACE_ID: u32 = 0;
 
-/// Per-namespace runtime state. The `index` maps `(hash, key) → file
-/// offset`; `record_count` tracks live records for cheap `len` queries.
-/// When the engine was opened with `enable_range_scans(true)`,
-/// `range_index` carries a sorted secondary index — a lock-free
-/// `crossbeam_skiplist::SkipMap` keyed by the actual key bytes so
-/// concurrent inserts + range iteration scale without acquiring a
-/// global lock. The hot `record_count` atomic is cache-padded so
-/// inserts in one namespace don't false-share with reads in another.
+/// Per-namespace runtime state. The `index` maps `(hash, key)` to the
+/// file offset of the key's live record and also provides the live
+/// record count (`Index::len`), so the count can never drift from the
+/// index. When the engine was opened with `enable_range_scans(true)`,
+/// `range_index` carries a sorted secondary index: a lock-free
+/// `crossbeam_skiplist::SkipMap` keyed by the key bytes. Both are
+/// updated under the key's write stripe, so for every key the skiplist
+/// agrees with the hash index once the write returns.
 struct NamespaceRuntime {
     index: Index,
-    record_count: CachePadded<AtomicU64>,
     range_index: Option<Arc<SkipMap<Vec<u8>, u64>>>,
 }
 
@@ -62,7 +62,6 @@ impl NamespaceRuntime {
     fn new(range_scans_enabled: bool) -> Self {
         Self {
             index: Index::new(),
-            record_count: CachePadded::new(AtomicU64::new(0)),
             range_index: range_scans_enabled.then(|| Arc::new(SkipMap::new())),
         }
     }
@@ -71,8 +70,256 @@ impl NamespaceRuntime {
 impl std::fmt::Debug for NamespaceRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NamespaceRuntime")
-            .field("len", &self.record_count.load(Ordering::Acquire))
+            .field("len", &self.index.len())
             .finish()
+    }
+}
+
+/// A namespace runtime handed out by [`Engine::namespace`]. The
+/// default namespace is borrowed straight from the engine, so the hot
+/// read path takes no lock and touches no reference count; named
+/// namespaces are looked up in the map and held by `Arc`.
+enum NsRef<'a> {
+    Default(&'a NamespaceRuntime),
+    Named(Arc<NamespaceRuntime>),
+}
+
+impl Deref for NsRef<'_> {
+    type Target = NamespaceRuntime;
+
+    #[inline]
+    fn deref(&self) -> &NamespaceRuntime {
+        match self {
+            Self::Default(ns) => ns,
+            Self::Named(ns) => ns,
+        }
+    }
+}
+
+/// Number of per-key write stripes. Power of two.
+const WRITE_STRIPES: usize = 1024;
+
+/// Striped per-key write locks.
+///
+/// Every write to a key (insert, remove, batch, TTL sweep, persist)
+/// holds the key's stripe across the journal append and the index and
+/// skiplist updates. Writes to the same key are therefore
+/// linearizable, and they reach the log in the same order as they
+/// reach the in-memory index, which is the order recovery replays.
+/// Batches lock their stripes in ascending order, so two batches
+/// cannot deadlock. Readers never take these locks.
+///
+/// Lock order, outermost first: the engine write gate (if any, shared
+/// mode), stripes in ascending order, then the index shard writer
+/// mutex and the store's append-order mutex. Nothing that holds a
+/// stripe waits for another stripe out of order.
+struct WriteStripes {
+    stripes: Box<[CachePadded<Mutex<()>>]>,
+}
+
+/// Stripes held by one write operation; released on drop. Every engine
+/// write entry point acquires its stripes through
+/// [`Engine::lock_key`] or [`Engine::lock_keys`].
+#[must_use = "the write stripes are released when this guard drops"]
+pub(crate) struct WriteGuard<'a> {
+    _stripes: StripeSet<'a>,
+}
+
+enum StripeSet<'a> {
+    One(MutexGuard<'a, ()>),
+    Many(Vec<MutexGuard<'a, ()>>),
+}
+
+impl WriteStripes {
+    fn new() -> Self {
+        Self {
+            stripes: (0..WRITE_STRIPES)
+                .map(|_| CachePadded::new(Mutex::new(())))
+                .collect(),
+        }
+    }
+
+    /// Stripe of `(ns_id, hash)`. Mixes hash bits that neither the
+    /// shard selector nor the home slot depend on.
+    #[inline]
+    fn stripe_of(ns_id: u32, hash: KeyHash) -> usize {
+        let mixed = hash.rotate_right(24) ^ u64::from(ns_id).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        (mixed as usize) & (WRITE_STRIPES - 1)
+    }
+
+    fn lock_one(&self, ns_id: u32, hash: KeyHash) -> StripeSet<'_> {
+        StripeSet::One(self.stripes[Self::stripe_of(ns_id, hash)].lock())
+    }
+
+    /// Lock the stripes of every hash in `hashes`, each once, in
+    /// ascending stripe order.
+    fn lock_many(&self, ns_id: u32, hashes: &[KeyHash]) -> StripeSet<'_> {
+        let mut wanted = [0_u64; WRITE_STRIPES / 64];
+        for &hash in hashes {
+            let stripe = Self::stripe_of(ns_id, hash);
+            wanted[stripe / 64] |= 1 << (stripe % 64);
+        }
+        let mut guards = Vec::with_capacity(hashes.len().min(WRITE_STRIPES));
+        for (word_index, &word) in wanted.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                guards.push(self.stripes[word_index * 64 + bit].lock());
+            }
+        }
+        StripeSet::Many(guards)
+    }
+}
+
+/// One operation of an [`Engine::write_batch`].
+#[derive(Debug)]
+pub(crate) enum BatchOp {
+    Insert {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expires_at: u64,
+    },
+    Remove {
+        key: Vec<u8>,
+    },
+}
+
+impl BatchOp {
+    fn key(&self) -> &[u8] {
+        match self {
+            Self::Insert { key, .. } | Self::Remove { key } => key,
+        }
+    }
+}
+
+/// A decoded live `Insert` record. Plaintext records borrow the key
+/// and value from the read mapping; encrypted records own the
+/// decrypted plaintext.
+enum Decoded<'a> {
+    Borrowed {
+        key: &'a [u8],
+        value: &'a [u8],
+        expires_at: u64,
+        view: MmapView<'a>,
+    },
+    // Constructed only by the encrypted read path.
+    #[cfg_attr(not(feature = "encrypt"), allow(dead_code))]
+    Owned {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expires_at: u64,
+    },
+}
+
+impl Decoded<'_> {
+    fn key(&self) -> &[u8] {
+        match self {
+            Self::Borrowed { key, .. } => key,
+            Self::Owned { key, .. } => key,
+        }
+    }
+
+    fn expires_at(&self) -> u64 {
+        match self {
+            Self::Borrowed { expires_at, .. } | Self::Owned { expires_at, .. } => *expires_at,
+        }
+    }
+
+    fn into_value(self) -> Vec<u8> {
+        match self {
+            Self::Borrowed { value, .. } => value.to_vec(),
+            Self::Owned { value, .. } => value,
+        }
+    }
+
+    fn into_triple(self) -> RecordSnapshot {
+        match self {
+            Self::Borrowed {
+                key,
+                value,
+                expires_at,
+                ..
+            } => (key.to_vec(), value.to_vec(), expires_at),
+            Self::Owned {
+                key,
+                value,
+                expires_at,
+            } => (key, value, expires_at),
+        }
+    }
+}
+
+/// True when a record with `expires_at` is live at `now_ms`.
+/// `expires_at == 0` means "no TTL"; `now_ms == 0` disables expiry
+/// checks (builds without the `ttl` feature pass 0).
+#[inline]
+pub(crate) fn is_live(expires_at: u64, now_ms: u64) -> bool {
+    expires_at == 0 || now_ms == 0 || expires_at > now_ms
+}
+
+/// Cursor over a namespace's sorted secondary index.
+///
+/// Holds no snapshot: each [`Self::fill`] seeks the skiplist from the
+/// last key handed out, so `iter_from(..).take(10)` costs one seek and
+/// ten entries however many keys follow. Iteration is weakly
+/// consistent: keys come out in ascending order, each at most once;
+/// keys inserted or removed ahead of the cursor while it runs may or
+/// may not be observed.
+pub(crate) struct RangeCursor {
+    map: Arc<SkipMap<Vec<u8>, u64>>,
+    next: Bound<Vec<u8>>,
+    end: Bound<Vec<u8>>,
+    done: bool,
+}
+
+impl std::fmt::Debug for RangeCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RangeCursor")
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RangeCursor {
+    /// Append up to `limit` `(key, offset)` pairs that follow the
+    /// cursor to `out`, and advance past them.
+    pub(crate) fn fill(&mut self, out: &mut VecDeque<(Vec<u8>, u64)>, limit: usize) {
+        if self.done {
+            return;
+        }
+        let before = out.len();
+        out.extend(
+            self.map
+                .range::<[u8], _>((bound_as_slice(&self.next), bound_as_slice(&self.end)))
+                .take(limit)
+                .map(|entry| (entry.key().clone(), *entry.value())),
+        );
+        let added = out.len() - before;
+        if added < limit {
+            self.done = true;
+        }
+        if added > 0 {
+            if let Some((last, _)) = out.back() {
+                self.next = Bound::Excluded(last.clone());
+            }
+        }
+    }
+}
+
+fn bound_as_slice(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match bound {
+        Bound::Included(v) => Bound::Included(v.as_slice()),
+        Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+fn owned_bound(bound: Bound<&Vec<u8>>) -> Bound<Vec<u8>> {
+    match bound {
+        Bound::Included(v) => Bound::Included(v.clone()),
+        Bound::Excluded(v) => Bound::Excluded(v.clone()),
+        Bound::Unbounded => Bound::Unbounded,
     }
 }
 
@@ -140,6 +387,15 @@ impl Default for EngineConfig {
 /// The engine. Cheap to clone (every field is `Arc`-shared internally).
 pub(crate) struct Engine {
     store: Arc<Store>,
+    /// The default namespace's runtime. The same `Arc` is stored in
+    /// `namespaces` under id 0; this field lets the hot path reach it
+    /// without the map's lock. Never replaced after `open`.
+    default_ns: Arc<NamespaceRuntime>,
+    /// Keyed hash shared by every namespace index and the write
+    /// stripes. Fresh secrets per open; the index is never persisted.
+    hasher: KeyHasher,
+    /// Per-key write stripes (see [`WriteStripes`]).
+    write_stripes: WriteStripes,
     /// Map of `namespace_id → runtime state`. The default namespace is
     /// always present at id 0; named namespaces are added via
     /// [`Self::create_or_open_namespace`].
@@ -248,8 +504,12 @@ impl Engine {
         }
 
         let range_scans_enabled = config.enable_range_scans;
+        let default_ns = Arc::new(NamespaceRuntime::new(range_scans_enabled));
         let engine = Self {
             store,
+            default_ns: Arc::clone(&default_ns),
+            hasher: KeyHasher::random(),
+            write_stripes: WriteStripes::new(),
             namespaces: RwLock::new(HashMap::new()),
             namespace_names: RwLock::new(HashMap::new()),
             next_namespace_id: AtomicU64::new(1),
@@ -261,10 +521,7 @@ impl Engine {
         // Always create the default namespace runtime.
         {
             let mut guard = engine.namespaces.write();
-            let _existing = guard.insert(
-                DEFAULT_NAMESPACE_ID,
-                Arc::new(NamespaceRuntime::new(range_scans_enabled)),
-            );
+            let _existing = guard.insert(DEFAULT_NAMESPACE_ID, default_ns);
         }
 
         // Recovery scan: walk every record from the start of the data
@@ -493,26 +750,13 @@ impl Engine {
         match action {
             RecoveryAction::Insert { ns_id, key } => {
                 let ns = self.ensure_namespace_runtime(ns_id)?;
-                let key_hash = Index::hash_key(&key);
-                let prev = ns
-                    .index
-                    .replace(key_hash, &key, offset, |off| self.key_at_offset(off))?;
-                if prev.is_none() {
-                    let _ = ns.record_count.fetch_add(1, Ordering::AcqRel);
-                }
-                if let Some(range_map) = ns.range_index.as_ref() {
-                    let _ = range_map.insert(key, offset);
-                }
+                let key_hash = self.hasher.hash(&key);
+                self.index_insert(&ns, ns_id, key_hash, &key, offset)?;
             }
             RecoveryAction::Remove { ns_id, key } => {
                 let ns = self.ensure_namespace_runtime(ns_id)?;
-                let key_hash = Index::hash_key(&key);
-                if ns.index.remove(key_hash, &key)?.is_some() {
-                    let _ = ns.record_count.fetch_sub(1, Ordering::AcqRel);
-                }
-                if let Some(range_map) = ns.range_index.as_ref() {
-                    let _ = range_map.remove(&key);
-                }
+                let key_hash = self.hasher.hash(&key);
+                self.index_remove(&ns, ns_id, key_hash, &key)?;
             }
             RecoveryAction::NamespaceName { ns_id, name } => {
                 if ns_id == DEFAULT_NAMESPACE_ID || name.is_empty() {
@@ -547,26 +791,60 @@ impl Engine {
         Ok(())
     }
 
-    /// Decode the key bytes of the record at `offset`. Used as a
-    /// hash-collision resolver for [`Index::replace`]: when the index
-    /// finds an existing `Single` slot at the same hash, it asks the
-    /// engine what key currently lives there so it can disambiguate
-    /// between a true replacement and a hash collision.
+    /// Index resolver: compare the key of the record at `offset` with
+    /// `key` without allocating in the common (same key) case. Used by
+    /// [`Index::replace`] and [`Index::remove`] to tell an overwrite
+    /// apart from a 64-bit hash collision.
+    fn check_key_at(&self, ns_id: u32, offset: u64, key: &[u8]) -> Result<KeyCheck> {
+        let guard = epoch::pin();
+        Ok(match self.decode_insert_at(ns_id, offset, &guard)? {
+            Some(record) if record.key() == key => KeyCheck::Same,
+            Some(record) => KeyCheck::Other(record.key().to_vec()),
+            None => KeyCheck::Unreadable,
+        })
+    }
+
+    /// Borrow the payload of the record framed at `offset` from the
+    /// read mapping. Returns `Ok(None)` when `offset` does not frame a
+    /// payload inside the journal.
     ///
-    /// Returns `Ok(None)` when the record cannot be decoded (corrupt
-    /// or already tombstoned in some way) — the index treats that as
-    /// "the existing entry is stale; overwrite in place."
-    fn key_at_offset(&self, offset: u64) -> Result<Option<Vec<u8>>> {
-        let mmap = self.store.mmap_covering(offset + 1)?;
-        let bytes: &[u8] = &mmap;
-        let payload = match format::payload_at(bytes, offset as usize) {
-            Ok(p) => p,
-            Err(_) => return Ok(None),
+    /// The first attempt maps at least `offset + 1` bytes. A record
+    /// appended after the mapping was last refreshed can extend past
+    /// it, so a failed slice is retried once against a mapping that
+    /// covers the journal tail.
+    fn payload_at<'a>(
+        &'a self,
+        offset: u64,
+        guard: &'a Guard,
+    ) -> Result<Option<(&'a [u8], MmapView<'a>)>> {
+        let Ok(start) = usize::try_from(offset) else {
+            return Ok(None);
+        };
+        let view = self.store.mapped(offset.saturating_add(1), guard)?;
+        if let Ok(payload) = format::payload_at(view.bytes(), start) {
+            return Ok(Some((payload, view)));
+        }
+        let view = self.store.mapped(self.store.tail(), guard)?;
+        Ok(format::payload_at(view.bytes(), start)
+            .ok()
+            .map(|payload| (payload, view)))
+    }
+
+    /// Decode the record at `offset` if it is an `Insert` in `ns_id`.
+    /// Returns `Ok(None)` for other record kinds, other namespaces and
+    /// offsets that do not frame a record.
+    fn decode_insert_at<'a>(
+        &'a self,
+        ns_id: u32,
+        offset: u64,
+        guard: &'a Guard,
+    ) -> Result<Option<Decoded<'a>>> {
+        let Some((payload, view)) = self.payload_at(offset, guard)? else {
+            return Ok(None);
         };
 
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
-            let ctx = Arc::clone(ctx);
             let owned = format::decode_payload_encrypted(payload, |nonce, ct| {
                 let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
                 input.extend_from_slice(nonce);
@@ -574,13 +852,32 @@ impl Engine {
                 ctx.decrypt(&input)
             })?;
             return Ok(match owned {
-                OwnedRecord::Insert { key, .. } => Some(key),
+                OwnedRecord::Insert {
+                    ns_id: record_ns,
+                    key,
+                    value,
+                    expires_at,
+                } if record_ns == ns_id => Some(Decoded::Owned {
+                    key,
+                    value,
+                    expires_at,
+                }),
                 _ => None,
             });
         }
 
         Ok(match format::decode_payload(payload)? {
-            RecordView::Insert { key, .. } => Some(key.to_vec()),
+            RecordView::Insert {
+                ns_id: record_ns,
+                key,
+                value,
+                expires_at,
+            } if record_ns == ns_id => Some(Decoded::Borrowed {
+                key,
+                value,
+                expires_at,
+                view,
+            }),
             _ => None,
         })
     }
@@ -606,15 +903,79 @@ impl Engine {
         Ok(Arc::clone(entry))
     }
 
-    fn namespace(&self, ns_id: u32) -> Result<Arc<NamespaceRuntime>> {
+    /// Look up a namespace runtime. The default namespace is returned
+    /// by reference with no lock or reference-count traffic.
+    fn namespace(&self, ns_id: u32) -> Result<NsRef<'_>> {
+        if ns_id == DEFAULT_NAMESPACE_ID {
+            return Ok(NsRef::Default(&self.default_ns));
+        }
         self.namespaces
             .read()
             .get(&ns_id)
-            .map(Arc::clone)
+            .map(|ns| NsRef::Named(Arc::clone(ns)))
             .ok_or(Error::InvalidConfig("unknown namespace id"))
     }
 
+    /// Acquire the write stripe for one key. Every single-key write
+    /// entry point goes through here; an engine-wide write gate, if
+    /// one is added, must be acquired before the stripe.
+    fn lock_key(&self, ns_id: u32, hash: KeyHash) -> WriteGuard<'_> {
+        WriteGuard {
+            _stripes: self.write_stripes.lock_one(ns_id, hash),
+        }
+    }
+
+    /// Acquire the write stripes for a batch, in ascending order. Same
+    /// gate rule as [`Self::lock_key`].
+    fn lock_keys(&self, ns_id: u32, hashes: &[KeyHash]) -> WriteGuard<'_> {
+        WriteGuard {
+            _stripes: self.write_stripes.lock_many(ns_id, hashes),
+        }
+    }
+
+    /// Point `key` at `offset` in the hash index and the range index.
+    /// Callers hold the key's write stripe (or run single-threaded
+    /// during recovery).
+    fn index_insert(
+        &self,
+        ns: &NamespaceRuntime,
+        ns_id: u32,
+        hash: KeyHash,
+        key: &[u8],
+        offset: u64,
+    ) -> Result<()> {
+        let _previous = ns.index.replace(hash, key, offset, |existing, key| {
+            self.check_key_at(ns_id, existing, key)
+        })?;
+        if let Some(range_map) = ns.range_index.as_ref() {
+            let _ = range_map.insert(key.to_vec(), offset);
+        }
+        Ok(())
+    }
+
+    /// Drop `key` from the hash index and the range index. Same
+    /// locking rule as [`Self::index_insert`].
+    fn index_remove(
+        &self,
+        ns: &NamespaceRuntime,
+        ns_id: u32,
+        hash: KeyHash,
+        key: &[u8],
+    ) -> Result<()> {
+        let _previous = ns.index.remove(hash, key, |existing, key| {
+            self.check_key_at(ns_id, existing, key)
+        })?;
+        if let Some(range_map) = ns.range_index.as_ref() {
+            let _ = range_map.remove(key);
+        }
+        Ok(())
+    }
+
     /// Insert or replace a key/value pair.
+    ///
+    /// The append and the index update run under the key's write
+    /// stripe, so concurrent writes to one key are applied to the log
+    /// and to memory in the same order.
     pub(crate) fn insert(
         &self,
         ns_id: u32,
@@ -623,96 +984,96 @@ impl Engine {
         expires_at: u64,
     ) -> Result<()> {
         let ns = self.namespace(ns_id)?;
-        let key_hash = Index::hash_key(key);
-
+        let hash = self.hasher.hash(key);
+        let _write = self.lock_key(ns_id, hash);
         let offset = self.append_insert(ns_id, key, value, expires_at)?;
-
-        let prev = ns
-            .index
-            .replace(key_hash, key, offset, |off| self.key_at_offset(off))?;
-        if prev.is_none() {
-            let _ = ns.record_count.fetch_add(1, Ordering::AcqRel);
-        }
-        if let Some(range_map) = ns.range_index.as_ref() {
-            let _ = range_map.insert(key.to_vec(), offset);
-        }
-        Ok(())
+        self.index_insert(&ns, ns_id, hash, key, offset)
     }
 
-    /// Bulk insert multiple records via fsys's vectored
-    /// `JournalHandle::append_batch`: one LSN reservation, one heap
-    /// allocation for the concatenated frames, one platform `pwrite`
-    /// covering the whole batch. Records are NOT atomic as a group
-    /// (no Begin/End markers); for atomic batches use the
-    /// transaction API.
+    /// Bulk insert. See [`Self::write_batch`].
     pub(crate) fn insert_many(
         &self,
         ns_id: u32,
         items: impl IntoIterator<Item = (Vec<u8>, Vec<u8>, u64)>,
     ) -> Result<()> {
-        let ns = self.namespace(ns_id)?;
-        let items: Vec<(Vec<u8>, Vec<u8>, u64)> = items.into_iter().collect();
-        if items.is_empty() {
+        let ops: Vec<BatchOp> = items
+            .into_iter()
+            .map(|(key, value, expires_at)| BatchOp::Insert {
+                key,
+                value,
+                expires_at,
+            })
+            .collect();
+        self.write_batch(ns_id, ops)
+    }
+
+    /// Apply a batch of inserts and removes through one vectored
+    /// journal append (`JournalHandle::append_batch`: one LSN
+    /// reservation, one `pwrite`).
+    ///
+    /// The write stripes of every key in the batch are held, in
+    /// ascending order, from before the append until every index
+    /// update is done. A concurrent single-key write to any of these
+    /// keys is therefore ordered entirely before or entirely after the
+    /// batch. Readers take no locks, so they can observe some of the
+    /// batch's keys updated and others not yet.
+    ///
+    /// The batch is not atomic on disk: there are no begin/commit
+    /// markers, so a crash during the append can leave a prefix of the
+    /// batch durable. A `Remove` of a key that is absent writes no
+    /// record, the same as [`Self::remove`].
+    pub(crate) fn write_batch(&self, ns_id: u32, ops: Vec<BatchOp>) -> Result<()> {
+        if ops.is_empty() {
             return Ok(());
         }
+        let ns = self.namespace(ns_id)?;
+        let hashes: Vec<KeyHash> = ops.iter().map(|op| self.hasher.hash(op.key())).collect();
+        let _write = self.lock_keys(ns_id, &hashes);
 
-        #[cfg(feature = "encrypt")]
-        let encryption = self.encryption.clone();
-
-        // Pre-encode every record into one `Vec<Vec<u8>>`, then
-        // submit the whole batch via fsys's vectored
-        // `append_batch`: one LSN reservation, one heap
-        // allocation for the concatenated frames, one platform
-        // `pwrite`. fsync cost is amortised by group-commit
-        // when the engine flushes at the end of the batch.
-        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(items.len());
-        for (key, value, expires_at) in &items {
-            let payload: Vec<u8> = {
-                #[cfg(feature = "encrypt")]
-                {
-                    if let Some(ctx) = encryption.as_ref() {
-                        let mut plain = Vec::with_capacity(20 + key.len() + value.len());
-                        format::encode_insert_body(&mut plain, ns_id, key, value, *expires_at);
-                        let nonce_then_ct = ctx.encrypt(&plain)?;
-                        let mut frame = Vec::with_capacity(1 + nonce_then_ct.len());
-                        frame.push(format::TAG_INSERT | format::TAG_ENCRYPTED_FLAG);
-                        frame.extend_from_slice(&nonce_then_ct);
-                        frame
-                    } else {
-                        let mut frame = Vec::with_capacity(1 + 20 + key.len() + value.len());
-                        frame.push(format::TAG_INSERT);
-                        format::encode_insert_body(&mut frame, ns_id, key, value, *expires_at);
-                        frame
+        // Keys inserted earlier in this batch count as present for a
+        // later `Remove` of the same key.
+        let mut inserted: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        let has_removes = ops.iter().any(|op| matches!(op, BatchOp::Remove { .. }));
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(ops.len());
+        let mut written: Vec<usize> = Vec::with_capacity(ops.len());
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                BatchOp::Insert {
+                    key,
+                    value,
+                    expires_at,
+                } => {
+                    // SECURITY-MERGE: seal_record (TAG_INSERT, encode_insert_body);
+                    // `encode_insert_payload` is the shared encoder.
+                    payloads.push(self.encode_insert_payload(ns_id, key, value, *expires_at)?);
+                    if has_removes {
+                        let _ = inserted.insert(key.as_slice());
                     }
                 }
-                #[cfg(not(feature = "encrypt"))]
-                {
-                    let mut frame = Vec::with_capacity(1 + 20 + key.len() + value.len());
-                    frame.push(format::TAG_INSERT);
-                    format::encode_insert_body(&mut frame, ns_id, key, value, *expires_at);
-                    frame
+                BatchOp::Remove { key } => {
+                    let present =
+                        inserted.remove(key.as_slice()) || ns.index.get(hashes[i], key)?.is_some();
+                    if !present {
+                        continue;
+                    }
+                    payloads.push(self.encode_remove_payload(ns_id, key)?);
                 }
-            };
-            payloads.push(payload);
+            }
+            written.push(i);
+        }
+        if payloads.is_empty() {
+            return Ok(());
         }
         let offsets = self
             .store
             .append_batch(payloads.iter().map(Vec::as_slice))?;
 
-        // Now update the index. Records are already on disk; this just
-        // bumps the in-memory map. The SkipMap is lock-free so no
-        // guard acquisition is needed across the iteration.
-        let range_map = ns.range_index.as_ref();
-        for ((key, _value, _exp), offset) in items.iter().zip(offsets.iter()) {
-            let key_hash = Index::hash_key(key);
-            let prev = ns
-                .index
-                .replace(key_hash, key, *offset, |off| self.key_at_offset(off))?;
-            if prev.is_none() {
-                let _ = ns.record_count.fetch_add(1, Ordering::AcqRel);
-            }
-            if let Some(range_map) = range_map {
-                let _ = range_map.insert(key.clone(), *offset);
+        for (&i, &offset) in written.iter().zip(offsets.iter()) {
+            match &ops[i] {
+                BatchOp::Insert { key, .. } => {
+                    self.index_insert(&ns, ns_id, hashes[i], key, offset)?;
+                }
+                BatchOp::Remove { key } => self.index_remove(&ns, ns_id, hashes[i], key)?,
             }
         }
         Ok(())
@@ -721,6 +1082,7 @@ impl Engine {
     fn append_insert(&self, ns_id: u32, key: &[u8], value: &[u8], expires_at: u64) -> Result<u64> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
+            // SECURITY-MERGE: seal_record (TAG_INSERT, encode_insert_body)
             // Build the plaintext payload.
             let mut payload = Vec::with_capacity(20 + key.len() + value.len());
             format::encode_insert_body(&mut payload, ns_id, key, value, expires_at);
@@ -743,6 +1105,7 @@ impl Engine {
     fn append_remove(&self, ns_id: u32, key: &[u8]) -> Result<u64> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
+            // SECURITY-MERGE: seal_record (TAG_REMOVE, encode_remove_body)
             let mut payload = Vec::with_capacity(8 + key.len());
             format::encode_remove_body(&mut payload, ns_id, key);
             let nonce_then_ct = ctx.encrypt(&payload)?;
@@ -760,8 +1123,35 @@ impl Engine {
         })
     }
 
-    /// Look up a key. Returns `Ok(None)` when not present, expired, or
-    /// hash-collided to a different key.
+    /// Encode a `[tag][body]` payload for a remove record.
+    fn encode_remove_payload(&self, ns_id: u32, key: &[u8]) -> Result<Vec<u8>> {
+        #[cfg(feature = "encrypt")]
+        if let Some(ctx) = self.encryption.as_ref() {
+            // SECURITY-MERGE: seal_record (TAG_REMOVE, encode_remove_body)
+            let mut body = Vec::with_capacity(8 + key.len());
+            format::encode_remove_body(&mut body, ns_id, key);
+            let nonce_then_ct = ctx.encrypt(&body)?;
+            let mut payload = Vec::with_capacity(1 + nonce_then_ct.len());
+            payload.push(format::TAG_REMOVE | format::TAG_ENCRYPTED_FLAG);
+            payload.extend_from_slice(&nonce_then_ct);
+            return Ok(payload);
+        }
+
+        let mut payload = Vec::with_capacity(1 + 8 + key.len());
+        payload.push(format::TAG_REMOVE);
+        format::encode_remove_body(&mut payload, ns_id, key);
+        Ok(payload)
+    }
+
+    /// Offset of `key`'s live record in `ns`, if any. Lock-free.
+    #[inline]
+    fn lookup(&self, ns: &NamespaceRuntime, key: &[u8]) -> Result<(KeyHash, Option<u64>)> {
+        let hash = self.hasher.hash(key);
+        Ok((hash, ns.index.get(hash, key)?))
+    }
+
+    /// Look up a key. Returns `Ok(None)` when not present or
+    /// hash-collided to a different key. Does not check expiry.
     pub(crate) fn get(&self, ns_id: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self.get_with_meta(ns_id, key)?.map(|(v, _)| v))
     }
@@ -777,13 +1167,12 @@ impl Engine {
         ns_id: u32,
         key: &[u8],
     ) -> Result<Option<(crate::ValueRef, u64)>> {
+        let guard = epoch::pin();
         let ns = self.namespace(ns_id)?;
-        let key_hash = Index::hash_key(key);
-        let offset = match ns.index.get(key_hash, key)? {
-            Some(o) => o,
-            None => return Ok(None),
+        let (_, Some(offset)) = self.lookup(&ns, key)? else {
+            return Ok(None);
         };
-        self.read_zerocopy_at(offset, key)
+        self.read_zerocopy_at(ns_id, offset, key, &guard)
     }
 
     /// Decode the record at `offset`, returning a [`crate::ValueRef`]
@@ -793,159 +1182,177 @@ impl Engine {
     /// live `Insert` whose key matches `expected_key`.
     fn read_zerocopy_at(
         &self,
+        ns_id: u32,
         offset: u64,
         expected_key: &[u8],
+        guard: &Guard,
     ) -> Result<Option<(crate::ValueRef, u64)>> {
-        let mmap = self.store.mmap_covering(offset + 1)?;
-        let bytes: &[u8] = &mmap;
-        let payload = match format::payload_at(bytes, offset as usize) {
-            Ok(p) => p,
-            Err(_) => return Ok(None),
+        let Some(record) = self.decode_insert_at(ns_id, offset, guard)? else {
+            return Ok(None);
         };
-
-        #[cfg(feature = "encrypt")]
-        if let Some(ctx) = self.encryption.as_ref() {
-            let ctx = Arc::clone(ctx);
-            let owned = format::decode_payload_encrypted(payload, |nonce, ct| {
-                let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
-                input.extend_from_slice(nonce);
-                input.extend_from_slice(ct);
-                ctx.decrypt(&input)
-            })?;
-            return Ok(match owned {
-                OwnedRecord::Insert {
-                    key,
-                    value,
-                    expires_at,
-                    ..
-                } => {
-                    if key.as_slice() == expected_key {
-                        Some((crate::ValueRef::from_owned(value), expires_at))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            });
+        if record.key() != expected_key {
+            return Ok(None);
         }
-
-        // Plaintext fast path: derive the value's mmap byte range
-        // from the borrowed `value` slice and build an mmap-backed
-        // ValueRef so reads are zero-copy.
-        let (value_range, expires_at) = match format::decode_payload(payload)? {
-            RecordView::Insert {
-                key,
+        Ok(Some(match record {
+            Decoded::Borrowed {
                 value,
                 expires_at,
+                view,
                 ..
             } => {
-                if key != expected_key {
-                    return Ok(None);
-                }
-                // Subtract base pointers to recover the absolute
-                // byte offset of `value` inside the mmap.
-                let base = bytes.as_ptr() as usize;
-                let val_start = value.as_ptr() as usize - base;
-                let val_end = val_start + value.len();
-                (val_start..val_end, expires_at)
+                // Recover the value's byte range inside the mapping
+                // from the borrowed slice.
+                let start = value.as_ptr() as usize - view.bytes().as_ptr() as usize;
+                let range = start..start + value.len();
+                (crate::ValueRef::from_mmap(view.to_arc(), range), expires_at)
             }
-            _ => return Ok(None),
-        };
-
-        Ok(Some((
-            crate::ValueRef::from_mmap(mmap, value_range),
-            expires_at,
-        )))
+            Decoded::Owned {
+                value, expires_at, ..
+            } => (crate::ValueRef::from_owned(value), expires_at),
+        }))
     }
 
     /// Fetch value + expires_at for a key in one pass. Used by the TTL
     /// path in `Emdb::get` so it doesn't have to make two record reads.
     pub(crate) fn get_with_meta(&self, ns_id: u32, key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
+        let guard = epoch::pin();
         let ns = self.namespace(ns_id)?;
-        let key_hash = Index::hash_key(key);
-        let offset = match ns.index.get(key_hash, key)? {
-            Some(o) => o,
-            None => return Ok(None),
+        let (_, Some(offset)) = self.lookup(&ns, key)? else {
+            return Ok(None);
         };
-        self.read_value_at(offset, key)
+        self.read_value_at(ns_id, offset, key, &guard)
     }
 
-    fn read_value_at(&self, offset: u64, expected_key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
-        let mmap = self.store.mmap_covering(offset + 1)?;
-        let bytes: &[u8] = &mmap;
-
-        #[cfg(feature = "encrypt")]
-        if let Some(ctx) = self.encryption.as_ref() {
-            let payload = match format::payload_at(bytes, offset as usize) {
-                Ok(p) => p,
-                Err(_) => return Ok(None),
-            };
-            let ctx = Arc::clone(ctx);
-            let owned = format::decode_payload_encrypted(payload, |nonce, ct| {
-                let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
-                input.extend_from_slice(nonce);
-                input.extend_from_slice(ct);
-                ctx.decrypt(&input)
-            })?;
-            return Ok(match owned {
-                OwnedRecord::Insert {
-                    key,
-                    value,
-                    expires_at,
-                    ..
-                } => {
-                    if key.as_slice() == expected_key {
-                        Some((value, expires_at))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            });
-        }
-
-        let payload = match format::payload_at(bytes, offset as usize) {
-            Ok(p) => p,
-            Err(_) => return Ok(None),
+    /// Whether `key` has a record that is live at `now_ms` (see
+    /// [`is_live`]). Decodes only the key and expiry; the value is
+    /// never copied.
+    pub(crate) fn contains_live(&self, ns_id: u32, key: &[u8], now_ms: u64) -> Result<bool> {
+        let guard = epoch::pin();
+        let ns = self.namespace(ns_id)?;
+        let (_, Some(offset)) = self.lookup(&ns, key)? else {
+            return Ok(false);
         };
-        Ok(match format::decode_payload(payload)? {
-            RecordView::Insert {
-                key,
-                value,
-                expires_at,
-                ..
-            } => {
-                if key == expected_key {
-                    Some((value.to_vec(), expires_at))
-                } else {
-                    None
-                }
+        Ok(match self.decode_insert_at(ns_id, offset, &guard)? {
+            Some(record) => record.key() == key && is_live(record.expires_at(), now_ms),
+            None => false,
+        })
+    }
+
+    fn read_value_at(
+        &self,
+        ns_id: u32,
+        offset: u64,
+        expected_key: &[u8],
+        guard: &Guard,
+    ) -> Result<Option<(Vec<u8>, u64)>> {
+        Ok(match self.decode_insert_at(ns_id, offset, guard)? {
+            Some(record) if record.key() == expected_key => {
+                let expires_at = record.expires_at();
+                Some((record.into_value(), expires_at))
             }
             _ => None,
         })
     }
 
     /// Remove a key. Returns the previously-associated value, if any.
+    ///
+    /// Runs entirely under the key's write stripe: of two concurrent
+    /// `remove`s of one key, exactly one returns `Some`.
     pub(crate) fn remove(&self, ns_id: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let prev = self.get(ns_id, key)?;
-        if prev.is_some() {
-            let _offset = self.append_remove(ns_id, key)?;
-            let ns = self.namespace(ns_id)?;
-            let key_hash = Index::hash_key(key);
-            if ns.index.remove(key_hash, key)?.is_some() {
-                let _ = ns.record_count.fetch_sub(1, Ordering::AcqRel);
-            }
-            if let Some(range_map) = ns.range_index.as_ref() {
-                let _ = range_map.remove(key);
-            }
+        let ns = self.namespace(ns_id)?;
+        let hash = self.hasher.hash(key);
+        let _write = self.lock_key(ns_id, hash);
+        let Some(offset) = ns.index.get(hash, key)? else {
+            return Ok(None);
+        };
+        let previous = {
+            let guard = epoch::pin();
+            self.read_value_at(ns_id, offset, key, &guard)?
+        };
+        let Some((value, _expires_at)) = previous else {
+            return Ok(None);
+        };
+        let _remove_offset = self.append_remove(ns_id, key)?;
+        let _removed = ns.index.remove_if_offset(hash, key, offset);
+        if let Some(range_map) = ns.range_index.as_ref() {
+            let _ = range_map.remove(key);
         }
-        Ok(prev)
+        Ok(Some(value))
     }
 
-    /// Number of live records in `ns_id`.
+    /// Remove `key` only if its live record is still the one at
+    /// `expected_offset`. Returns whether a remove record was written.
+    /// Used by TTL sweeps so a fresh concurrent re-insert is never
+    /// deleted.
+    pub(crate) fn remove_if_unchanged(
+        &self,
+        ns_id: u32,
+        key: &[u8],
+        expected_offset: u64,
+    ) -> Result<bool> {
+        let ns = self.namespace(ns_id)?;
+        let hash = self.hasher.hash(key);
+        let _write = self.lock_key(ns_id, hash);
+        if ns.index.get(hash, key)? != Some(expected_offset) {
+            return Ok(false);
+        }
+        let _remove_offset = self.append_remove(ns_id, key)?;
+        let _removed = ns.index.remove_if_offset(hash, key, expected_offset);
+        if let Some(range_map) = ns.range_index.as_ref() {
+            let _ = range_map.remove(key);
+        }
+        Ok(true)
+    }
+
+    /// Rewrite `key` without a TTL if it currently has one and is
+    /// still live at `now_ms`. Returns whether the record was
+    /// rewritten. An expired record is left alone (it is never
+    /// resurrected), and a record without a TTL needs no rewrite.
+    pub(crate) fn clear_expiry(&self, ns_id: u32, key: &[u8], now_ms: u64) -> Result<bool> {
+        let ns = self.namespace(ns_id)?;
+        let hash = self.hasher.hash(key);
+        let _write = self.lock_key(ns_id, hash);
+        let Some(offset) = ns.index.get(hash, key)? else {
+            return Ok(false);
+        };
+        let current = {
+            let guard = epoch::pin();
+            self.read_value_at(ns_id, offset, key, &guard)?
+        };
+        let Some((value, expires_at)) = current else {
+            return Ok(false);
+        };
+        if expires_at == 0 || !is_live(expires_at, now_ms) {
+            return Ok(false);
+        }
+        let new_offset = self.append_insert(ns_id, key, &value, 0)?;
+        self.index_insert(&ns, ns_id, hash, key, new_offset)?;
+        Ok(true)
+    }
+
+    /// `(key, offset)` of every record in `ns_id` whose TTL has passed
+    /// at `now_ms`. Decodes keys and expiry only; values are never
+    /// copied.
+    pub(crate) fn expired_entries(&self, ns_id: u32, now_ms: u64) -> Result<Vec<(Vec<u8>, u64)>> {
+        let ns = self.namespace(ns_id)?;
+        let offsets = ns.index.collect_offsets()?;
+        let mut expired = Vec::new();
+        for offset in offsets {
+            let guard = epoch::pin();
+            if let Some(record) = self.decode_insert_at(ns_id, offset, &guard)? {
+                if !is_live(record.expires_at(), now_ms) {
+                    expired.push((record.key().to_vec(), offset));
+                }
+            }
+        }
+        Ok(expired)
+    }
+
+    /// Number of live records in `ns_id`, derived from the hash index.
+    /// Records whose TTL has passed are counted until they are swept.
     pub(crate) fn record_count(&self, ns_id: u32) -> Result<u64> {
         let ns = self.namespace(ns_id)?;
-        Ok(ns.record_count.load(Ordering::Acquire))
+        Ok(ns.index.len() as u64)
     }
 
     /// Force pending writes to disk.
@@ -969,7 +1376,7 @@ impl Engine {
         {
             let guard = self.namespaces.read();
             for (ns_id, ns) in guard.iter() {
-                live_records = live_records.saturating_add(ns.record_count.load(Ordering::Acquire));
+                live_records = live_records.saturating_add(ns.index.len() as u64);
                 if *ns_id != DEFAULT_NAMESPACE_ID {
                     named_namespace_count += 1;
                 }
@@ -1063,7 +1470,6 @@ impl Engine {
         for (ns_id, _) in &namespaces {
             let ns = self.namespace(*ns_id)?;
             ns.index.clear()?;
-            ns.record_count.store(0, Ordering::Release);
             if let Some(range_map) = ns.range_index.as_ref() {
                 clear_skipmap(range_map);
             }
@@ -1296,7 +1702,6 @@ impl Engine {
     pub(crate) fn clear_namespace(&self, ns_id: u32) -> Result<()> {
         let ns = self.namespace(ns_id)?;
         ns.index.clear()?;
-        ns.record_count.store(0, Ordering::Release);
         if let Some(range_map) = ns.range_index.as_ref() {
             clear_skipmap(range_map);
         }
@@ -1304,37 +1709,41 @@ impl Engine {
     }
 
     /// Range-scan a namespace's secondary index. Returns `(key, value)`
-    /// pairs sorted lexicographically by key. Requires the engine to
-    /// have been opened with `enable_range_scans(true)`.
+    /// pairs sorted lexicographically by key, skipping records that
+    /// are not live at `now_ms` (see [`is_live`]). Requires the engine
+    /// to have been opened with `enable_range_scans(true)`.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidConfig`] if range scans were not enabled
     /// at open time.
-    pub(crate) fn range_scan<R>(&self, ns_id: u32, range: R) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
+    pub(crate) fn range_scan<R>(
+        &self,
+        ns_id: u32,
+        range: R,
+        now_ms: u64,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
     where
         R: RangeBounds<Vec<u8>>,
     {
-        let ns = self.namespace(ns_id)?;
-        let range_map = ns.range_index.as_ref().ok_or(Error::InvalidConfig(
-            "range scans not enabled; pass `EmdbBuilder::enable_range_scans(true)` at open time",
-        ))?;
-
-        // Snapshot (key, offset) pairs via the lock-free SkipMap
-        // iterator. No global lock is held; concurrent inserts
-        // continue to advance against the same skiplist while we
-        // scan.
-        let pairs: Vec<(Vec<u8>, u64)> = skipmap_range_snapshot(range_map, &range);
-
-        // Now resolve each offset to its value via the mmap. Using
-        // `read_value_at` keeps the encryption-aware decode path.
-        let mut out = Vec::with_capacity(pairs.len());
-        for (key, offset) in pairs {
-            if let Some((value, _expires)) = self.read_value_at(offset, &key)? {
-                out.push((key, value));
+        let mut cursor = self.range_cursor(ns_id, range)?;
+        let mut page = VecDeque::new();
+        let mut out = Vec::new();
+        loop {
+            cursor.fill(&mut page, 256);
+            if page.is_empty() {
+                return Ok(out);
+            }
+            for (key, offset) in page.drain(..) {
+                if let Some((value, expires_at)) =
+                    self.read_value_with_meta_at(ns_id, offset, &key)?
+                {
+                    if is_live(expires_at, now_ms) {
+                        out.push((key, value));
+                    }
+                }
             }
         }
-        Ok(out)
     }
 
     /// Snapshot the live record offsets in `ns_id`, sorted ascending.
@@ -1347,16 +1756,13 @@ impl Engine {
         Ok(offsets)
     }
 
-    /// Snapshot the (key, offset) pairs in a `range` query via the
-    /// lock-free SkipMap iterator. Used by lazy range iterators so
-    /// no lock is held across the caller's iteration. The keys are
-    /// cloned out of the skiplist (cheap relative to value reads);
-    /// offsets are looked up in the mmap on each `next()`.
-    pub(crate) fn snapshot_range_offsets<R>(
-        &self,
-        ns_id: u32,
-        range: R,
-    ) -> Result<Vec<(Vec<u8>, u64)>>
+    /// Open a lazy cursor over `range` in `ns_id`'s secondary index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] if range scans were not enabled
+    /// at open time.
+    pub(crate) fn range_cursor<R>(&self, ns_id: u32, range: R) -> Result<RangeCursor>
     where
         R: RangeBounds<Vec<u8>>,
     {
@@ -1364,57 +1770,49 @@ impl Engine {
         let range_map = ns.range_index.as_ref().ok_or(Error::InvalidConfig(
             "range scans not enabled; pass `EmdbBuilder::enable_range_scans(true)` at open time",
         ))?;
-
-        Ok(skipmap_range_snapshot(range_map, &range))
+        Ok(RangeCursor {
+            map: Arc::clone(range_map),
+            next: owned_bound(range.start_bound()),
+            end: owned_bound(range.end_bound()),
+            done: false,
+        })
     }
 
-    /// Decode a single record at `offset` into an owned tuple. Used by
-    /// the lazy iterator's `next()`. Returns `Ok(None)` when the
-    /// record is no longer a live `Insert` (overwritten in place,
-    /// tombstoned, or unrelated record kind at the offset).
-    pub(crate) fn decode_owned_at(&self, offset: u64) -> Result<Option<RecordSnapshot>> {
-        let mmap = self.store.mmap_covering(offset + 1)?;
-        let bytes: &[u8] = &mmap;
-        let payload = match format::payload_at(bytes, offset as usize) {
-            Ok(p) => p,
-            Err(_) => return Ok(None),
-        };
-
-        #[cfg(feature = "encrypt")]
-        if let Some(ctx) = self.encryption.as_ref() {
-            let ctx = Arc::clone(ctx);
-            let owned = format::decode_payload_encrypted(payload, |nonce, ct| {
-                let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
-                input.extend_from_slice(nonce);
-                input.extend_from_slice(ct);
-                ctx.decrypt(&input)
-            })?;
-            return Ok(match owned {
-                OwnedRecord::Insert {
-                    key,
-                    value,
-                    expires_at,
-                    ..
-                } => Some((key, value, expires_at)),
-                _ => None,
-            });
-        }
-
-        Self::decode_plaintext_into_triple(payload)
+    /// Decode the record at `offset` into an owned `(key, value,
+    /// expires_at)` tuple. Used by the lazy iterator's `next()`.
+    /// Returns `Ok(None)` when the offset does not hold an `Insert`
+    /// of `ns_id`.
+    pub(crate) fn decode_owned_at(
+        &self,
+        ns_id: u32,
+        offset: u64,
+    ) -> Result<Option<RecordSnapshot>> {
+        let guard = epoch::pin();
+        Ok(self
+            .decode_insert_at(ns_id, offset, &guard)?
+            .map(Decoded::into_triple))
     }
 
-    /// Read just the value at `offset`, validating the on-disk key
-    /// matches `expected_key`. Returns `Ok(None)` if the record was
-    /// overwritten by a later record with a different key (hash
-    /// collision repaired) or is no longer an `Insert`. Used by
-    /// lazy range iterators that already know the key from the
-    /// `SkipMap` snapshot.
+    /// Decode only the key and expiry of the record at `offset`. Used
+    /// by key iterators so values are never copied.
+    pub(crate) fn decode_key_at(&self, ns_id: u32, offset: u64) -> Result<Option<(Vec<u8>, u64)>> {
+        let guard = epoch::pin();
+        Ok(self
+            .decode_insert_at(ns_id, offset, &guard)?
+            .map(|record| (record.key().to_vec(), record.expires_at())))
+    }
+
+    /// Read just the value at `offset`, validating that the record is
+    /// an `Insert` of `expected_key` in `ns_id`. Used by range
+    /// iterators that already know the key from the skiplist.
     pub(crate) fn read_value_with_meta_at(
         &self,
+        ns_id: u32,
         offset: u64,
         expected_key: &[u8],
     ) -> Result<Option<(Vec<u8>, u64)>> {
-        self.read_value_at(offset, expected_key)
+        let guard = epoch::pin();
+        self.read_value_at(ns_id, offset, expected_key, &guard)
     }
 
     /// Materialise every live record in `ns_id` as `(key, value, expires_at)`.
@@ -1565,29 +1963,6 @@ impl Engine {
     }
 }
 
-/// Snapshot the `(key, offset)` entries of a `SkipMap` falling inside
-/// `bounds` into an owned `Vec`. The skiplist iterator is lock-free,
-/// so this lets callers materialise a stable view without holding any
-/// lock while they walk the mmap for value bytes.
-fn skipmap_range_snapshot<R>(map: &SkipMap<Vec<u8>, u64>, bounds: &R) -> Vec<(Vec<u8>, u64)>
-where
-    R: RangeBounds<Vec<u8>>,
-{
-    let start = match bounds.start_bound() {
-        Bound::Included(v) => Bound::Included(v.as_slice()),
-        Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
-        Bound::Unbounded => Bound::Unbounded,
-    };
-    let end = match bounds.end_bound() {
-        Bound::Included(v) => Bound::Included(v.as_slice()),
-        Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
-        Bound::Unbounded => Bound::Unbounded,
-    };
-    map.range::<[u8], _>((start, end))
-        .map(|entry| (entry.key().clone(), *entry.value()))
-        .collect()
-}
-
 /// Drop every entry in `map`. crossbeam-skiplist's `SkipMap` has no
 /// in-place `clear`; we walk the entries and remove them. Callers
 /// must serialise this with concurrent writers themselves — the
@@ -1618,11 +1993,4 @@ fn compaction_temp_path(path: &std::path::Path) -> std::path::PathBuf {
         .unwrap_or("emdb");
     out.set_file_name(format!("{original_name}.compact.tmp"));
     out
-}
-
-// Suppress unused warning for the import on builds where neither encrypt
-// branch references Mmap directly.
-#[allow(dead_code)]
-fn _mmap_type_anchor() -> Option<Arc<Mmap>> {
-    None
 }

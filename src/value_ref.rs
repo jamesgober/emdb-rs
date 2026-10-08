@@ -73,11 +73,10 @@ enum Repr {
         range: std::ops::Range<usize>,
     },
     /// Bytes were produced by an AEAD decrypt or otherwise
-    /// allocated; we own the `Vec` directly. Only constructed on
-    /// builds with the `encrypt` feature, but the variant exists
-    /// unconditionally so the rest of the type signature stays
-    /// stable across feature combinations.
-    #[allow(dead_code)]
+    /// allocated; we own the `Vec` directly. Only constructed at run
+    /// time by encrypted databases, but the variant exists
+    /// unconditionally so the type is the same across feature
+    /// combinations.
     Owned(Vec<u8>),
 }
 
@@ -93,7 +92,6 @@ impl ValueRef {
     /// Construct an owned reference. Used by the encrypted-database
     /// path (where the AEAD decrypt produces fresh plaintext bytes)
     /// and by unit tests.
-    #[allow(dead_code)]
     pub(crate) fn from_owned(bytes: Vec<u8>) -> Self {
         Self {
             repr: Repr::Owned(bytes),
