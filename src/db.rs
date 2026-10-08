@@ -47,29 +47,13 @@ pub(crate) struct Inner {
     #[cfg(feature = "ttl")]
     pub(crate) default_ttl: Option<Duration>,
     _lock_file: LockFile,
-    /// When true, the on-disk file (and its sidecars) are removed when
-    /// the last handle drops. Set by [`Emdb::open_in_memory`].
-    ephemeral: bool,
-    /// Private temp directory of an ephemeral database. Declared last
-    /// so it drops after the engine and the lock file: removing the
-    /// directory then takes every file emdb wrote into it.
+    /// Private temp directory of an ephemeral database
+    /// ([`Emdb::open_in_memory`]). Declared last so it drops after the
+    /// engine (whose store flushes and unmaps the file) and the lock
+    /// file: removing the directory then takes every file emdb wrote
+    /// into it, the data file and all its sidecars, while nothing
+    /// holds them any more.
     _ephemeral_dir: Option<crate::data_dir::EphemeralDir>,
-}
-
-impl Drop for Inner {
-    fn drop(&mut self) {
-        if self.ephemeral {
-            // Best-effort cleanup of the temp files backing an
-            // `open_in_memory` handle: `Drop` cannot report failures,
-            // and a leftover file in the temp directory is harmless.
-            let path = &self.path;
-            let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_file(crate::storage::meta::meta_path_for(path));
-            let mut lock = path.as_os_str().to_owned();
-            lock.push(".lock");
-            let _ = std::fs::remove_file(lock);
-        }
-    }
 }
 
 impl Clone for Emdb {
@@ -153,11 +137,11 @@ impl Emdb {
         // inside a fresh owner-only directory under the OS temp
         // directory, removed (directory and all) when the last handle
         // drops.
-        let (path, ephemeral, ephemeral_dir) = match path {
-            Some(p) => (p, false, None),
+        let (path, ephemeral_dir) = match path {
+            Some(p) => (p, None),
             None => {
                 let (p, dir) = crate::data_dir::ephemeral_database_path()?;
-                (p, true, Some(dir))
+                (p, Some(dir))
             }
         };
 
@@ -198,7 +182,6 @@ impl Emdb {
                 #[cfg(feature = "ttl")]
                 default_ttl: builder.default_ttl,
                 _lock_file: lock_file,
-                ephemeral,
                 _ephemeral_dir: ephemeral_dir,
             }),
         };
