@@ -50,6 +50,10 @@ pub(crate) struct Inner {
     /// When true, the on-disk file (and its sidecars) are removed when
     /// the last handle drops. Set by [`Emdb::open_in_memory`].
     ephemeral: bool,
+    /// Private temp directory of an ephemeral database. Declared last
+    /// so it drops after the engine and the lock file: removing the
+    /// directory then takes every file emdb wrote into it.
+    _ephemeral_dir: Option<crate::data_dir::EphemeralDir>,
 }
 
 impl Drop for Inner {
@@ -83,11 +87,15 @@ impl Emdb {
         EmdbBuilder::new().path(path.as_ref().to_path_buf()).build()
     }
 
-    /// Open an ephemeral database. The handle is backed by a unique
-    /// temp-file path that is removed when the last clone drops. Useful
-    /// for tests, REPLs, and anywhere a disposable in-memory-shaped
-    /// store is wanted; behaviour is identical to [`Emdb::open`] except
-    /// for the ephemeral cleanup.
+    /// Open an ephemeral database. Despite the name, the data is not
+    /// held only in memory: the handle is backed by a real database
+    /// file inside a fresh owner-only directory (mode `0o700` on Unix)
+    /// under the OS temp directory, and that directory is removed when
+    /// the last clone drops. Records are written to that file (and may
+    /// reach swap or disk) like any other database, so do not treat it
+    /// as a place for secrets that must never touch storage. Useful for
+    /// tests, REPLs, and anywhere a disposable store is wanted;
+    /// behaviour is otherwise identical to [`Emdb::open`].
     ///
     /// Panics if the temp directory is unwritable — this method is for
     /// tests/dev convenience and is not appropriate for production
@@ -133,42 +141,29 @@ impl Emdb {
             )?);
         }
 
-        // No path supplied at all → ephemeral mode. Synthesise a
-        // unique tempfile path and mark the resulting handle
-        // ephemeral so the file is removed on Drop.
-        //
-        // Uniqueness sources: a process-global atomic counter (every
-        // call inside one process gets a distinct value), the OS
-        // process id (distinguishes concurrent processes — e.g. two
-        // cargo test workers, or two doctest executables running side
-        // by side), the system nanosecond clock (cosmetic — helps
-        // debugging by sorting paths chronologically), and the
-        // current thread id (further entropy for forensics). The
-        // counter alone is sufficient for in-process uniqueness;
-        // including pid + nanos + tid is belt-and-suspenders so the
-        // path is unique across the whole machine even under heavy
-        // parallel test workloads.
-        let (path, ephemeral) = match path {
-            Some(p) => (p, false),
+        // No path supplied at all → ephemeral mode: a database file
+        // inside a fresh owner-only directory under the OS temp
+        // directory, removed (directory and all) when the last handle
+        // drops.
+        let (path, ephemeral, ephemeral_dir) = match path {
+            Some(p) => (p, false, None),
             None => {
-                use core::sync::atomic::{AtomicU64, Ordering};
-                static MEMORY_COUNTER: AtomicU64 = AtomicU64::new(0);
-                let counter = MEMORY_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let pid = std::process::id();
-                let mut p = std::env::temp_dir();
-                let nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0_u128, |d| d.as_nanos());
-                let tid = std::thread::current().id();
-                p.push(format!("emdb-mem-{pid}-{counter}-{nanos}-{tid:?}.emdb"));
-                (p, true)
+                let (p, dir) = crate::data_dir::ephemeral_database_path()?;
+                (p, true, Some(dir))
             }
         };
 
-        let lock_file = LockFile::acquire(path.as_path())?;
+        // Lock, meta and journal paths derive from the canonical path,
+        // so opening the same file through a symbolic link contends
+        // for the same lock.
+        let engine_path = crate::data_dir::canonical_database_path(&path)?;
+        let lock_file = LockFile::acquire(&engine_path)?;
+        // Create a missing database file owner-only before fsys opens
+        // it with "create if missing" and default permissions.
+        let _created = crate::private_fs::create_private_file(&engine_path)?;
 
         let engine_config = EngineConfig {
-            path: path.clone(),
+            path: engine_path,
             flags: 0,
             enable_range_scans: builder.enable_range_scans,
             flush_policy: builder.flush_policy,
@@ -190,6 +185,7 @@ impl Emdb {
                 default_ttl: builder.default_ttl,
                 _lock_file: lock_file,
                 ephemeral,
+                _ephemeral_dir: ephemeral_dir,
             }),
         };
 
@@ -691,12 +687,15 @@ impl Emdb {
     /// Read the metadata of whoever currently holds the advisory
     /// lock on `path`, without trying to acquire the lock.
     ///
-    /// Returns `Ok(None)` when no `.lock` sidecar exists at
-    /// `<path>.lock` (the database is unlocked). Returns
-    /// `Ok(Some(holder))` when the sidecar is present and its body
-    /// is well-formed — typically because some emdb instance is
-    /// either currently using the database or died with the lock
-    /// held.
+    /// Reads the `<path>.lock-meta` holder file (at most 4 KiB), which
+    /// a holder writes after taking the lock and removes when it
+    /// closes. The `<path>.lock` file itself stays in place between
+    /// opens. Returns `Ok(None)` when no holder file exists (the
+    /// database is unlocked). Returns `Ok(Some(holder))` when the
+    /// holder file is present and well-formed, typically because
+    /// some emdb instance is either currently using the database or
+    /// died with the lock held. Symbolic links in `path` are resolved,
+    /// so any name for the database reports the same holder.
     ///
     /// This is the diagnostic precondition for [`Self::break_lock`]:
     /// read the holder, confirm via OS tooling (`ps`, `Get-Process`,
@@ -712,8 +711,10 @@ impl Emdb {
         crate::lockfile::LockFile::read_holder(path.as_ref())
     }
 
-    /// Forcibly remove a stuck `<path>.lock` sidecar so a fresh
-    /// [`Self::open`] can succeed.
+    /// Forcibly remove the `<path>.lock` and `<path>.lock-meta`
+    /// sidecars. Normally not needed: the OS releases the advisory lock
+    /// when the holding process exits, and the leftover lock file is
+    /// reused by the next open.
     ///
     /// # Safety contract (read carefully)
     ///

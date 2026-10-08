@@ -51,8 +51,11 @@ concurrently.
 
 - `Error::Io` — filesystem error (permission denied, disk full,
   unreachable parent directory).
-- `Error::AlreadyLocked` — another process holds the lock. See
+- `Error::LockBusy { path }`: another process (or another handle in
+  this process) holds the lock. See
   [Lockfile recovery](#lockfile-recovery) for diagnosis.
+- `Error::LockfileError(io)`: the lock file could not be opened or
+  locked for another reason.
 - `Error::MagicMismatch` / `Error::VersionMismatch` /
   `Error::Corrupted` — the file exists but is not a valid
   emdb v0.9+/v1.x database.
@@ -884,7 +887,15 @@ See [Construction](#construction). On-disk path.
 When a process holding the database lock dies without releasing
 (SIGKILL, panic during destructor, OOM kill), the lockfile
 remains and subsequent `Emdb::open` calls fail with
-`Error::AlreadyLocked`.
+`Error::LockBusy`.
+
+Since 1.0.3 the `<path>.lock` file is created owner-only and is left
+in place when a handle closes (only the `<path>.lock-meta` holder
+file is removed). The lock itself is the OS advisory lock on that
+file, which the OS releases when the holding process exits, so a
+leftover `<path>.lock` file does not block the next open. The lock
+path is derived from the canonical database path, so opening the
+same file through a symbolic link contends for the same lock.
 
 ### `Emdb::lock_holder(path) -> Result<Option<LockHolder>>`
 
@@ -935,7 +946,23 @@ let db = Emdb::open(path)?;
 
 emdb supports at-rest encryption via AES-256-GCM (default) or
 ChaCha20-Poly1305. Keys can be supplied raw (32 bytes) or derived
-from a passphrase via Argon2id.
+from a passphrase via Argon2id (19 MiB, 2 iterations, 1 lane; fixed).
+
+What it protects: the contents of every record (keys, values, TTLs,
+namespace names) against someone who reads the file. Each record is
+authenticated on its own. What it does not protect: the log as a
+whole. Someone who can write the file can delete, reorder or replay
+whole records, or roll the file back to an older copy, without
+detection. Record sizes, counts and order, the meta sidecar fields
+and the lock holder's PID are visible. Nonces are random 96-bit
+values: plan to rotate the key well before 2^32 total writes under
+it. See [ARCHITECTURE.md](ARCHITECTURE.md#encryption) for details.
+
+A keyed open only adopts a database that has no records yet. A
+non-empty plaintext database must be converted with
+`Emdb::enable_encryption` first; a keyed open of it returns
+`Error::InvalidConfig` and leaves it untouched. `EmdbBuilder`'s
+`Debug` output never shows the key or passphrase.
 
 ### `EmdbBuilder::encryption_key(key)`
 
@@ -1390,9 +1417,9 @@ pub enum EncryptionInput {
 
 Used by the static encryption-admin methods
 (`Emdb::enable_encryption`, `Emdb::disable_encryption`,
-`Emdb::rotate_encryption_key`).
-
-Used by the static encryption-admin methods.
+`Emdb::rotate_encryption_key`). Its `Debug` output is redacted
+(`Key(<redacted>)`, `Passphrase(<redacted>)`); the value itself is
+owned by the caller, who should wipe it after use.
 
 ---
 
@@ -1404,13 +1431,17 @@ handle in production code:
 | Variant | When | Recovery |
 |---|---|---|
 | `Io(io::Error)` | Filesystem error (disk full, permission denied, etc.). | Inspect the inner `io::Error`. |
-| `AlreadyLocked` | `Emdb::open` saw a held lock. | See [Lockfile recovery](#lockfile-recovery). |
+| `LockBusy { path }` | `Emdb::open` saw a held lock. | See [Lockfile recovery](#lockfile-recovery). |
+| `LockfileError(io::Error)` | The lock file could not be opened or locked for another reason. | Inspect the inner `io::Error`. |
 | `MagicMismatch` | File at the path is not an emdb v0.9+/v1.x database. | Confirm the path. v0.7/v0.8 files are not compatible with v0.9+/v1.x. |
 | `VersionMismatch { found, expected }` | File version doesn't match this emdb release. | Migrate via the previous emdb release. |
-| `Corrupted { offset, reason }` | Frame validation or CRC mismatch. | Restore from backup. fsys's frame format is CRC-32C protected; this fires on hardware-level corruption or external tampering. |
-| `InvalidConfig(reason)` | Builder configuration was inconsistent. | Fix the builder call site. |
-| `KeyNotFound` | A method that requires the key (e.g., `expires_at` on a missing key) didn't find it. Most "lookup" APIs return `Ok(None)` instead. | Application logic. |
-| `EncryptionError(reason)` | AEAD decryption failed (wrong key, tampered ciphertext). | Verify the key. |
+| `Corrupted { offset, reason }` | A record failed validation: a malformed body, a record that references an unbound namespace id, a plaintext record in an encrypted database, or (in an encrypted database whose key verified) a record whose AEAD tag fails. | Restore from backup. This fires on hardware-level corruption or on modification of the file. |
+| `InvalidConfig(reason)` | Builder configuration was inconsistent, or the file does not match the open mode (for example a keyed open of an existing plaintext database, or a plain open of an encrypted one). | Fix the builder call site; convert with `Emdb::enable_encryption` / `disable_encryption`. |
+| `FeatureMismatch { file_flags, build_flags }` | The file needs a feature this build lacks. | Rebuild with the feature. |
+| `InvalidPath` | A nested-key API got an empty prefix (`nested` feature). | Pass a non-empty prefix. |
+| `TtlOverflow` | A TTL pushed the expiry past the representable time range (`ttl` feature). | Use a shorter TTL. |
+| `Encryption(reason)` | Encryption machinery failed: malformed verification block, AEAD failure while encrypting, or the OS random number generator failed (`encrypt` feature). | Treat the database or the build as broken; not fixed by another key. |
+| `EncryptionKeyMismatch` | The supplied key or passphrase does not decrypt the verification block in `<path>.meta` (`encrypt` feature). | Supply the right key. |
 
 `Result<T>` is `std::result::Result<T, emdb::Error>`.
 
@@ -1420,9 +1451,9 @@ use emdb::{Emdb, Error};
 fn open_or_recover(path: &str) -> emdb::Result<Emdb> {
     match Emdb::open(path) {
         Ok(db) => Ok(db),
-        Err(Error::AlreadyLocked) => {
-            // Diagnose; potentially break_lock; retry.
-            Err(Error::AlreadyLocked)
+        Err(err @ Error::LockBusy { .. }) => {
+            // Diagnose with Emdb::lock_holder; potentially break_lock; retry.
+            Err(err)
         }
         Err(e) => Err(e),
     }

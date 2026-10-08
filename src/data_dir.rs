@@ -35,7 +35,7 @@
 //! `<root>/<app_name>/<database_name>`. Both the app subdirectory and
 //! the database file are created on demand by the builder.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use crate::{Error, Result};
 
@@ -193,24 +193,49 @@ pub(crate) fn resolve_database_path(
     validate_path_component(file, "database_name")?;
 
     let dir = root.join(app);
-    // Create the app subdirectory. `create_dir_all` is the idempotent
-    // variant — already-exists is fine. Anything else surfaces.
-    std::fs::create_dir_all(&dir).map_err(Error::from)?;
+    // Create the app subdirectory (owner-only on Unix). Already-exists
+    // is fine; anything else surfaces.
+    crate::private_fs::create_private_dir_all(&dir).map_err(Error::from)?;
 
     Ok(dir.join(file))
 }
 
+/// Windows device names. Opening `NUL`, `CON`, `COM1`, ... (with or
+/// without an extension) reaches the device instead of a file.
+const WINDOWS_RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// True when `name` is a Windows device name, ignoring case, an
+/// extension (`nul.emdb`) and trailing spaces before it.
+fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    WINDOWS_RESERVED_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(stem))
+}
+
 /// Validate a single path component used as either `app_name` or
-/// `database_name`. The check is intentionally conservative — every
-/// path separator (`/` or `\`), every `..` component, and the empty
-/// string are rejected so the resolved path can never escape the data
-/// root and so behaviour is identical on every platform.
+/// `database_name`. The check is intentionally conservative and
+/// identical on every platform, so the resolved path can never escape
+/// the data root and a name that is safe on one OS is safe on all:
+///
+/// - path separators (`/`, `\`) are rejected;
+/// - `:` is rejected (on Windows `C:name` is a drive-relative path
+///   that ignores the data root, and `name:stream` addresses an NTFS
+///   alternate data stream);
+/// - `.`, `..` and any name made only of dots are rejected, as are
+///   names ending in `.` or a space (Windows strips those, so `app.`
+///   and `app` would name the same directory);
+/// - Windows device names (`CON`, `NUL`, `COM1`, `LPT1`, ... with or
+///   without an extension) are rejected;
+/// - control characters are rejected;
+/// - what remains must parse as exactly one normal path component.
 ///
 /// Callers that want nested folders should pre-compose them with
 /// [`crate::EmdbBuilder::data_root`] (their own platform-side join
 /// logic), or pick a single dash-joined name like `"hivedb-kv"`.
-/// Multi-segment `app_name` is intentionally not supported — keeping
-/// validation trivial and dodging Windows backslash translation.
 fn validate_path_component(value: &str, field: &'static str) -> Result<()> {
     if value.contains('/') || value.contains('\\') {
         return Err(Error::InvalidConfig(match field {
@@ -224,14 +249,201 @@ fn validate_path_component(value: &str, field: &'static str) -> Result<()> {
             _ => "path component must not contain path separators",
         }));
     }
-    if value == ".." || value.starts_with("../") || value.starts_with("..\\") {
+    if value.chars().all(|c| c == '.') {
         return Err(Error::InvalidConfig(match field {
-            "app_name" => "app_name must not contain ..",
-            "database_name" => "database_name must not contain ..",
-            _ => "path component must not contain ..",
+            "app_name" => "app_name must not be . or .. (or only dots)",
+            "database_name" => "database_name must not be . or .. (or only dots)",
+            _ => "path component must not be . or ..",
+        }));
+    }
+    if value.contains(':') {
+        return Err(Error::InvalidConfig(match field {
+            "app_name" => "app_name must not contain : (drive prefix or alternate data stream)",
+            "database_name" => {
+                "database_name must not contain : (drive prefix or alternate data stream)"
+            }
+            _ => "path component must not contain :",
+        }));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(Error::InvalidConfig(match field {
+            "app_name" => "app_name must not contain control characters",
+            "database_name" => "database_name must not contain control characters",
+            _ => "path component must not contain control characters",
+        }));
+    }
+    if value.ends_with('.') || value.ends_with(' ') {
+        return Err(Error::InvalidConfig(match field {
+            "app_name" => "app_name must not end with . or a space",
+            "database_name" => "database_name must not end with . or a space",
+            _ => "path component must not end with . or a space",
+        }));
+    }
+    if is_windows_reserved_name(value) {
+        return Err(Error::InvalidConfig(match field {
+            "app_name" => "app_name must not be a Windows device name (CON, NUL, COM1, LPT1, ...)",
+            "database_name" => {
+                "database_name must not be a Windows device name (CON, NUL, COM1, LPT1, ...)"
+            }
+            _ => "path component must not be a Windows device name",
+        }));
+    }
+    let mut components = Path::new(value).components();
+    let single_normal = matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    );
+    if !single_normal {
+        return Err(Error::InvalidConfig(match field {
+            "app_name" => "app_name must be a single plain file-system name",
+            "database_name" => "database_name must be a single plain file-system name",
+            _ => "path component must be a single plain file-system name",
         }));
     }
     Ok(())
+}
+
+/// Resolve the path used to derive a database's lock, meta and journal
+/// file names, following symbolic links so that two opens of the same
+/// file through different names share one lock.
+///
+/// - An existing path is canonicalized.
+/// - A path that does not exist yet is joined onto its canonicalized
+///   parent directory (the file itself is created later).
+/// - A dangling symbolic link is rejected: emdb would create the
+///   link's target while locking the link's name.
+/// - When even the parent cannot be canonicalized (it does not exist,
+///   or a component is unreadable) the path is returned unchanged so
+///   the open reports its own I/O error.
+///
+/// On Windows the `\\?\` prefix that `canonicalize` adds is dropped
+/// for ordinary drive paths, so error messages and sidecar names stay
+/// readable.
+///
+/// # Errors
+///
+/// [`Error::InvalidConfig`] for a dangling symbolic link.
+pub(crate) fn canonical_database_path(path: &Path) -> Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => return Ok(simplify_canonical(canonical)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Ok(path.to_path_buf()),
+    }
+    if std::fs::symlink_metadata(path).is_ok() {
+        // Something exists at `path`, but following it fails: a
+        // symbolic link whose target is missing.
+        return Err(Error::InvalidConfig(
+            "database path is a symbolic link whose target does not exist",
+        ));
+    }
+    let Some(file_name) = path.file_name() else {
+        return Ok(path.to_path_buf());
+    };
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    match std::fs::canonicalize(parent) {
+        Ok(dir) => Ok(simplify_canonical(dir).join(file_name)),
+        Err(_) => Ok(path.to_path_buf()),
+    }
+}
+
+/// Strip the verbatim `\\?\` prefix from a canonical Windows drive
+/// path when the plain form means the same file: the path is shorter
+/// than `MAX_PATH` and contains no device-name component. UNC and
+/// other verbatim forms are kept. Unix paths pass through unchanged.
+fn simplify_canonical(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        let mut comps = path.components();
+        if let Some(Component::Prefix(prefix)) = comps.next() {
+            if let Prefix::VerbatimDisk(letter) = prefix.kind() {
+                let rest: Vec<Component<'_>> = comps.collect();
+                let plain_safe = rest.iter().all(|c| match c {
+                    Component::RootDir => true,
+                    Component::Normal(name) => {
+                        name.to_str().is_some_and(|n| !is_windows_reserved_name(n))
+                    }
+                    _ => false,
+                });
+                if plain_safe {
+                    let mut out = PathBuf::from(format!("{}:\\", char::from(letter)));
+                    for c in rest {
+                        if let Component::Normal(name) = c {
+                            out.push(name);
+                        }
+                    }
+                    if out.as_os_str().len() < 260 {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    path
+}
+
+/// Owner of the private temporary directory behind an
+/// [`crate::Emdb::open_in_memory`] database. Dropping it removes the
+/// directory and everything emdb wrote into it (journal, meta and lock
+/// sidecars, compaction leftovers). It must drop after the engine and
+/// the lock file so no handle is still writing into the directory.
+#[derive(Debug)]
+pub(crate) struct EphemeralDir {
+    dir: PathBuf,
+}
+
+impl Drop for EphemeralDir {
+    fn drop(&mut self) {
+        // Best-effort: on Windows a file that a live `ValueRef` still
+        // maps cannot be deleted yet. The directory is owner-only and
+        // lives in the OS temp directory, so a leftover is cleaned up
+        // with the rest of the temp directory.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Create a fresh owner-only directory under the OS temp directory and
+/// return the database path inside it, plus the guard that removes the
+/// directory again.
+///
+/// The directory is created with `create_new` semantics (mode `0o700`
+/// on Unix), so it cannot be a directory or symbolic link another user
+/// planted in a shared `/tmp`, and nothing else can create files in it.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the temp directory is not writable.
+pub(crate) fn ephemeral_database_path() -> Result<(PathBuf, EphemeralDir)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MEMORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let pid = std::process::id();
+    let base = std::env::temp_dir();
+    let mut last_err = None;
+    // A collision needs another process with our pid and the same
+    // counter and clock values, or a name planted in advance; a few
+    // retries with fresh counter values cover both.
+    for _ in 0..16 {
+        let counter = MEMORY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_u128, |d| d.as_nanos());
+        let dir = base.join(format!("emdb-mem-{pid}-{counter}-{nanos}"));
+        match crate::private_fs::create_new_private_dir(&dir) {
+            Ok(()) => {
+                let path = dir.join("emdb-mem.emdb");
+                return Ok((path, EphemeralDir { dir }));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last_err = Some(err),
+            Err(err) => return Err(Error::from(err)),
+        }
+    }
+    Err(Error::from(last_err.unwrap_or_else(|| {
+        std::io::Error::other("could not create a unique temporary directory")
+    })))
 }
 
 #[cfg(test)]
@@ -306,6 +518,96 @@ mod tests {
     #[test]
     fn validate_rejects_dotdot() {
         assert!(validate_path_component("..", "app_name").is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_windows_escapes_and_aliases() {
+        for bad in [
+            ".",
+            "...",
+            "C:escaped",
+            "C:",
+            "x.emdb:ads",
+            "NUL",
+            "nul",
+            "nul.emdb",
+            "CON",
+            "Con .txt",
+            "PRN",
+            "AUX",
+            "COM1",
+            "com9.db",
+            "LPT1",
+            "app.",
+            "app ",
+            "tab\there",
+            "nul\u{0}byte",
+        ] {
+            assert!(
+                validate_path_component(bad, "database_name").is_err(),
+                "{bad:?} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_plain_names() {
+        for good in [
+            "emdb",
+            "hive-kv",
+            "core.emdb",
+            "v1.2.emdb",
+            ".hidden",
+            "COM10",
+            "console",
+            "nullable.db",
+            "LPT",
+            "a b",
+        ] {
+            assert!(
+                validate_path_component(good, "database_name").is_ok(),
+                "{good:?} rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonical_database_path_resolves_missing_file_against_parent() {
+        let root = temp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical = super::canonical_database_path(&root.join("db.emdb")).unwrap();
+        assert_eq!(canonical.file_name().unwrap(), "db.emdb");
+        assert!(canonical.is_absolute());
+        // Same answer once the file exists.
+        std::fs::write(root.join("db.emdb"), b"").unwrap();
+        let existing = super::canonical_database_path(&root.join("db.emdb")).unwrap();
+        assert_eq!(canonical, existing);
+        // A dotted detour resolves to the same path.
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let detour = root.join("sub").join("..").join("db.emdb");
+        assert_eq!(super::canonical_database_path(&detour).unwrap(), existing);
+        #[cfg(windows)]
+        assert!(!existing.to_string_lossy().starts_with(r"\\?\"));
+        let _removed = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_canonical_database_path_missing_parent_is_returned_unchanged() {
+        let missing = temp_root().join("no-such-dir").join("db.emdb");
+        assert_eq!(super::canonical_database_path(&missing).unwrap(), missing);
+    }
+
+    #[test]
+    fn test_ephemeral_database_path_is_unique_and_cleaned_up() {
+        let (p1, g1) = super::ephemeral_database_path().unwrap();
+        let (p2, g2) = super::ephemeral_database_path().unwrap();
+        assert_ne!(p1.parent(), p2.parent());
+        let dir = p1.parent().unwrap().to_path_buf();
+        assert!(dir.is_dir());
+        std::fs::write(&p1, b"data").unwrap();
+        drop(g1);
+        drop(g2);
+        assert!(!dir.exists());
     }
 
     #[test]

@@ -1,0 +1,44 @@
+[package]
+name = "emdb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+crc32c = "0.6"
+emdb = { path = "..", features = ["ttl", "nested", "encrypt"] }
+
+# Standalone workspace so the fuzz crate never joins the emdb build.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_payload"
+path = "fuzz_targets/decode_payload.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "meta_decode"
+path = "fuzz_targets/meta_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encrypted_frame"
+path = "fuzz_targets/encrypted_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "open_journal"
+path = "fuzz_targets/open_journal.rs"
+test = false
+doc = false

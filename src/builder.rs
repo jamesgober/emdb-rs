@@ -11,7 +11,10 @@ use crate::Emdb;
 use crate::Result;
 
 /// Builder for constructing an [`Emdb`].
-#[derive(Debug, Clone, Default)]
+///
+/// The `Debug` output shows whether an encryption key or passphrase is
+/// set but never their contents.
+#[derive(Clone, Default)]
 pub struct EmdbBuilder {
     pub(crate) path: Option<PathBuf>,
     #[cfg(feature = "ttl")]
@@ -32,9 +35,52 @@ pub struct EmdbBuilder {
     #[cfg(feature = "encrypt")]
     pub(crate) encryption_key: Option<crate::encryption::KeyBytes>,
     #[cfg(feature = "encrypt")]
-    pub(crate) encryption_passphrase: Option<String>,
+    pub(crate) encryption_passphrase: Option<crate::encryption::Passphrase>,
     #[cfg(feature = "encrypt")]
     pub(crate) cipher: Option<crate::encryption::Cipher>,
+}
+
+impl std::fmt::Debug for EmdbBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("EmdbBuilder");
+        let _ = s.field("path", &self.path);
+        #[cfg(feature = "ttl")]
+        {
+            let _ = s.field("default_ttl", &self.default_ttl);
+        }
+        let _ = s
+            .field("data_root", &self.data_root)
+            .field("app_name", &self.app_name)
+            .field("database_name", &self.database_name)
+            .field("enable_range_scans", &self.enable_range_scans)
+            .field("flush_policy", &self.flush_policy)
+            .field("iouring_sqpoll_idle_ms", &self.iouring_sqpoll_idle_ms);
+        #[cfg(feature = "encrypt")]
+        {
+            let _ = s
+                .field(
+                    "encryption_key",
+                    &self.encryption_key.as_ref().map(|_| Redacted),
+                )
+                .field(
+                    "encryption_passphrase",
+                    &self.encryption_passphrase.as_ref().map(|_| Redacted),
+                )
+                .field("cipher", &self.cipher);
+        }
+        s.finish()
+    }
+}
+
+/// Placeholder printed in place of secret material.
+#[cfg(feature = "encrypt")]
+struct Redacted;
+
+#[cfg(feature = "encrypt")]
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 impl EmdbBuilder {
@@ -165,10 +211,15 @@ impl EmdbBuilder {
 
     /// Enable encryption with a key derived from a UTF-8 passphrase
     /// via Argon2id. Mutually exclusive with [`Self::encryption_key`].
+    ///
+    /// The builder keeps the passphrase in a buffer that is wiped when
+    /// the builder (and every clone of it) drops. Passing a `String`
+    /// moves it in without a copy; passing a `&str` copies it, and the
+    /// caller's original is untouched.
     #[cfg(feature = "encrypt")]
     #[must_use]
     pub fn encryption_passphrase(mut self, passphrase: impl Into<String>) -> Self {
-        self.encryption_passphrase = Some(passphrase.into());
+        self.encryption_passphrase = Some(zeroize::Zeroizing::new(passphrase.into()));
         self
     }
 
@@ -224,6 +275,25 @@ mod tests {
                 let _ = std::fs::remove_file(parent.join(format!("{stem}.lock")));
             }
         }
+    }
+
+    #[cfg(feature = "encrypt")]
+    #[test]
+    fn test_builder_debug_redacts_key_and_passphrase() {
+        let with_key = EmdbBuilder::new().encryption_key([0xAB; 32]);
+        let rendered = format!("{with_key:?}");
+        assert!(
+            rendered.contains("encryption_key: Some(<redacted>)"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("171"), "{rendered}");
+        let with_pass = EmdbBuilder::new().encryption_passphrase("hunter2-super-secret");
+        let rendered = format!("{with_pass:#?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        let plain = format!("{:?}", EmdbBuilder::new().path("x.emdb"));
+        assert!(plain.contains("x.emdb"), "{plain}");
+        assert!(plain.contains("encryption_passphrase: None"), "{plain}");
     }
 
     #[test]

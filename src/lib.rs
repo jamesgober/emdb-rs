@@ -264,7 +264,6 @@ mod builder;
 mod data_dir;
 mod db;
 #[cfg(feature = "encrypt")]
-#[allow(dead_code)]
 mod encryption;
 #[cfg(feature = "encrypt")]
 mod encryption_admin;
@@ -273,6 +272,7 @@ mod lockfile;
 mod namespace;
 #[cfg(feature = "nested")]
 mod nested;
+mod private_fs;
 mod stats;
 mod storage;
 mod transaction;
@@ -295,3 +295,49 @@ pub use storage::FlushPolicy;
 pub use transaction::Transaction;
 pub use ttl::Ttl;
 pub use value_ref::ValueRef;
+
+/// Entry points for the cargo-fuzz targets in `fuzz/`. Compiled only
+/// under `--cfg fuzzing` (which cargo-fuzz sets), so it is not part of
+/// the public API of any normal build.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod __fuzz {
+    /// Plaintext payload decoder.
+    pub fn decode_payload(bytes: &[u8]) {
+        let _ = crate::storage::format::decode_payload(bytes);
+    }
+
+    /// Frame-length based payload slicing.
+    pub fn payload_at(bytes: &[u8], offset: usize) {
+        let _ = crate::storage::format::payload_at(bytes, offset);
+    }
+
+    /// Meta sidecar decoder; a decoded header must re-encode to an
+    /// equal header.
+    pub fn meta_decode(bytes: &[u8]) {
+        if let Ok(header) = crate::storage::meta::MetaHeader::decode(bytes) {
+            let encoded = header.encode();
+            let again = crate::storage::meta::MetaHeader::decode(&encoded).ok();
+            assert_eq!(again, Some(header), "meta header does not round-trip");
+        }
+    }
+
+    /// Encrypted payload decoder with a fixed key.
+    #[cfg(feature = "encrypt")]
+    pub fn decode_encrypted_with_fixed_key(bytes: &[u8]) {
+        let ctx = crate::encryption::EncryptionContext::from_key(&[7_u8; 32]);
+        let _ = crate::storage::format::decode_payload_encrypted(bytes, |nonce, ct| {
+            let mut input = nonce.to_vec();
+            input.extend_from_slice(ct);
+            ctx.decrypt(&input)
+        });
+    }
+
+    /// Encrypt `plain` under the fixed fuzz key (`nonce || ct || tag`)
+    /// so the post-AEAD body decoders are reachable.
+    #[cfg(feature = "encrypt")]
+    pub fn encrypt_fixed(plain: &[u8]) -> Vec<u8> {
+        let ctx = crate::encryption::EncryptionContext::from_key(&[7_u8; 32]);
+        ctx.encrypt(plain).unwrap_or_default()
+    }
+}

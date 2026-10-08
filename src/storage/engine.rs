@@ -85,7 +85,7 @@ pub(crate) type SharedEncryption = Option<Arc<crate::encryption::EncryptionConte
 pub(crate) type SharedEncryption = ();
 
 /// Configuration handed to [`Engine::open`] by the builder.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct EngineConfig {
     pub(crate) path: PathBuf,
     /// Feature-flag bitmap persisted in the file header.
@@ -114,9 +114,38 @@ pub(crate) struct EngineConfig {
     pub(crate) cipher: Option<crate::encryption::Cipher>,
     /// Argon2id-derived passphrase. The engine peeks the header for the
     /// salt, derives the key, and then proceeds as if `encryption_key`
-    /// were set.
+    /// were set. Wiped on drop.
     #[cfg(feature = "encrypt")]
-    pub(crate) encryption_passphrase: Option<String>,
+    pub(crate) encryption_passphrase: Option<crate::encryption::Passphrase>,
+}
+
+/// Hand-written so the key and passphrase never reach a log line.
+/// `Zeroizing<T>` forwards `Debug` to the wrapped bytes, so a derived
+/// impl would print the raw key.
+impl std::fmt::Debug for EngineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("EngineConfig");
+        let _ = s
+            .field("path", &self.path)
+            .field("flags", &self.flags)
+            .field("enable_range_scans", &self.enable_range_scans)
+            .field("flush_policy", &self.flush_policy)
+            .field("iouring_sqpoll_idle_ms", &self.iouring_sqpoll_idle_ms);
+        #[cfg(feature = "encrypt")]
+        {
+            let _ = s
+                .field(
+                    "encryption_key",
+                    &self.encryption_key.as_ref().map(|_| "<redacted>"),
+                )
+                .field("cipher", &self.cipher)
+                .field(
+                    "encryption_passphrase",
+                    &self.encryption_passphrase.as_ref().map(|_| "<redacted>"),
+                );
+        }
+        s.finish()
+    }
 }
 
 impl Default for EngineConfig {
@@ -291,7 +320,40 @@ impl Engine {
         // Peek the header (if the file exists) so we can read the salt
         // for passphrase mode and the cipher bit for both modes.
         let peeked = peek_header(&config.path)?;
-        let on_disk_cipher = peeked.map(|h| Self::cipher_from_flags(h.flags));
+        let keyed = config.encryption_key.is_some() || config.encryption_passphrase.is_some();
+        if !keyed {
+            // Unencrypted opens. If the file carries any encryption
+            // metadata, fail loudly instead of appending plaintext
+            // records to an encrypted log.
+            if let Some(header) = peeked {
+                if header.flags & FLAG_ENCRYPTED != 0
+                    || header.encryption_verify != [0_u8; meta::META_VERIFY_LEN]
+                {
+                    return Err(Error::InvalidConfig(
+                        "this database was created with at-rest encryption; supply encryption_key or encryption_passphrase",
+                    ));
+                }
+            }
+            return Ok((None, None, None));
+        }
+
+        // A keyed open initialises encryption only on a database that
+        // has no records yet. An existing database without a
+        // verification block is a plaintext database (or one whose
+        // meta sidecar was lost). Accepting it would mark it encrypted
+        // while its records stay plaintext, and every later open would
+        // have to trust unauthenticated records. Refuse before anything
+        // is written, so the database stays usable without a key.
+        let has_verify_block =
+            peeked.is_some_and(|h| h.encryption_verify != [0_u8; meta::META_VERIFY_LEN]);
+        if !has_verify_block && journal_has_bytes(&config.path)? {
+            return Err(Error::InvalidConfig(
+                "this database is not encrypted (it has records but no encryption metadata); open it without a key, or convert it first with Emdb::enable_encryption",
+            ));
+        }
+        let on_disk_cipher = peeked
+            .filter(|_| has_verify_block)
+            .map(|h| Self::cipher_from_flags(h.flags));
 
         // Cipher: explicit override OR on-disk cipher OR default. If
         // the user supplied an explicit choice that disagrees with the
@@ -309,7 +371,7 @@ impl Engine {
 
         if let Some(passphrase) = config.encryption_passphrase.as_ref() {
             let (salt, fresh) = match peeked {
-                Some(header) => {
+                Some(header) if has_verify_block => {
                     if header.encryption_salt == [0_u8; meta::META_SALT_LEN] {
                         return Err(Error::InvalidConfig(
                             "this database was created with a raw encryption_key; supply via encryption_key, not encryption_passphrase",
@@ -317,8 +379,10 @@ impl Engine {
                     }
                     (header.encryption_salt, None)
                 }
-                None => {
-                    let s = crate::encryption::random_salt();
+                // No verification block and no records: a new
+                // database. Generate the salt it will keep.
+                _ => {
+                    let s = crate::encryption::random_salt()?;
                     (s, Some(s))
                 }
             };
@@ -328,7 +392,7 @@ impl Engine {
 
         if let Some(key) = config.encryption_key.as_ref() {
             if let Some(header) = peeked {
-                if header.encryption_salt != [0_u8; meta::META_SALT_LEN] {
+                if has_verify_block && header.encryption_salt != [0_u8; meta::META_SALT_LEN] {
                     return Err(Error::InvalidConfig(
                         "this database was created with an encryption_passphrase; supply via encryption_passphrase, not encryption_key",
                     ));
@@ -341,14 +405,6 @@ impl Engine {
             return Ok((Some(key.clone()), None, cipher));
         }
 
-        // Unencrypted opens. If the file is encrypted, fail loudly.
-        if let Some(header) = peeked {
-            if header.flags & FLAG_ENCRYPTED != 0 {
-                return Err(Error::InvalidConfig(
-                    "this database was created with at-rest encryption; supply encryption_key or encryption_passphrase",
-                ));
-            }
-        }
         Ok((None, None, None))
     }
 
@@ -371,9 +427,18 @@ impl Engine {
         fresh_salt: Option<[u8; meta::META_SALT_LEN]>,
         existing_header: &MetaHeader,
     ) -> Result<()> {
-        // If the on-disk verify block is all-zero, we treat this as a
-        // fresh file and write a new verification block + salt.
+        // An all-zero verify block on a journal with no records is a
+        // fresh file: write a new verification block + salt. With
+        // records present it is a plaintext database, which a keyed
+        // open must not adopt (`resolve_encryption` already refuses
+        // this before the store opens; checked again here against the
+        // journal the store actually opened).
         if existing_header.encryption_verify == [0_u8; meta::META_VERIFY_LEN] {
+            if store.tail() != 0 {
+                return Err(Error::InvalidConfig(
+                    "this database is not encrypted (it has records but no encryption metadata); open it without a key, or convert it first with Emdb::enable_encryption",
+                ));
+            }
             let salt = fresh_salt.unwrap_or([0_u8; meta::META_SALT_LEN]);
             // Encrypt the well-known verification plaintext.
             let nonce_then_ct = ctx.encrypt(crate::encryption::VERIFICATION_PLAINTEXT)?;
@@ -427,6 +492,12 @@ impl Engine {
     /// Decode a single recovered payload (`[tag][body]`) and apply
     /// it to the in-memory index. Used exclusively by
     /// [`Self::recovery_scan`].
+    ///
+    /// In an encrypted database every record must carry the encrypted
+    /// flag. A plaintext record there was not written by emdb (the
+    /// engine encrypts every record once a key is set), so it is
+    /// rejected as [`Error::Corrupted`] instead of being applied
+    /// without authentication.
     fn apply_recovered_payload(&self, payload: &[u8], payload_start: u64) -> Result<()> {
         if payload.is_empty() {
             return Err(Error::Corrupted {
@@ -436,6 +507,14 @@ impl Engine {
         }
         let tag = payload[0];
         let encrypted = (tag & format::TAG_ENCRYPTED_FLAG) != 0;
+
+        #[cfg(feature = "encrypt")]
+        if !encrypted && self.encryption.is_some() {
+            return Err(Error::Corrupted {
+                offset: payload_start,
+                reason: "plaintext record in an encrypted database",
+            });
+        }
 
         let action = if encrypted {
             #[cfg(feature = "encrypt")]
@@ -453,7 +532,8 @@ impl Engine {
                     input.extend_from_slice(nonce);
                     input.extend_from_slice(ct);
                     ctx.decrypt(&input)
-                })?;
+                })
+                .map_err(|err| relocate_corruption(err, payload_start))?;
                 match owned {
                     OwnedRecord::Insert { ns_id, key, .. } => RecoveryAction::Insert { ns_id, key },
                     OwnedRecord::Remove { ns_id, key } => RecoveryAction::Remove { ns_id, key },
@@ -464,13 +544,14 @@ impl Engine {
             }
             #[cfg(not(feature = "encrypt"))]
             {
-                let _ = payload_start;
                 return Err(Error::InvalidConfig(
                     "encrypted record present but the `encrypt` feature is not compiled in",
                 ));
             }
         } else {
-            match format::decode_payload(payload)? {
+            match format::decode_payload(payload)
+                .map_err(|err| relocate_corruption(err, payload_start))?
+            {
                 RecordView::Insert { ns_id, key, .. } => RecoveryAction::Insert {
                     ns_id,
                     key: key.to_vec(),
@@ -489,10 +570,24 @@ impl Engine {
         self.apply_recovered_action(action, payload_start)
     }
 
+    /// Apply one decoded record during recovery.
+    ///
+    /// Namespace rules (every file emdb writes satisfies them, because
+    /// a `NamespaceName` record is appended before the first record of
+    /// a namespace and ids are never reused):
+    ///
+    /// - An `Insert` or `Remove` must target the default namespace or
+    ///   an id bound earlier in the log by a `NamespaceName` record.
+    ///   Anything else is [`Error::Corrupted`]. This stops a small
+    ///   crafted file from creating a namespace runtime (and its index
+    ///   allocation) for every id it mentions.
+    /// - A `NamespaceName` must bind a non-empty UTF-8 name to an id in
+    ///   `1..u32::MAX`, and must not rebind an id that is already bound
+    ///   to a different name.
     fn apply_recovered_action(&self, action: RecoveryAction, offset: u64) -> Result<()> {
         match action {
             RecoveryAction::Insert { ns_id, key } => {
-                let ns = self.ensure_namespace_runtime(ns_id)?;
+                let ns = self.recovered_namespace(ns_id, offset)?;
                 let key_hash = Index::hash_key(&key);
                 let prev = ns
                     .index
@@ -505,7 +600,7 @@ impl Engine {
                 }
             }
             RecoveryAction::Remove { ns_id, key } => {
-                let ns = self.ensure_namespace_runtime(ns_id)?;
+                let ns = self.recovered_namespace(ns_id, offset)?;
                 let key_hash = Index::hash_key(&key);
                 if ns.index.remove(key_hash, &key)?.is_some() {
                     let _ = ns.record_count.fetch_sub(1, Ordering::AcqRel);
@@ -515,11 +610,13 @@ impl Engine {
                 }
             }
             RecoveryAction::NamespaceName { ns_id, name } => {
-                if ns_id == DEFAULT_NAMESPACE_ID || name.is_empty() {
-                    // Defensive: the engine never emits a NamespaceName
-                    // for the default namespace. Skip if we somehow find
-                    // one (e.g., bit-flipped record that passed CRC).
-                    return Ok(());
+                if ns_id == DEFAULT_NAMESPACE_ID || ns_id == u32::MAX || name.is_empty() {
+                    // The engine never binds the default namespace, never
+                    // allocates u32::MAX and rejects empty names.
+                    return Err(Error::Corrupted {
+                        offset,
+                        reason: "namespace-name record with a reserved id or an empty name",
+                    });
                 }
                 let name_str = match std::str::from_utf8(&name) {
                     Ok(s) => s.to_string(),
@@ -530,21 +627,42 @@ impl Engine {
                         });
                     }
                 };
+                let mut name_guard = self.namespace_names.write();
+                // An id that already has a runtime was bound by an
+                // earlier record. Repeating the same binding is
+                // harmless; binding it to a different name is not
+                // something emdb ever writes.
+                let already_bound = self.namespaces.read().contains_key(&ns_id);
+                if already_bound && name_guard.get(name_str.as_str()) != Some(&ns_id) {
+                    return Err(Error::Corrupted {
+                        offset,
+                        reason: "namespace id bound to a second name",
+                    });
+                }
                 // Register the runtime if absent so subsequent inserts
                 // into this ns_id land in the right place. Then bind
                 // the name → id mapping.
                 let _ = self.ensure_namespace_runtime(ns_id)?;
-                let mut name_guard = self.namespace_names.write();
                 let _existing = name_guard.insert(name_str, ns_id);
                 drop(name_guard);
-                // Bump the id allocator past this id.
-                if ns_id as u64 >= self.next_namespace_id.load(Ordering::Acquire) {
-                    self.next_namespace_id
-                        .store(ns_id as u64 + 1, Ordering::Release);
-                }
             }
         }
         Ok(())
+    }
+
+    /// Runtime for a namespace referenced by a recovered `Insert` or
+    /// `Remove`. Only the default namespace and ids already bound by a
+    /// `NamespaceName` record have one; an unknown id means the log
+    /// was not written by emdb.
+    fn recovered_namespace(&self, ns_id: u32, offset: u64) -> Result<Arc<NamespaceRuntime>> {
+        self.namespaces
+            .read()
+            .get(&ns_id)
+            .map(Arc::clone)
+            .ok_or(Error::Corrupted {
+                offset,
+                reason: "record references a namespace id with no namespace-name binding",
+            })
     }
 
     /// Decode the key bytes of the record at `offset`. Used as a
@@ -585,6 +703,11 @@ impl Engine {
         })
     }
 
+    /// Create (or return) the runtime for a namespace id bound by a
+    /// recovered `NamespaceName` record, and move the id allocator
+    /// past it so a later [`Self::create_or_open_namespace`] cannot
+    /// reuse the id. Callers have already rejected id 0 and
+    /// `u32::MAX`, so `ns_id + 1` stays within `u32`.
     fn ensure_namespace_runtime(&self, ns_id: u32) -> Result<Arc<NamespaceRuntime>> {
         {
             let guard = self.namespaces.read();
@@ -597,11 +720,9 @@ impl Engine {
         let entry = guard
             .entry(ns_id)
             .or_insert_with(|| Arc::new(NamespaceRuntime::new(range_scans)));
-        // Bump next_namespace_id past whatever ns_id we just created so a
-        // fresh `create_or_open_namespace` call won't reuse it.
-        if ns_id as u64 >= self.next_namespace_id.load(Ordering::Acquire) {
-            self.next_namespace_id
-                .store(ns_id as u64 + 1, Ordering::Release);
+        let next = u64::from(ns_id) + 1;
+        if next > self.next_namespace_id.load(Ordering::Acquire) {
+            self.next_namespace_id.store(next, Ordering::Release);
         }
         Ok(Arc::clone(entry))
     }
@@ -1246,13 +1367,9 @@ impl Engine {
     fn encode_namespace_name_payload(&self, ns_id: u32, name: &[u8]) -> Result<Vec<u8>> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
-            let mut body = Vec::with_capacity(8 + name.len());
-            format::encode_namespace_name_body(&mut body, ns_id, name);
-            let nonce_then_ct = ctx.encrypt(&body)?;
-            let mut payload = Vec::with_capacity(1 + nonce_then_ct.len());
-            payload.push(format::TAG_NAMESPACE_NAME | format::TAG_ENCRYPTED_FLAG);
-            payload.extend_from_slice(&nonce_then_ct);
-            return Ok(payload);
+            return ctx.seal_record(format::TAG_NAMESPACE_NAME, |body| {
+                format::encode_namespace_name_body(body, ns_id, name);
+            });
         }
 
         let mut payload = Vec::with_capacity(1 + 8 + name.len());
@@ -1271,13 +1388,9 @@ impl Engine {
     ) -> Result<Vec<u8>> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
-            let mut body = Vec::with_capacity(20 + key.len() + value.len());
-            format::encode_insert_body(&mut body, ns_id, key, value, expires_at);
-            let nonce_then_ct = ctx.encrypt(&body)?;
-            let mut payload = Vec::with_capacity(1 + nonce_then_ct.len());
-            payload.push(format::TAG_INSERT | format::TAG_ENCRYPTED_FLAG);
-            payload.extend_from_slice(&nonce_then_ct);
-            return Ok(payload);
+            return ctx.seal_record(format::TAG_INSERT, |body| {
+                format::encode_insert_body(body, ns_id, key, value, expires_at);
+            });
         }
 
         let mut payload = Vec::with_capacity(1 + 20 + key.len() + value.len());
@@ -1499,7 +1612,23 @@ impl Engine {
         if let Some(id) = name_guard.get(name) {
             return Ok(*id);
         }
-        let id = self.next_namespace_id.fetch_add(1, Ordering::AcqRel) as u32;
+        // Every allocation (and the recovery-time bump in
+        // `ensure_namespace_runtime`) happens under the
+        // `namespace_names` write lock or before the engine is shared,
+        // so a plain load + store cannot race. Id 0 is the default
+        // namespace and u32::MAX is reserved, so a counter that would
+        // hand out either is exhausted rather than wrapped onto the
+        // default namespace.
+        let next = self.next_namespace_id.load(Ordering::Acquire);
+        let id = match u32::try_from(next) {
+            Ok(id) if id != DEFAULT_NAMESPACE_ID && id != u32::MAX => id,
+            _ => {
+                return Err(Error::InvalidConfig(
+                    "namespace id space exhausted; no more namespaces can be created in this database",
+                ));
+            }
+        };
+        self.next_namespace_id.store(next + 1, Ordering::Release);
         // Append the namespace-name binding record. Encrypted databases
         // route through the AEAD path; plaintext databases write the
         // body directly.
@@ -1520,14 +1649,10 @@ impl Engine {
     fn append_namespace_name(&self, ns_id: u32, name: &str) -> Result<u64> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
-            let mut payload = Vec::with_capacity(8 + name.len());
-            format::encode_namespace_name_body(&mut payload, ns_id, name.as_bytes());
-            let nonce_then_ct = ctx.encrypt(&payload)?;
-            return self.store.append_with(|buf| {
-                buf.push(format::TAG_NAMESPACE_NAME | format::TAG_ENCRYPTED_FLAG);
-                buf.extend_from_slice(&nonce_then_ct);
-                Ok(())
-            });
+            let payload = ctx.seal_record(format::TAG_NAMESPACE_NAME, |body| {
+                format::encode_namespace_name_body(body, ns_id, name.as_bytes());
+            })?;
+            return self.store.append(&payload);
         }
 
         self.store.append_with(|buf| {
@@ -1606,6 +1731,31 @@ fn clear_skipmap(map: &SkipMap<Vec<u8>, u64>) {
 /// opening the file with the right key.
 fn peek_header(path: &std::path::Path) -> Result<Option<MetaHeader>> {
     meta::read(path)
+}
+
+/// Rebase a decoder's `Corrupted` offset (relative to the record
+/// payload) onto the record's absolute file offset so the error points
+/// at the damaged record. Other errors pass through unchanged.
+fn relocate_corruption(err: Error, payload_start: u64) -> Error {
+    match err {
+        Error::Corrupted { offset, reason } => Error::Corrupted {
+            offset: payload_start.saturating_add(offset),
+            reason,
+        },
+        other => other,
+    }
+}
+
+/// True when the journal file at `path` exists and is not empty. fsys
+/// journals carry no file header and do not pre-allocate, so any byte
+/// means at least one record (or a torn first record) was written.
+#[cfg(feature = "encrypt")]
+fn journal_has_bytes(path: &std::path::Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(m) => Ok(m.len() != 0),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(Error::from(err)),
+    }
 }
 
 /// Sibling-file path used by [`Engine::compact_in_place`] as the
