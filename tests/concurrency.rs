@@ -459,6 +459,204 @@ fn test_range_iter_is_lazy_and_sees_keys_ahead_of_the_cursor() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// Compaction against concurrent writers, namespace drops and cursors.
+// ---------------------------------------------------------------------
+
+/// Wait for `workers` completion messages, failing (instead of hanging
+/// the test run) when one does not arrive in time.
+fn wait_all(done: &std::sync::mpsc::Receiver<&'static str>, workers: usize, what: &str) {
+    let deadline = std::time::Duration::from_secs(120);
+    for _ in 0..workers {
+        match done.recv_timeout(deadline) {
+            Ok(_) => {}
+            Err(err) => panic!("{what}: a worker did not finish ({err:?}); deadlock?"),
+        }
+    }
+}
+
+/// Every write takes the engine write gate shared exactly once. If
+/// `insert_many` (which delegates to the batch path) or a transaction
+/// commit took it a second time while holding it, a compaction queued
+/// for the gate in between would block the second acquisition forever
+/// (the gate is a fair lock) and this test would time out.
+#[test]
+fn test_batches_and_transactions_racing_compaction_do_not_deadlock() -> Result<()> {
+    let path = tmp_path("gate-once");
+    cleanup(&path);
+    let db = Arc::new(Emdb::open(&path)?);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<&'static str>();
+    let rounds = rounds(300) as u32;
+
+    let compactor = {
+        let (db, stop, done) = (Arc::clone(&db), Arc::clone(&stop), done_tx.clone());
+        thread::spawn(move || -> Result<()> {
+            while !stop.load(Ordering::Relaxed) {
+                db.compact()?;
+            }
+            let _ = done.send("compactor");
+            Ok(())
+        })
+    };
+    let workers: Vec<_> = (0..3_u32)
+        .map(|t| {
+            let (db, done) = (Arc::clone(&db), done_tx.clone());
+            thread::spawn(move || -> Result<()> {
+                for i in 0..rounds {
+                    db.insert_many((0..32_u32).map(|j| (format!("t{t}:b{j}"), format!("{i}"))))?;
+                    db.transaction(|tx| {
+                        tx.insert(format!("t{t}:tx"), format!("{i}"))?;
+                        let _ = tx.remove(format!("t{t}:b{}", i % 32))?;
+                        Ok(())
+                    })?;
+                    db.insert(format!("t{t}:single"), format!("{i}"))?;
+                    let _ = db.remove(format!("t{t}:gone"))?;
+                }
+                let _ = done.send("worker");
+                Ok(())
+            })
+        })
+        .collect();
+    wait_all(&done_rx, workers.len(), "writers racing compaction");
+    stop.store(true, Ordering::Relaxed);
+    wait_all(&done_rx, 1, "compactor");
+    join(compactor)?;
+    for worker in workers {
+        join(worker)?;
+    }
+
+    let last = format!("{}", rounds - 1);
+    let check = |db: &Emdb| -> Result<()> {
+        for t in 0..3_u32 {
+            assert_eq!(db.get(format!("t{t}:tx"))?, Some(last.clone().into_bytes()));
+            assert_eq!(
+                db.get(format!("t{t}:single"))?,
+                Some(last.clone().into_bytes())
+            );
+        }
+        Ok(())
+    };
+    check(&db)?;
+    db.flush()?;
+    drop(db);
+    let db = Emdb::open(&path)?;
+    check(&db)?;
+    drop(db);
+    cleanup(&path);
+    Ok(())
+}
+
+/// A write through a namespace handle looks the namespace up only
+/// after it holds the write gate, so it either lands before
+/// `drop_namespace` (and is tombstoned by it) or fails with the
+/// namespace gone. Nothing reaches the log after the unbind record,
+/// so the database reopens and the name stays dropped.
+#[test]
+fn test_writes_racing_drop_namespace_leave_a_clean_log() -> Result<()> {
+    for round in 0..rounds(20) {
+        let path = tmp_path(&format!("drop-race-{round}"));
+        cleanup(&path);
+        {
+            let db = Arc::new(Emdb::open(&path)?);
+            let ns = db.namespace("victim")?;
+            ns.insert("seed", "v")?;
+            let barrier = Arc::new(Barrier::new(3));
+            let writers: Vec<_> = (0..2_u32)
+                .map(|t| {
+                    let (ns, barrier) = (ns.clone(), Arc::clone(&barrier));
+                    thread::spawn(move || {
+                        let _ = barrier.wait();
+                        for i in 0_u32..20_000 {
+                            let key = format!("t{t}:{}", i % 64);
+                            let result = if i % 3 == 0 {
+                                ns.remove(key).map(|_| ())
+                            } else {
+                                ns.insert(key, "v")
+                            };
+                            if result.is_err() {
+                                return;
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let _ = barrier.wait();
+            thread::sleep(std::time::Duration::from_micros(200));
+            assert!(db.drop_namespace("victim")?);
+            for writer in writers {
+                join(writer);
+            }
+            db.flush()?;
+        }
+        let db = Emdb::open(&path)?;
+        assert_eq!(db.list_namespaces()?, vec![String::new()]);
+        let ns = db.namespace("victim")?;
+        assert_eq!(ns.len()?, 0, "dropped namespace came back with data");
+        drop(db);
+        cleanup(&path);
+    }
+    Ok(())
+}
+
+/// A range iterator that is part-way through when `compact()` runs
+/// keeps its place: the page it already holds resolves against the
+/// mapping pinned with it, and the next page re-attaches to the
+/// namespace's new skiplist after the last key it handed out. No key
+/// comes out twice or out of order, values are current, and records
+/// of other namespaces never appear.
+#[test]
+fn test_range_iter_continues_across_compaction() -> Result<()> {
+    let path = tmp_path("range-compact");
+    cleanup(&path);
+    let db = Emdb::builder()
+        .path(&path)
+        .enable_range_scans(true)
+        .build()?;
+    let ns = db.namespace("ns")?;
+    for i in 0..200_u32 {
+        let key = format!("k{i:03}");
+        db.insert(key.clone(), "default")?;
+        ns.insert(key.clone(), "v1")?;
+        ns.insert(key, "v2")?;
+    }
+    // Pages are 16 then 32 entries: 40 items consumed means the first
+    // 48 keys were fetched before the compaction.
+    let mut iter = ns.range_iter(b"k".to_vec()..b"l".to_vec())?;
+    let mut seen: Vec<(Vec<u8>, Vec<u8>)> = iter.by_ref().take(40).collect();
+    let _ = ns.remove("k100")?;
+    ns.insert("k150", "v3")?;
+    ns.insert("k005x", "behind")?;
+    db.compact()?;
+    seen.extend(iter);
+
+    for pair in seen.windows(2) {
+        assert!(pair[0].0 < pair[1].0, "keys out of order or repeated");
+    }
+    let keys: Vec<String> = seen
+        .iter()
+        .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
+        .collect();
+    assert!(!keys.contains(&"k100".to_string()), "removed key yielded");
+    assert!(
+        !keys.contains(&"k005x".to_string()),
+        "key behind the cursor yielded"
+    );
+    assert_eq!(keys.len(), 199);
+    for (key, value) in &seen {
+        let expected: &[u8] = if key == b"k150" { b"v3" } else { b"v2" };
+        assert_eq!(
+            value.as_slice(),
+            expected,
+            "{}",
+            String::from_utf8_lossy(key)
+        );
+    }
+    drop(db);
+    cleanup(&path);
+    Ok(())
+}
+
 #[cfg(feature = "ttl")]
 mod ttl {
     use super::*;
