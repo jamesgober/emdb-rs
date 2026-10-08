@@ -20,7 +20,8 @@
 //!
 //! - **Writes**: `fsys::JournalHandle` does lock-free LSN
 //!   reservation + concurrent `pwrite`. The hot append path holds
-//!   no mutex.
+//!   no mutex, except on Windows, where appends are serialised to
+//!   keep file extension in offset order (see `SERIALIZE_APPENDS`).
 //! - **Reads**: a read-only mapping of the journal file, published
 //!   through [`MmapCell`]. Hot-path readers borrow it under an epoch
 //!   guard ([`Store::mapped`]) without touching a reference count;
@@ -62,6 +63,24 @@ const FSYS_PRE_PAYLOAD_BYTES: u64 = 8;
 /// Number of trailing frame bytes after the payload (the CRC).
 const FSYS_POST_PAYLOAD_BYTES: u64 = 4;
 
+/// Whether journal appends are serialised so that file-extending
+/// writes reach the OS in offset order.
+///
+/// On NTFS a write that starts beyond the current end of valid data
+/// makes the file system zero-fill the gap below it synchronously, and
+/// the later write that fills the gap pays again. Concurrent appends
+/// reserve their offsets in one order and finish their writes in
+/// another, so every out-of-order pair hits this path: measured with
+/// plain `seek_write`, a single thread writing 72-byte records in
+/// pairs, second record first, drops from ~635 K to ~10 K writes/s,
+/// mapped or not, and 2 to 8 emdb writer threads collapsed to 9-20 K
+/// inserts/s. Taking a mutex around the reservation and the write
+/// keeps extensions in order. The sync for
+/// [`FlushPolicy::WriteThrough`] stays outside the lock, so group
+/// commit still coalesces fsyncs. Other platforms keep the lock-free
+/// append path.
+const SERIALIZE_APPENDS: bool = cfg!(windows);
+
 /// Storage substrate handle. Cheap-clone via `Arc`.
 ///
 /// Held inside an `Arc<Store>` by [`crate::storage::engine::Engine`];
@@ -102,6 +121,8 @@ pub(crate) struct Store {
     /// changes (verification block on first encrypted open;
     /// salt rotation on key rotation).
     meta: Arc<RwLock<MetaHeader>>,
+    /// Orders journal appends when [`SERIALIZE_APPENDS`] is set.
+    append_order: Mutex<()>,
 }
 
 impl std::fmt::Debug for Store {
@@ -215,6 +236,7 @@ impl Store {
             mmap_len: CachePadded::new(AtomicU64::new(mmap_len)),
             policy,
             meta: Arc::new(RwLock::new(meta)),
+            append_order: Mutex::new(()),
         })
     }
 
@@ -304,11 +326,13 @@ impl Store {
     /// on stable storage before this returns.
     pub(crate) fn append(&self, payload: &[u8]) -> Result<u64> {
         let payload_len = payload.len() as u64;
-        let end_lsn = self
-            .journal
-            .append(payload)
-            .map_err(|err| Error::Io(std::io::Error::other(format!("fsys append: {err}"))))?
-            .as_u64();
+        let end_lsn = {
+            let _ordered = SERIALIZE_APPENDS.then(|| self.append_order.lock());
+            self.journal
+                .append(payload)
+                .map_err(|err| Error::Io(std::io::Error::other(format!("fsys append: {err}"))))?
+                .as_u64()
+        };
         let payload_start = end_lsn - FSYS_POST_PAYLOAD_BYTES - payload_len;
 
         // The mmap is *not* refreshed here. Writes stay on the
@@ -383,11 +407,15 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let end_lsn = self
-            .journal
-            .append_batch(&payloads)
-            .map_err(|err| Error::Io(std::io::Error::other(format!("fsys append_batch: {err}"))))?
-            .as_u64();
+        let end_lsn = {
+            let _ordered = SERIALIZE_APPENDS.then(|| self.append_order.lock());
+            self.journal
+                .append_batch(&payloads)
+                .map_err(|err| {
+                    Error::Io(std::io::Error::other(format!("fsys append_batch: {err}")))
+                })?
+                .as_u64()
+        };
 
         // Reconstruct per-payload start offsets from the batch's
         // end LSN. Frames are appended back-to-back, so the
