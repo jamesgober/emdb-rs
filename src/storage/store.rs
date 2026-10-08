@@ -623,12 +623,9 @@ fn prepare_data_file(path: &Path) -> Result<bool> {
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // SECURITY-MERGE: create_private_file (owner-only data file)
-            let _file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(path)?;
+            // `Emdb::open` creates the file before the engine runs;
+            // engines opened directly (encryption admin) may not.
+            drop(crate::private_fs::create_new_private_file(path)?);
             Ok(true)
         }
         Err(err) => Err(Error::Io(err)),

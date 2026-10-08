@@ -430,6 +430,33 @@ fn test_existing_database_file_mode_is_preserved() -> emdb::Result<()> {
     Ok(())
 }
 
+/// Compaction renames a rewritten file over the database: it keeps the
+/// owner's mode. A backup is a new file, so it is owner-only.
+#[cfg(unix)]
+#[test]
+fn test_compaction_keeps_mode_and_backup_is_owner_only() -> emdb::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = tmp_path("modes-rewrite");
+    let backup = tmp_path("modes-rewrite-backup");
+    cleanup(&path);
+    cleanup(&backup);
+    let db = Emdb::open(&path)?;
+    db.insert("a", "1")?;
+    db.insert("a", "2")?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+    db.compact()?;
+    let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640, "compaction changed the mode");
+    db.backup_to(&backup)?;
+    let mode = std::fs::metadata(&backup)?.permissions().mode() & 0o777;
+    assert_eq!(mode & 0o077, 0, "backup mode {mode:o}");
+    drop(db);
+    cleanup(&path);
+    cleanup(&backup);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Lockfile (E-S10).
 // ---------------------------------------------------------------------

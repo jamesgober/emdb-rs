@@ -20,7 +20,7 @@
 //! (~200-400ns extra per record on commodity AES-NI hardware).
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
@@ -1374,8 +1374,11 @@ impl Engine {
         };
 
         // Rename first and swap handles only once it succeeded: a
-        // failed rename leaves the store on the original file.
-        if let Err(err) = std::fs::rename(&tmp, &path) {
+        // failed rename leaves the store on the original file. The
+        // rewrite takes over the permissions of the file it replaces.
+        if let Err(err) = crate::private_fs::keep_permissions(&path, &tmp)
+            .and_then(|()| std::fs::rename(&tmp, &path))
+        {
             drop((read_file, mmap));
             return Err(rewrite.abandon(Error::Io(err)));
         }
@@ -2184,9 +2187,9 @@ impl Rewrite {
     /// removed since) into the rewrite.
     fn create(fs: &fsys::Handle, path: &Path) -> Result<Self> {
         remove_if_exists(path)?;
-        // SECURITY-MERGE: create_private_file (owner-only temporary;
-        // Ok(false) must be an error here, like `create_new` below)
-        drop(OpenOptions::new().write(true).create_new(true).open(path)?);
+        // Owner-only, and `create_new`: a file or link that appears
+        // after the removal is refused rather than written through.
+        drop(crate::private_fs::create_new_private_file(path)?);
         match fs.journal_with(path, store::journal_options()) {
             Ok(journal) => Ok(Self {
                 path: path.to_path_buf(),

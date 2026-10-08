@@ -191,9 +191,13 @@ fn link_or_copy(from: &Path, to: &Path) -> Result<()> {
     if std::fs::hard_link(from, to).is_ok() {
         return Ok(());
     }
-    // SECURITY-MERGE: create_private_file(to) before the copy
-    let _bytes = std::fs::copy(from, to)?;
-    std::fs::File::open(to)?.sync_all()?;
+    // `std::fs::copy` would give the copy the source's permissions;
+    // the copy is created owner-only instead. The caller removed any
+    // earlier file at `to`, so `create_new` failing means something
+    // else put a file there.
+    let mut copy = crate::private_fs::create_new_private_file(to)?;
+    let _bytes = std::io::copy(&mut std::fs::File::open(from)?, &mut copy)?;
+    copy.sync_all()?;
     Ok(())
 }
 
@@ -201,12 +205,8 @@ fn link_or_copy(from: &Path, to: &Path) -> Result<()> {
 #[cfg(feature = "encrypt")]
 fn write_marker(marker: &Path) -> Result<()> {
     use std::io::Write;
-    // SECURITY-MERGE: open_or_create_private_file (owner-only marker)
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(marker)?;
+    let mut file = crate::private_fs::open_or_create_private_file(marker)?;
+    file.set_len(0)?;
     file.write_all(b"emdb encryption admin: rename <path>.enc.tmp over <path>\n")?;
     file.sync_all()?;
     sync_dir(marker)
@@ -224,6 +224,9 @@ pub(crate) fn rewrite_database(
     from: Option<&EncryptionInput>,
     to: Option<&EncryptionInput>,
 ) -> Result<()> {
+    // Lock the same canonical path `Emdb::open` locks, so an admin
+    // call through a symbolic link still excludes a concurrent open.
+    let path = &crate::data_dir::canonical_database_path(path)?;
     let _lock = crate::lockfile::LockFile::acquire(path)?;
     finish_interrupted_rewrite(path)?;
     if !path.exists() {
@@ -247,8 +250,9 @@ pub(crate) fn rewrite_database(
     let _ignored = remove_if_exists(&sibling(&tmp, ".lock"));
     let _ignored = remove_if_exists(&sibling(&tmp, ".lock-meta"));
 
-    // SECURITY-MERGE: create_private_file(&tmp) before copy_records
-    // (Engine::open creates `.enc.tmp` through the store otherwise).
+    // The rewrite target is created owner-only here, with `create_new`
+    // so a file or link planted after the removal above is refused.
+    drop(crate::private_fs::create_new_private_file(&tmp)?);
     if let Err(err) = copy_records(path, &tmp, from, to) {
         let _ignored = remove_if_exists(&tmp);
         let _ignored = remove_if_exists(&tmp_meta);
@@ -268,7 +272,13 @@ pub(crate) fn rewrite_database(
     }
     sync_dir(path)?;
 
-    // From here on an interrupted swap is completed by the next open.
+    // The new files take over the permissions of the ones they
+    // replace. From here on an interrupted swap is completed by the
+    // next open.
+    crate::private_fs::keep_permissions(path, &tmp)?;
+    if path_meta.exists() {
+        crate::private_fs::keep_permissions(&path_meta, &tmp_meta)?;
+    }
     write_marker(&marker)?;
     std::fs::rename(&tmp_meta, &path_meta)?;
     std::fs::rename(&tmp, path)?;

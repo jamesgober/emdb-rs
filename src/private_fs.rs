@@ -86,6 +86,28 @@ pub(crate) fn open_or_create_private_file(path: &Path) -> io::Result<File> {
     opts.open(path)
 }
 
+/// Give `replacement` the permission bits of `original` (Unix). Used
+/// before a rewritten file is renamed over the database, so compaction
+/// and the encryption admin rewrite neither tighten nor loosen the
+/// permissions the owner chose. A no-op on other platforms, where the
+/// replacement inherits the directory's ACL like the original did.
+///
+/// # Errors
+///
+/// I/O errors from reading `original`'s metadata or setting the bits.
+pub(crate) fn keep_permissions(original: &Path, replacement: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let permissions = std::fs::metadata(original)?.permissions();
+        std::fs::set_permissions(replacement, permissions)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (original, replacement);
+        Ok(())
+    }
+}
+
 /// `DirBuilder` that creates owner-only directories (mode `0o700` on
 /// Unix).
 fn private_dir_builder(recursive: bool) -> std::fs::DirBuilder {
@@ -116,7 +138,7 @@ pub(crate) fn create_new_private_dir(path: &Path) -> io::Result<()> {
 mod tests {
     use super::{
         create_new_private_dir, create_new_private_file, create_private_dir_all,
-        create_private_file, open_or_create_private_file,
+        create_private_file, keep_permissions, open_or_create_private_file,
     };
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -186,6 +208,31 @@ mod tests {
         create_new_private_dir(&single).unwrap();
         assert!(create_new_private_dir(&single).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_keep_permissions_copies_mode_and_missing_original_errors() {
+        let original = scratch("keep-original");
+        let replacement = scratch("keep-replacement");
+        std::fs::write(&original, b"a").unwrap();
+        assert!(create_private_file(&replacement).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o640)).unwrap();
+            keep_permissions(&original, &replacement).unwrap();
+            let mode = std::fs::metadata(&replacement)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o640);
+            assert!(keep_permissions(&scratch("keep-missing"), &replacement).is_err());
+        }
+        #[cfg(not(unix))]
+        keep_permissions(&original, &replacement).unwrap();
+        let _ = std::fs::remove_file(&original);
+        let _ = std::fs::remove_file(&replacement);
     }
 
     #[cfg(unix)]
