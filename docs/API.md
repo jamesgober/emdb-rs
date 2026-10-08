@@ -51,10 +51,10 @@ concurrently.
 
 - `Error::Io` — filesystem error (permission denied, disk full,
   unreachable parent directory).
-- `Error::LockBusy { path }` — another process (or another handle in
+- `Error::LockBusy { path }`: another process (or another handle in
   this process) holds the lock. See
   [Lockfile recovery](#lockfile-recovery) for diagnosis.
-- `Error::LockfileError(io)` — the lock file could not be opened or
+- `Error::LockfileError(io)`: the lock file could not be opened or
   locked for another reason.
 - `Error::MagicMismatch` / `Error::VersionMismatch` /
   `Error::Corrupted` — the file exists but is not a valid

@@ -250,7 +250,7 @@ fn test_valid_namespace_histories_still_open() -> emdb::Result<()> {
 }
 
 // ---------------------------------------------------------------------
-// Strict record decoding (robustness). Plaintext databases.
+// Strict record decoding. Plaintext databases.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -527,7 +527,7 @@ fn test_open_dangling_symlink_returns_invalid_config() {
 }
 
 // ---------------------------------------------------------------------
-// Encryption (E-S1, E-S2, E-S4, robustness).
+// Encryption (E-S1, E-S2, E-S4, AEAD failure reporting).
 // ---------------------------------------------------------------------
 
 #[cfg(feature = "encrypt")]

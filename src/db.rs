@@ -692,7 +692,7 @@ impl Emdb {
     /// closes. The `<path>.lock` file itself stays in place between
     /// opens. Returns `Ok(None)` when no holder file exists (the
     /// database is unlocked). Returns `Ok(Some(holder))` when the
-    /// holder file is present and well-formed — typically because
+    /// holder file is present and well-formed, typically because
     /// some emdb instance is either currently using the database or
     /// died with the lock held. Symbolic links in `path` are resolved,
     /// so any name for the database reports the same holder.
