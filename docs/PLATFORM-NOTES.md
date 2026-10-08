@@ -82,12 +82,13 @@ returning from `pwrite`; no separate `fsync` call is needed.
 This is the lowest-overhead per-record durability mode on
 Linux.
 
-### `posix_fadvise(POSIX_FADV_DONTNEED)` on compaction
+### Page cache during compaction
 
-Compaction rewrites the journal. After the rewrite, fsys advises
-the kernel to drop the old journal's pages from the page cache —
-they're about to be replaced via rename. Keeps the working set
-honest after a compaction.
+Compaction reads the old journal with positioned reads, not
+through the shared mapping, so its pages are cached by the kernel
+but never enter the process's resident set. The old file's pages
+are released when its last mapping (held by any iterator or
+`ValueRef` created before the compaction) is dropped.
 
 ### `WriteLifetimeHint`
 
@@ -113,11 +114,16 @@ equivalent to Linux's `RWF_DSYNC`.
 
 ### `MoveFileExW(REPLACE_EXISTING)`
 
-Compaction and metadata sidecar updates use
-`MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`
-for the atomic rename. On Windows, the destination must not
-have any open handles; emdb manages its own handles so this
-is internal.
+Metadata sidecar updates go through fsys's atomic replace, which
+uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`.
+Compaction, `backup_to` and the encryption admin rename with
+`MoveFileExW(MOVEFILE_REPLACE_EXISTING)` (`std::fs::rename`) and
+then flush the directory through a handle opened with
+`FILE_FLAG_BACKUP_SEMANTICS`; file systems that cannot flush a
+directory (FAT, some network shares) skip that step. A rename over
+the database fails if another program holds it open without
+`FILE_SHARE_DELETE`; compaction then leaves the database on its
+original file and reports the error.
 
 ### Lockfile semantics
 
@@ -285,8 +291,8 @@ database from two processes will corrupt the journal.
 | `flush()` (`OnEachFlush`) | `fdatasync` | `F_FULLFSYNC` | `FlushFileBuffers` |
 | `flush()` (`Group` leader) | `fdatasync` | `F_FULLFSYNC` | `FlushFileBuffers` |
 | `insert` w/ `WriteThrough` | `RWF_DSYNC` | `O_SYNC` + `F_FULLFSYNC` | `FILE_FLAG_WRITE_THROUGH` |
-| `checkpoint()` (metadata) | `rename` is atomic | `rename` is atomic | `MoveFileExW(REPLACE_EXISTING \| WRITE_THROUGH)` |
-| `compact()` (journal swap) | `rename` is atomic | `rename` is atomic | `MoveFileExW(REPLACE_EXISTING \| WRITE_THROUGH)` |
+| `checkpoint()` | journal sync + sidecar `rename` + directory `fsync` | journal sync + sidecar `rename` + directory `F_FULLFSYNC` | journal sync + `MoveFileExW(REPLACE_EXISTING \| WRITE_THROUGH)` |
+| `compact()` (journal swap) | `rename` + directory `fsync` | `rename` + directory `F_FULLFSYNC` | `MoveFileExW(REPLACE_EXISTING)` + directory `FlushFileBuffers` |
 
 The semantics are equivalent — every platform guarantees
 "data is durable after this call returns" — but absolute

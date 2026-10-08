@@ -95,15 +95,32 @@ A database is one journal file plus two sidecar files:
 |---|---|
 | `<path>` | The journal — append-only sequence of frames. |
 | `<path>.lock` | OS-level advisory lockfile (one process at a time). Created owner-only; left in place on close. |
-| `<path>.meta` | Atomically-replaced metadata sidecar (checkpoint info, encryption header, etc.). |
+| `<path>.meta` | Atomically-replaced 112-byte metadata sidecar: format version, feature flags, creation time, encryption salt and key-verification block, CRC-32 (IEEE). |
+
+There is no header inside the journal: byte 0 is the magic of the
+first frame. A non-empty file that does not start with the frame
+magic is refused with `Error::MagicMismatch` and left untouched.
+
+Other files that can appear next to the database:
+
+| File | Purpose |
+|---|---|
+| `<path>.compact.tmp` | Compaction's rewrite target; renamed over `<path>` on success, removed on failure and on the next open. |
+| `<target>.backup.tmp`, `<target>.backup.tmp.meta` | `backup_to`'s rewrite target and sidecar before they are renamed over `<target>` and `<target>.meta`. |
+| `<path>.enc.tmp`, `<path>.encadmin` | Encryption admin rewrite target and its swap marker (see [Encryption admin](#encryption-admin)). |
+| `<path>.encbak`, `<path>.encbak.meta` | The database as it was before the last encryption admin operation. |
+| `<path>.corrupt-<offset>` | Written by fsys when an open cuts a torn journal tail: the cut bytes, kept for forensics. Safe to delete once you have checked the database. |
 
 The journal is **never modified in place** during normal
 operation. The only writers are:
 
-1. **Append** — `fsys::JournalHandle::append` reserves an LSN,
+1. **Append**: `fsys::JournalHandle::append` reserves an LSN,
    writes the new frame at the journal tail, optionally fsyncs.
-2. **Compaction** — writes a fresh journal under a temp name,
+   `remove`, `clear` and `drop_namespace` append too (tombstones).
+2. **Compaction**: writes a fresh journal under a temp name,
    atomically renames it over the original.
+3. **Open**: fsys cuts a torn tail left by a crash (see
+   [Crash recovery](#crash-recovery)).
 
 Reads are always from a memory-mapped view (`Arc<Mmap>`) over
 the live journal file.
@@ -123,7 +140,10 @@ fsys, but emdb's record types embed inside the payload:
 on disk so a hexdump shows `46 53 59 01`). The trailing CRC-32C
 covers `magic_and_ver || length || payload`. fsys's decoder
 validates magic + length + CRC before handing the payload to
-emdb's decoder.
+emdb's decoder. A frame's payload is capped at 256 MiB - 1 bytes;
+an insert whose encoded record (key, value and about 21 bytes of
+record header, plus 28 bytes of nonce and tag when encrypted) is
+larger fails with `Error::Io` of kind `InvalidInput`.
 
 ### Record payload
 
@@ -685,62 +705,114 @@ The rules:
 - Records written but not flushed are lost on crash. This is
   the standard contract — `flush` is what makes a record
   durable.
-- Records that are flushed survive any crash short of NAND
-  corruption. The frame format is CRC-32C protected; partial
-  writes are detected and ignored.
-- The index is rebuilt on every open by replaying the journal
-  from the last checkpoint forward. No on-disk index format
-  to corrupt.
+- Records that are flushed survive any crash short of media
+  corruption. The frame format is CRC-32C protected; a torn
+  final frame is detected and cut.
+- The index is rebuilt on every open by replaying the whole
+  journal. There is no on-disk index to corrupt and no
+  checkpoint that shortens the replay.
 
 ### Recovery sequence
 
 1. Acquire the lockfile (`Emdb::open` errors with
-   `Error::LockBusy` if held by another process).
-2. Load the metadata sidecar (`<path>.meta`) — checkpoint LSN,
-   encryption header, schema version.
-3. Memory-map the journal file.
-4. Walk frames from the checkpoint LSN forward. For each frame:
-   - Validate CRC. If CRC fails, stop (truncate-and-recover):
-     all bytes past the failure point are discarded.
-   - Decode payload.
-   - Apply to the index (insert / tombstone / namespace).
-5. The database is now consistent up to the last fully-written
-   frame.
+   `Error::LockBusy` if another process holds it).
+2. Finish an encryption admin swap a crash interrupted, if its
+   marker is present.
+3. Create a missing data file (empty, owner-only), check that the
+   data file is empty or starts with the frame magic
+   (`Error::MagicMismatch` otherwise), and load the
+   metadata sidecar. A missing sidecar is recreated, but only
+   after step 5 succeeds, so a failed open writes nothing.
+4. Verify the encryption key against the sidecar's verification
+   block (encrypted databases).
+5. Walk every frame from offset 0, applying each payload to the
+   index (insert / tombstone / namespace binding). When the walk
+   stops before the end of the file, classify what follows:
+   - **Nothing valid follows** (a torn final frame or trailing
+     garbage): accepted.
+   - **Only unwritten space precedes a valid frame** (zero bytes,
+     or a partly written frame whose CRC field or a whole 512-byte
+     sector is still zero): accepted. Concurrent appends write at
+     reserved offsets, so a crash can leave such a gap in front of
+     a frame another thread finished; no successful `flush` ever
+     covered anything at or after the gap.
+   - **Anything else followed by valid frames** (a bit flip in a
+     complete frame, foreign bytes): the open fails with
+     `Error::Corrupted { offset, .. }` and **nothing is modified**.
+     Earlier releases cut the file here and silently dropped every
+     record after the damage.
+6. Hand the file to fsys, which cuts an accepted torn tail. A tail
+   that is not all zero is first copied to
+   `<path>.corrupt-<offset>`.
+7. Write the sidecar if it was new, then (with the `ttl` feature)
+   tombstone default-namespace records that had already expired.
+
+The walk in step 5 also checks every record it applies. An insert or
+remove must name the default namespace or an id that a namespace
+record bound earlier; a namespace record must use an id other than 0
+and `u32::MAX`, must not give a bound id a second name, and an empty
+name (the record `drop_namespace` writes) must name a bound id. In an
+encrypted database every record must carry the encrypted flag and
+authenticate. A record that breaks a rule fails the open with
+`Error::Corrupted`.
+
+### Recovering from `Error::Corrupted`
+
+The offset in the error is where the damage starts; every record
+before it is intact. To keep those records and give up everything
+from the damage on (the loss earlier releases imposed silently):
+
+1. Copy the database file and its `.meta` sidecar somewhere safe.
+2. Truncate the file at the reported offset, for example
+   `truncate -s <offset> db.emdb` on Linux/macOS, or
+   `fsutil file seteof db.emdb <offset>` on Windows.
+3. Open the database again.
+
+Restoring from a `backup_to` copy is the alternative when the
+records after the damage matter. A builder option that performs
+the truncation (after saving the cut bytes) is planned for 1.1.
 
 ### Checkpoints
 
-`Emdb::checkpoint()` writes a snapshot of the current namespace
-table and key-count to `<path>.meta` and updates the recovery
-start LSN. On the next open, recovery resumes from the
-checkpoint instead of from the journal start.
-
-Checkpoints are a recovery-speed optimisation, not a durability
-guarantee. Calling `checkpoint()` on a fresh database with
-millions of records cuts open time from O(journal_size) to
-O(post-checkpoint_size).
+`Emdb::checkpoint()` syncs the journal (like `flush`) and rewrites
+`<path>.meta`. The sidecar holds no recovery position, so a
+checkpoint does not shorten the next open; earlier documentation
+said otherwise. It fails when the journal is poisoned by an
+earlier write or sync failure.
 
 ---
 
 ## Compaction
 
-`Emdb::compact()` rewrites the journal in compacted form:
+`Emdb::compact()` rewrites the journal in compacted form. Every
+writer (insert, remove, `insert_many`, transactions, namespace
+creation) holds an engine-level write gate in shared mode for the
+duration of its append and index update; compaction takes the
+gate exclusively for the whole run:
 
-1. Snapshot the live index (every live offset).
-2. Open a temporary journal file (`<path>.compact.tmp`).
-3. Walk every live offset in arbitrary order; for each, decode
-   the frame and append it to the temp journal.
-4. fsync the temp journal.
-5. Atomically rename the temp journal over `<path>` (POSIX
-   rename / Windows `MoveFileExW(REPLACE_EXISTING)`).
-6. Re-mmap the new file and rebuild the index from offsets in
-   the new file.
+1. Take the write gate exclusively. Remove any stale
+   `<path>.compact.tmp` and create it fresh (`create_new`).
+2. Snapshot the live offsets of every namespace.
+3. Copy each live record verbatim (encrypted records stay
+   encrypted) into the temporary journal, in batches of about
+   4 MiB read with positioned reads, and build each namespace's
+   new index off to the side as the batches land.
+4. fsync the temporary journal and map it.
+5. Rename it over `<path>` (POSIX `rename` / Windows
+   `MoveFileExW(REPLACE_EXISTING)`), then fsync the directory.
+   If the rename fails, nothing has changed: the database keeps
+   using the original file and the temporary is removed.
+6. Install the new journal handle, read handle and mapping, and
+   swap in the new indexes in one step. The journal handle that
+   wrote the temporary becomes the live journal, so later writes
+   land in the new file.
 
-Compaction is a **stop-the-world** operation: readers see the
-old journal until step 5, then transparently see the new one.
-Writers block from step 1 until step 5 (briefly, with the
-write-side acquire of the compaction mutex). Read latency is
-unaffected — the existing `Arc<Mmap>` keeps serving reads from
-the old journal until the swap.
+Readers are not blocked. A point read that raced the swap (old
+index offset, new file, or the reverse) is detected through a
+swap sequence number and retried. Iterators pin the mapping they
+were created from and keep yielding that snapshot; `ValueRef`s
+likewise stay valid. Peak memory is bounded by the batch size plus
+one offset per live record, not by the database size.
 
 ### Why not online compaction
 
@@ -773,8 +845,10 @@ real workload.
 - **Writes don't serialise on a writer mutex.** fsys's LSN
   reservation is a single atomic; concurrent appenders issue
   independent `pwrite`s.
-- **Compaction is the only stop-the-world operation.** All
-  other operations are concurrent-safe.
+- **Compaction stops writers, not readers.** `clear`,
+  `drop_namespace` and the snapshot phase of `backup_to` also take
+  the write gate exclusively; all other operations run
+  concurrently.
 
 The bench `benches/concurrent_reads.rs` measures **9.94 M
 reads/sec aggregate at 8 threads on a 4-core consumer box** —
@@ -788,21 +862,50 @@ becomes the cap.
 | Failure | Detected by | Effect |
 |---|---|---|
 | **Disk full** | fsys's `pwrite` returns `ENOSPC` / `ERROR_DISK_FULL` | `Error::Io`; in-memory state unchanged, journal unchanged. |
-| **Disk corruption** | CRC fail on frame decode | Recovery stops at first bad frame; all data after the bad frame is lost. |
-| **Process kill mid-write** | First decode on next open hits a torn frame | Torn frame is treated as corruption — recovery stops there; pre-flush records are lost. |
-| **Wrong encryption key** | AEAD check of the verification block in `<path>.meta` fails | `Error::EncryptionKeyMismatch`; no records are read. |
+| **Write or sync failure** | fsys returns the I/O error | `Error::Io` with the OS error kind; the journal is poisoned, so later writes, `flush` and `checkpoint` fail until the database is reopened. |
+| **Disk corruption** | CRC fail on frame decode, valid frames after it | Open refused with `Error::Corrupted`; the file is not modified. See [Recovering from `Error::Corrupted`](#recovering-from-errorcorrupted). |
+| **Process kill mid-write** | Torn final frame (or unwritten gap) on next open | Cut by the open; records that were not flushed may be lost, flushed ones are not. |
+| **Wrong encryption key** | Verification block fails to decrypt | `Error::EncryptionKeyMismatch`; no partial reads, nothing written. |
 | **Encrypted record modified** | AEAD check of the record fails after the key verified | `Error::Corrupted`. |
 | **Plaintext record in an encrypted database** | Tag byte lacks the encrypted flag | `Error::Corrupted`. |
-| **Wrong path / not an emdb file** | Magic mismatch on first frame | `Error::MagicMismatch`. |
-| **Version mismatch** | Schema version in metadata sidecar doesn't match | `Error::VersionMismatch`. |
+| **Wrong path / not an emdb file** | First bytes are not the frame magic | `Error::MagicMismatch`; the file is not modified. |
+| **Version mismatch** | Sidecar format version doesn't match | `Error::VersionMismatch`. |
 | **Lockfile held by dead process** | `Error::LockBusy` | Use `Emdb::lock_holder` to diagnose; `Emdb::break_lock` if the holder is confirmed dead. |
 | **Concurrent open by another process** | OS advisory lock acquisition fails | `Error::LockBusy`. |
 | **Out of memory** | Allocator failure | Panics (Rust's default `alloc_error_handler`). |
 | **Hash collision** | OVERFLOW state in index; verify-key on decode | Handled transparently; cost is one extra raw-key compare per affected slot. |
 
 The bias is **fail-fast and visible**, not silent recovery. A
-corrupted journal will lose data, but it will lose it noisily
-(returning errors), not by silently serving stale records.
+corrupted journal is refused with an error that names the offset,
+instead of being silently shortened.
+
+---
+
+## Encryption admin
+
+`enable_encryption`, `disable_encryption` and
+`rotate_encryption_key` rewrite the whole database while holding
+its lock:
+
+1. Copy every live, unexpired record (with its expiry) into
+   `<path>.enc.tmp` under the destination key; sync it.
+2. Keep the original as `<path>.encbak` / `<path>.encbak.meta`
+   (hard links, or synced copies where hard links are not
+   available).
+3. Write the swap marker `<path>.encadmin` (synced), rename the
+   new sidecar and journal over `<path>.meta` and `<path>`, sync
+   the directory, remove the marker.
+
+`<path>` never goes missing. If a crash interrupts step 3, the
+next open (or admin call) finds the marker and completes the
+renames from the synced temporaries. An open that finds `<path>`
+missing or empty next to a non-empty `<path>.encbak` (the state an
+interrupted emdb 1.0.2 rotation could leave) is refused rather than
+creating an empty database.
+
+**`<path>.encbak` is a plaintext copy after `enable_encryption`
+and an old-key copy after a rotation.** Delete it once the new
+database is verified.
 
 ---
 

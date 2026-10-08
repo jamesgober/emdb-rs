@@ -20,26 +20,38 @@
 //! (~200-400ns extra per record on commodity AES-NI hardware).
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::{Bound, RangeBounds};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crossbeam_skiplist::SkipMap;
 use crossbeam_utils::CachePadded;
 use memmap2::Mmap;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard};
 
+use crate::error::from_fsys;
 use crate::storage::flush::FlushPolicy;
 use crate::storage::format::{self, RecordView};
 #[cfg(feature = "encrypt")]
 use crate::storage::format::{OwnedRecord, NONCE_LEN};
 use crate::storage::index::Index;
+use crate::storage::integrity;
+use crate::storage::meta::{self, FLAG_ENCRYPTED};
 #[cfg(feature = "encrypt")]
-use crate::storage::meta::FLAG_CIPHER_CHACHA20;
-use crate::storage::meta::{self, MetaHeader, FLAG_ENCRYPTED};
-use crate::storage::store::Store;
+use crate::storage::meta::{MetaHeader, FLAG_CIPHER_CHACHA20};
+use crate::storage::store::{
+    self, batch_payload_starts, remove_if_exists, sync_dir, Store, FSYS_MAX_PAYLOAD,
+    FSYS_PRE_PAYLOAD_BYTES,
+};
 use crate::{Error, Result};
+
+/// Payload bytes per batch when compaction, backup, `clear`,
+/// `drop_namespace` and the encryption admin rewrite stream records.
+/// Bounds their peak memory independently of the database size.
+pub(crate) const REWRITE_CHUNK_BYTES: usize = 4 << 20;
 
 /// Default namespace id (the implicit unnamed namespace).
 pub(crate) const DEFAULT_NAMESPACE_ID: u32 = 0;
@@ -80,9 +92,6 @@ impl std::fmt::Debug for NamespaceRuntime {
 /// `Send + Sync` and the cipher state is shared between callers.
 #[cfg(feature = "encrypt")]
 pub(crate) type SharedEncryption = Option<Arc<crate::encryption::EncryptionContext>>;
-
-#[cfg(not(feature = "encrypt"))]
-pub(crate) type SharedEncryption = ();
 
 /// Configuration handed to [`Engine::open`] by the builder.
 #[derive(Clone)]
@@ -169,6 +178,12 @@ impl Default for EngineConfig {
 /// The engine. Cheap to clone (every field is `Arc`-shared internally).
 pub(crate) struct Engine {
     store: Arc<Store>,
+    /// Write gate. Every mutation of the journal plus index holds it
+    /// shared (see [`Self::write_gate`]); compaction, `clear`,
+    /// `drop_namespace` and the snapshot phase of backup hold it
+    /// exclusively, so they see no half-applied write and no write
+    /// can land in a file compaction is about to retire.
+    write_gate: RwLock<()>,
     /// Map of `namespace_id → runtime state`. The default namespace is
     /// always present at id 0; named namespaces are added via
     /// [`Self::create_or_open_namespace`].
@@ -197,6 +212,20 @@ impl std::fmt::Debug for Engine {
 /// Owned snapshot row used by `iter` / `keys`.
 pub(crate) type RecordSnapshot = (Vec<u8>, Vec<u8>, u64);
 
+/// Guard returned by [`Engine::write_gate`].
+pub(crate) type WriteGuard<'a> = RwLockReadGuard<'a, ()>;
+
+/// A read mapping pinned for the lifetime of an iterator. Offsets an
+/// iterator snapshots are resolved against the mapping taken in the
+/// same consistent step, so a compaction that replaces the file
+/// while the iterator runs does not change what it yields: it keeps
+/// reading the retired file, whose mapping stays valid while pinned.
+pub(crate) type ReadView = Arc<Mmap>;
+
+/// `(key, offset)` pairs of a range query plus the mapping they
+/// resolve against. See [`Engine::snapshot_range_offsets`].
+pub(crate) type RangeSnapshot = (Vec<(Vec<u8>, u64)>, ReadView);
+
 /// Output of [`Engine::resolve_encryption`]: the resolved 32-byte key
 /// (wrapped in `Zeroizing` so it clears on drop), an optional fresh
 /// salt to persist for new passphrase databases, and the requested
@@ -215,6 +244,14 @@ enum RecoveryAction {
     Insert { ns_id: u32, key: Vec<u8> },
     Remove { ns_id: u32, key: Vec<u8> },
     NamespaceName { ns_id: u32, name: Vec<u8> },
+}
+
+/// What the recovery scan remembers between records.
+#[derive(Default)]
+struct RecoveryState {
+    /// Namespaces unbound by a `drop_namespace` record, by id, with
+    /// the name they had (empty when the id had no name left).
+    dropped: HashMap<u32, String>,
 }
 
 impl Engine {
@@ -279,6 +316,7 @@ impl Engine {
         let range_scans_enabled = config.enable_range_scans;
         let engine = Self {
             store,
+            write_gate: RwLock::new(()),
             namespaces: RwLock::new(HashMap::new()),
             namespace_names: RwLock::new(HashMap::new()),
             next_namespace_id: AtomicU64::new(1),
@@ -296,12 +334,66 @@ impl Engine {
             );
         }
 
-        // Recovery scan: walk every record from the start of the data
-        // region to the on-disk tail (or until the first bad CRC),
-        // populating namespace indexes.
+        // Recovery scan: walk every record from the start of the
+        // journal to its last valid frame, populating namespace
+        // indexes, and refuse the open if valid records follow damage
+        // (mid-file corruption) instead of letting fsys cut them.
+        #[cfg(feature = "ttl")]
+        let expired = engine.recovery_scan()?;
+        #[cfg(not(feature = "ttl"))]
         engine.recovery_scan()?;
 
+        // Only now hand the file to fsys (which cuts a torn tail) and
+        // persist a meta sidecar that was held back: a failed open
+        // above (wrong key, corrupt journal) leaves the files as they
+        // were.
+        engine.store.open_journal()?;
+        engine.store.finish_open()?;
+        engine.remove_stale_rewrite_files();
+
+        #[cfg(feature = "ttl")]
+        engine.sweep_expired_on_open(expired);
+
         Ok(engine)
+    }
+
+    /// Shared write gate. Every code path that appends to the journal
+    /// and then updates an index holds the returned guard for the
+    /// whole operation, so compaction (which takes the gate
+    /// exclusively) never interleaves with a half-applied write.
+    ///
+    /// The lock is fair: do not acquire it twice on one thread (a
+    /// waiting compaction would deadlock the second acquisition).
+    #[inline]
+    pub(crate) fn write_gate(&self) -> WriteGuard<'_> {
+        self.write_gate.read()
+    }
+
+    /// Run `read` until it completes without a compaction swap
+    /// happening in the middle of it. Every read that resolves an
+    /// index offset against a mapping goes through here: an offset
+    /// taken from the old index and decoded against the new file (or
+    /// the reverse) is detected and the read is retried.
+    fn consistent<T>(&self, mut read: impl FnMut() -> Result<T>) -> Result<T> {
+        loop {
+            let seq = self.store.read_begin();
+            let out = read();
+            if self.store.read_validate(seq) {
+                return out;
+            }
+        }
+    }
+
+    /// Remove temporaries a crash or an older release left next to
+    /// the database: `<path>.compact.tmp` and the `.meta` sidecar
+    /// emdb 1.0.2 and earlier wrote (and leaked) for it. The caller
+    /// holds the database lock, so no rewrite is running. Failures
+    /// are ignored: the files are never read, and the next
+    /// compaction removes them again before it starts.
+    fn remove_stale_rewrite_files(&self) {
+        let tmp = compaction_temp_path(self.store.path());
+        let _ignored = remove_if_exists(&meta::meta_path_for(&tmp));
+        let _ignored = remove_if_exists(&tmp);
     }
 
     /// Resolve which encryption key (if any) to use, including the KDF
@@ -459,33 +551,49 @@ impl Engine {
     }
 
     /// Walk every record in the journal and rebuild the in-memory
-    /// index. Delegates frame iteration + CRC validation + tail-
-    /// truncation detection to `fsys::JournalReader`; emdb's job
-    /// here is just to decode each record's payload (`tag + body`)
-    /// and route it to the right namespace runtime.
+    /// index. Delegates frame iteration + CRC validation to
+    /// `fsys::JournalReader`; emdb decodes each record's payload
+    /// (`tag + body`) and routes it to the right namespace runtime.
     ///
-    /// `JournalReader::lsn` is the byte offset of the FRAME's
-    /// first byte (the magic). emdb's index stores the
-    /// `payload_start` — the byte offset of the first byte of
-    /// the tag-prefixed payload, which sits 8 bytes past the
-    /// frame start (4 magic + 4 length).
-    fn recovery_scan(&self) -> Result<()> {
+    /// When the reader stops before the end of the file, the bytes
+    /// after its stop point are classified by
+    /// [`integrity::check_damage`]: a torn tail is accepted (fsys cuts
+    /// it when the journal opens), damage followed by valid records
+    /// fails the open with [`Error::Corrupted`] before anything is
+    /// cut.
+    ///
+    /// `JournalReader::lsn` is the byte offset of the frame's first
+    /// byte (the magic). emdb's index stores the `payload_start`,
+    /// which sits 8 bytes past the frame start (4 magic + 4 length).
+    ///
+    /// With the `ttl` feature, also returns the default-namespace
+    /// keys whose live record had already expired (see
+    /// [`OpenExpired`]).
+    fn recovery_scan(&self) -> Result<OpenExpired> {
         let mut reader = self.store.open_reader()?;
-        // Hint the kernel about the access pattern. Best-effort —
-        // some platforms ignore the hint.
-        let _ = reader.advise_sequential();
-        let iter = reader.iter();
-        for record_result in iter {
-            let record = record_result
-                .map_err(|err| Error::Io(std::io::Error::other(format!("fsys reader: {err}"))))?;
-            let payload_start =
-                record.lsn.as_u64() + crate::storage::store::Store::pre_payload_bytes();
-            self.apply_recovered_payload(&record.payload, payload_start)?;
+        // Advisory read-ahead hint: a platform that rejects it reads
+        // the same bytes with its default read-ahead window.
+        let _advice = reader.advise_sequential();
+        let mut state = RecoveryState::default();
+        #[cfg(feature = "ttl")]
+        let mut expiry = ExpiryTracker::new(crate::ttl::now_unix_millis());
+        for record_result in reader.iter() {
+            let record = record_result.map_err(from_fsys)?;
+            let payload_start = record.lsn.as_u64() + FSYS_PRE_PAYLOAD_BYTES;
+            self.apply_recovered_payload(&record.payload, payload_start, &mut state)?;
+            #[cfg(feature = "ttl")]
+            expiry.observe(&record.payload);
         }
-        // The iterator's tail state could be inspected here for
-        // diagnostic logging (CleanEnd vs TruncatedHeader vs
-        // ChecksumMismatch); we do not currently surface it but
-        // the data is available via `iter.into_reader().tail_state()`.
+        if reader.tail_state() != fsys::JournalTailState::CleanEnd {
+            integrity::check_damage(
+                self.store.path(),
+                reader.position().as_u64(),
+                reader.file_size(),
+            )?;
+        }
+        #[cfg(feature = "ttl")]
+        return Ok(expiry.finish());
+        #[cfg(not(feature = "ttl"))]
         Ok(())
     }
 
@@ -498,7 +606,12 @@ impl Engine {
     /// engine encrypts every record once a key is set), so it is
     /// rejected as [`Error::Corrupted`] instead of being applied
     /// without authentication.
-    fn apply_recovered_payload(&self, payload: &[u8], payload_start: u64) -> Result<()> {
+    fn apply_recovered_payload(
+        &self,
+        payload: &[u8],
+        payload_start: u64,
+        state: &mut RecoveryState,
+    ) -> Result<()> {
         if payload.is_empty() {
             return Err(Error::Corrupted {
                 offset: payload_start,
@@ -567,7 +680,7 @@ impl Engine {
             }
         };
 
-        self.apply_recovered_action(action, payload_start)
+        self.apply_recovered_action(action, payload_start, state)
     }
 
     /// Apply one decoded record during recovery.
@@ -583,11 +696,25 @@ impl Engine {
     ///   allocation) for every id it mentions.
     /// - A `NamespaceName` must bind a non-empty UTF-8 name to an id in
     ///   `1..u32::MAX`, and must not rebind an id that is already bound
-    ///   to a different name.
-    fn apply_recovered_action(&self, action: RecoveryAction, offset: u64) -> Result<()> {
+    ///   to a different name or that an earlier record unbound.
+    /// - A `NamespaceName` with an empty name is the unbind record
+    ///   [`Self::drop_namespace`] appends after the tombstones of every
+    ///   key. It must name an id that is bound at that point.
+    /// - An `Insert` or `Remove` for an id unbound earlier in the log
+    ///   comes from emdb 1.0.2 or older, which skips the unbind record
+    ///   and still lists the dropped namespace (empty) under its old
+    ///   name. Such a record binds the id to that name again, as the
+    ///   older release saw it; if the name now belongs to another id,
+    ///   the record is [`Error::Corrupted`].
+    fn apply_recovered_action(
+        &self,
+        action: RecoveryAction,
+        offset: u64,
+        state: &mut RecoveryState,
+    ) -> Result<()> {
         match action {
             RecoveryAction::Insert { ns_id, key } => {
-                let ns = self.recovered_namespace(ns_id, offset)?;
+                let ns = self.recovered_namespace(ns_id, offset, state)?;
                 let key_hash = Index::hash_key(&key);
                 let prev = ns
                     .index
@@ -600,7 +727,7 @@ impl Engine {
                 }
             }
             RecoveryAction::Remove { ns_id, key } => {
-                let ns = self.recovered_namespace(ns_id, offset)?;
+                let ns = self.recovered_namespace(ns_id, offset, state)?;
                 let key_hash = Index::hash_key(&key);
                 if ns.index.remove(key_hash, &key)?.is_some() {
                     let _ = ns.record_count.fetch_sub(1, Ordering::AcqRel);
@@ -610,12 +737,25 @@ impl Engine {
                 }
             }
             RecoveryAction::NamespaceName { ns_id, name } => {
-                if ns_id == DEFAULT_NAMESPACE_ID || ns_id == u32::MAX || name.is_empty() {
-                    // The engine never binds the default namespace, never
-                    // allocates u32::MAX and rejects empty names.
+                if ns_id == DEFAULT_NAMESPACE_ID || ns_id == u32::MAX {
+                    // The engine never binds the default namespace and
+                    // never allocates u32::MAX.
                     return Err(Error::Corrupted {
                         offset,
-                        reason: "namespace-name record with a reserved id or an empty name",
+                        reason: "namespace-name record with a reserved id",
+                    });
+                }
+                if name.is_empty() {
+                    // The record `drop_namespace` writes after the
+                    // tombstones of every key: forget the binding.
+                    return self.unbind_recovered_namespace(ns_id, offset, state);
+                }
+                if state.dropped.contains_key(&ns_id) {
+                    // Ids are never reused within one log, so a new
+                    // name for a dropped id was not written by emdb.
+                    return Err(Error::Corrupted {
+                        offset,
+                        reason: "namespace-name record rebinds a dropped namespace id",
                     });
                 }
                 let name_str = match std::str::from_utf8(&name) {
@@ -654,15 +794,60 @@ impl Engine {
     /// `Remove`. Only the default namespace and ids already bound by a
     /// `NamespaceName` record have one; an unknown id means the log
     /// was not written by emdb.
-    fn recovered_namespace(&self, ns_id: u32, offset: u64) -> Result<Arc<NamespaceRuntime>> {
-        self.namespaces
-            .read()
-            .get(&ns_id)
-            .map(Arc::clone)
-            .ok_or(Error::Corrupted {
+    fn recovered_namespace(
+        &self,
+        ns_id: u32,
+        offset: u64,
+        state: &mut RecoveryState,
+    ) -> Result<Arc<NamespaceRuntime>> {
+        if let Some(ns) = self.namespaces.read().get(&ns_id) {
+            return Ok(Arc::clone(ns));
+        }
+        let Some(name) = state.dropped.remove(&ns_id) else {
+            return Err(Error::Corrupted {
                 offset,
                 reason: "record references a namespace id with no namespace-name binding",
-            })
+            });
+        };
+        let mut name_guard = self.namespace_names.write();
+        if name.is_empty() || name_guard.contains_key(name.as_str()) {
+            return Err(Error::Corrupted {
+                offset,
+                reason: "record references a dropped namespace whose name was reused",
+            });
+        }
+        let ns = self.ensure_namespace_runtime(ns_id)?;
+        let _previous = name_guard.insert(name, ns_id);
+        Ok(ns)
+    }
+
+    /// Apply the empty-name record [`Self::drop_namespace`] writes:
+    /// forget the name binding and the runtime of `ns_id`, and
+    /// remember the name in `state` for records an older release may
+    /// have appended to the namespace afterwards (see
+    /// [`Self::apply_recovered_action`]). The id allocator moved past
+    /// `ns_id` when it was bound, so the id is never handed out again
+    /// for this log.
+    fn unbind_recovered_namespace(
+        &self,
+        ns_id: u32,
+        offset: u64,
+        state: &mut RecoveryState,
+    ) -> Result<()> {
+        if self.namespaces.write().remove(&ns_id).is_none() {
+            return Err(Error::Corrupted {
+                offset,
+                reason: "namespace unbind record for an id that is not bound",
+            });
+        }
+        let mut name_guard = self.namespace_names.write();
+        let name = name_guard
+            .iter()
+            .find_map(|(name, id)| (*id == ns_id).then(|| name.clone()))
+            .unwrap_or_default();
+        let _bound = name_guard.remove(name.as_str());
+        let _previous = state.dropped.insert(ns_id, name);
+        Ok(())
     }
 
     /// Decode the key bytes of the record at `offset`. Used as a
@@ -675,13 +860,18 @@ impl Engine {
     /// or already tombstoned in some way) — the index treats that as
     /// "the existing entry is stale; overwrite in place."
     fn key_at_offset(&self, offset: u64) -> Result<Option<Vec<u8>>> {
-        let mmap = self.store.mmap_covering(offset + 1)?;
+        let mmap = self.store.mmap_for_payload(offset)?;
         let bytes: &[u8] = &mmap;
         let payload = match format::payload_at(bytes, offset as usize) {
             Ok(p) => p,
             Err(_) => return Ok(None),
         };
+        self.key_from_payload(payload)
+    }
 
+    /// Decode the key of an insert payload (`[tag][body]`), decrypting
+    /// it on encrypted databases. `Ok(None)` for other record kinds.
+    fn key_from_payload(&self, payload: &[u8]) -> Result<Option<Vec<u8>>> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
             let ctx = Arc::clone(ctx);
@@ -743,6 +933,7 @@ impl Engine {
         value: &[u8],
         expires_at: u64,
     ) -> Result<()> {
+        let _gate = self.write_gate();
         let ns = self.namespace(ns_id)?;
         let key_hash = Index::hash_key(key);
 
@@ -771,6 +962,7 @@ impl Engine {
         ns_id: u32,
         items: impl IntoIterator<Item = (Vec<u8>, Vec<u8>, u64)>,
     ) -> Result<()> {
+        let _gate = self.write_gate();
         let ns = self.namespace(ns_id)?;
         let items: Vec<(Vec<u8>, Vec<u8>, u64)> = items.into_iter().collect();
         if items.is_empty() {
@@ -898,13 +1090,15 @@ impl Engine {
         ns_id: u32,
         key: &[u8],
     ) -> Result<Option<(crate::ValueRef, u64)>> {
-        let ns = self.namespace(ns_id)?;
-        let key_hash = Index::hash_key(key);
-        let offset = match ns.index.get(key_hash, key)? {
-            Some(o) => o,
-            None => return Ok(None),
-        };
-        self.read_zerocopy_at(offset, key)
+        self.consistent(|| {
+            let ns = self.namespace(ns_id)?;
+            let key_hash = Index::hash_key(key);
+            let offset = match ns.index.get(key_hash, key)? {
+                Some(o) => o,
+                None => return Ok(None),
+            };
+            self.read_zerocopy_at(offset, key)
+        })
     }
 
     /// Decode the record at `offset`, returning a [`crate::ValueRef`]
@@ -917,7 +1111,7 @@ impl Engine {
         offset: u64,
         expected_key: &[u8],
     ) -> Result<Option<(crate::ValueRef, u64)>> {
-        let mmap = self.store.mmap_covering(offset + 1)?;
+        let mmap = self.store.mmap_for_payload(offset)?;
         let bytes: &[u8] = &mmap;
         let payload = match format::payload_at(bytes, offset as usize) {
             Ok(p) => p,
@@ -982,18 +1176,32 @@ impl Engine {
     /// Fetch value + expires_at for a key in one pass. Used by the TTL
     /// path in `Emdb::get` so it doesn't have to make two record reads.
     pub(crate) fn get_with_meta(&self, ns_id: u32, key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
-        let ns = self.namespace(ns_id)?;
-        let key_hash = Index::hash_key(key);
-        let offset = match ns.index.get(key_hash, key)? {
-            Some(o) => o,
-            None => return Ok(None),
-        };
-        self.read_value_at(offset, key)
+        self.consistent(|| {
+            let ns = self.namespace(ns_id)?;
+            let key_hash = Index::hash_key(key);
+            let offset = match ns.index.get(key_hash, key)? {
+                Some(o) => o,
+                None => return Ok(None),
+            };
+            self.read_value_at(offset, key)
+        })
     }
 
     fn read_value_at(&self, offset: u64, expected_key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
-        let mmap = self.store.mmap_covering(offset + 1)?;
-        let bytes: &[u8] = &mmap;
+        let mmap = self.store.mmap_for_payload(offset)?;
+        self.read_value_in(&mmap, offset, expected_key)
+    }
+
+    /// Decode the value at `offset` from `view`, validating that the
+    /// record's key is `expected_key`. Used directly by range
+    /// iterators with the mapping they pinned at snapshot time.
+    pub(crate) fn read_value_in(
+        &self,
+        view: &ReadView,
+        offset: u64,
+        expected_key: &[u8],
+    ) -> Result<Option<(Vec<u8>, u64)>> {
+        let bytes: &[u8] = view;
 
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
@@ -1048,6 +1256,7 @@ impl Engine {
 
     /// Remove a key. Returns the previously-associated value, if any.
     pub(crate) fn remove(&self, ns_id: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let _gate = self.write_gate();
         let prev = self.get(ns_id, key)?;
         if prev.is_some() {
             let _offset = self.append_remove(ns_id, key)?;
@@ -1074,10 +1283,11 @@ impl Engine {
         self.store.flush()
     }
 
-    /// Persist the in-memory header (with current `tail_hint`) to disk.
-    /// Implements the fast-reopen checkpoint exposed via
-    /// [`crate::Emdb::checkpoint`].
+    /// Sync the journal, then rewrite the meta sidecar. Backs
+    /// [`crate::Emdb::checkpoint`]. Fails when the journal is poisoned
+    /// by an earlier write or sync failure.
     pub(crate) fn checkpoint(&self) -> Result<()> {
+        self.store.flush()?;
         self.store.persist_meta()
     }
 
@@ -1120,92 +1330,87 @@ impl Engine {
     /// Compact the on-disk file by rewriting only live records, then
     /// atomically swapping the new file in for the old.
     ///
-    /// Steps:
-    ///  1. Snapshot every namespace's `(key, value, expires_at)` tuples
-    ///     by walking the live indexes (one mmap read per record).
-    ///  2. Open a fresh [`Store`] at `<path>.compact.tmp` carrying the
-    ///     same flags + encryption metadata as the current file.
-    ///  3. Bulk-write every snapshotted record into the temp store via
-    ///     a single batched `pwrite`.
-    ///  4. Sync the temp store, drop its handle, then ask our own
-    ///     [`Store::swap_underlying`] to rename the temp file into the
-    ///     canonical path and refresh our writer / mmap.
-    ///  5. Clear and rebuild every namespace's index from the new
-    ///     post-compaction record offsets.
+    /// Steps, all under the exclusive write gate (writers wait for the
+    /// whole compaction; readers continue against the old file):
+    ///  1. Create `<path>.compact.tmp` fresh (`create_new`), so a
+    ///     stale temporary can never be appended to.
+    ///  2. Stream every live record into it in bounded batches,
+    ///     reading the source with positioned reads, and build each
+    ///     namespace's new index off to the side as the batches land.
+    ///  3. Sync the temporary, map it, and rename it over the
+    ///     database path; then sync the directory.
+    ///  4. Between [`Store::begin_swap`] and [`Store::end_swap`],
+    ///     install the new journal, read file and mapping, and swap
+    ///     the namespace runtimes in one assignment. Readers never see
+    ///     an empty or half-built index.
     ///
     /// # Errors
     ///
-    /// Returns I/O errors from any of the rewrite, sync, or rename
-    /// steps; on failure, the original file is left untouched (the
-    /// temp file is best-effort cleaned up).
+    /// I/O errors from the rewrite, sync, or rename steps, and
+    /// [`Error::Corrupted`] when a live record cannot be read back. On
+    /// any failure before the rename completes, the database keeps
+    /// using the original file and the temporary is removed.
     pub(crate) fn compact_in_place(&self) -> Result<()> {
-        // Snapshot every namespace + its name so we can re-emit the
-        // name → id binding in the compacted file.
-        let namespaces: Vec<(u32, String)> = self.list_namespaces()?;
-        let mut snapshots: Vec<(u32, String, Vec<RecordSnapshot>)> =
-            Vec::with_capacity(namespaces.len());
-        for (ns_id, name) in &namespaces {
-            let records = self.collect_records(*ns_id)?;
-            snapshots.push((*ns_id, name.clone(), records));
-        }
-
-        // Write the compacted file directly (no mmap on the temp
-        // file; we just need bytes on disk that `Store` can later
-        // open). This avoids the Windows "can't shrink a mapped
-        // file" problem that would otherwise come up if we routed
-        // the temp file through `Store::open` (which pre-allocates
-        // 1 MiB).
+        let _gate = self.write_gate.write();
         let path = self.store.path().to_path_buf();
-        let tmp_path = compaction_temp_path(&path);
-        // Best-effort cleanup of any stale leftover from a prior
-        // failed run.
-        let _ = std::fs::remove_file(&tmp_path);
+        let tmp = compaction_temp_path(&path);
+        // emdb 1.0.2 and earlier wrote this sidecar and never removed it.
+        remove_if_exists(&meta::meta_path_for(&tmp))?;
 
-        let header = self.store.header()?;
-        if let Err(err) = self.write_compacted_file(&tmp_path, &header, &snapshots) {
-            // Best-effort cleanup of the half-written temp file; the
-            // original file is untouched.
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(err);
+        let namespaces = self.list_namespaces()?;
+        let live = self.live_offsets(&namespaces)?;
+        let mut source = SourceReader::open(&path)?;
+        let rewrite = Rewrite::create(self.store.fs(), &tmp)?;
+        let built = match self
+            .write_live(&rewrite, &mut source, &live, true)
+            .and_then(|built| rewrite.sync().map(|()| built))
+        {
+            Ok(built) => built,
+            Err(err) => return Err(rewrite.abandon(err)),
+        };
+        let (read_file, mmap) = match rewrite.open_for_reading() {
+            Ok(opened) => opened,
+            Err(err) => return Err(rewrite.abandon(err)),
+        };
+
+        // Rename first and swap handles only once it succeeded: a
+        // failed rename leaves the store on the original file.
+        if let Err(err) = std::fs::rename(&tmp, &path) {
+            drop((read_file, mmap));
+            return Err(rewrite.abandon(Error::Io(err)));
         }
+        let dir_synced = sync_dir(&path);
 
-        // Atomic swap. After this returns, `self.store` is backed by
-        // the new compacted file; old readers' `Arc<Mmap>` snapshots
-        // stay valid until they release.
-        if let Err(err) = self.store.swap_underlying(&tmp_path) {
-            // Best-effort cleanup: the swap failed mid-flight, so the
-            // temp file is still around but the original is intact.
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(err);
-        }
+        self.store.begin_swap();
+        self.store
+            .install_file(rewrite.into_journal(), read_file, mmap);
+        *self.namespaces.write() = built;
+        self.store.end_swap();
 
-        // Clear and rebuild every namespace index from the newly-laid-
-        // out file via the recovery scan.
-        for (ns_id, _) in &namespaces {
-            let ns = self.namespace(*ns_id)?;
-            ns.index.clear()?;
-            ns.record_count.store(0, Ordering::Release);
-            if let Some(range_map) = ns.range_index.as_ref() {
-                clear_skipmap(range_map);
-            }
-        }
-        self.recovery_scan()?;
-
-        Ok(())
+        // The swap is done either way; report a failed directory sync
+        // so the caller knows the rename may not survive a power loss.
+        dir_synced
     }
 
     /// Write a snapshot of the live record set to `target`,
-    /// producing a self-contained, openable database file. Backs
+    /// producing a self-contained, openable database: the journal at
+    /// `target` and its meta sidecar at `<target>.meta`. Backs
     /// [`crate::Emdb::backup_to`].
     ///
-    /// Atomicity: the records are written to `<target>.tmp`,
-    /// `fdatasync`'d, then renamed over `target`. A failure at any
-    /// point leaves `target` untouched; the temp file is
-    /// best-effort cleaned up.
+    /// The set of live records is captured under the exclusive write
+    /// gate (a brief index walk); the records are then copied without
+    /// holding it, from a file handle opened during the snapshot, so a
+    /// concurrent compaction cannot change what the backup contains.
     ///
-    /// Refuses to write to the database's own path — that would
-    /// be a concurrent-write hazard.
-    pub(crate) fn backup_to(&self, target: &std::path::Path) -> Result<()> {
+    /// The copy goes to `<target>.backup.tmp` (plus its sidecar),
+    /// both are synced, then the sidecar and the journal are renamed
+    /// over `<target>.meta` and `target` (rename-over, never remove
+    /// then rename) and the directory is synced. Encrypted databases
+    /// keep their salt and verification block, so the backup opens
+    /// with the same key or passphrase.
+    ///
+    /// Refuses to write to the database's own path.
+    pub(crate) fn backup_to(&self, target: &Path) -> Result<()> {
         let source_path = self.store.path().to_path_buf();
         let target_canonical = match target.canonicalize() {
             Ok(p) => p,
@@ -1228,142 +1433,159 @@ impl Engine {
             ));
         }
 
-        // Snapshot every namespace + its name, same shape as the
-        // compactor uses.
-        let namespaces: Vec<(u32, String)> = self.list_namespaces()?;
-        let mut snapshots: Vec<(u32, String, Vec<RecordSnapshot>)> =
-            Vec::with_capacity(namespaces.len());
-        for (ns_id, name) in &namespaces {
-            let records = self.collect_records(*ns_id)?;
-            snapshots.push((*ns_id, name.clone(), records));
+        let (live, mut source, header) = {
+            let _gate = self.write_gate.write();
+            let namespaces = self.list_namespaces()?;
+            let live = self.live_offsets(&namespaces)?;
+            // Opened while no compaction can run, so it refers to the
+            // file the offsets belong to even if one runs later.
+            let source = SourceReader::open(&source_path)?;
+            (live, source, self.store.header()?)
+        };
+
+        let tmp = backup_temp_path(target);
+        let tmp_meta = meta::meta_path_for(&tmp);
+        let target_meta = meta::meta_path_for(target);
+        remove_if_exists(&tmp_meta)?;
+        let rewrite = Rewrite::create(self.store.fs(), &tmp)?;
+        let written = self
+            .write_live(&rewrite, &mut source, &live, false)
+            .and_then(|_| rewrite.sync())
+            .and_then(|()| meta::write_to(self.store.fs(), &tmp_meta, &header));
+        if let Err(err) = written {
+            let _ignored = remove_if_exists(&tmp_meta);
+            return Err(rewrite.abandon(err));
         }
+        drop(rewrite.into_journal());
 
-        let mut tmp_path = target.to_path_buf();
-        let original_name = target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("emdb-backup");
-        tmp_path.set_file_name(format!("{original_name}.backup.tmp"));
-
-        // Best-effort cleanup of any stale leftover.
-        let _ = std::fs::remove_file(&tmp_path);
-
-        let header = self.store.header()?;
-        if let Err(err) = self.write_compacted_file(&tmp_path, &header, &snapshots) {
-            // Best-effort cleanup of the half-written temp file.
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(err);
+        // The sidecar goes first: once `target` names the new journal,
+        // `<target>.meta` already describes it.
+        let committed =
+            std::fs::rename(&tmp_meta, &target_meta).and_then(|()| std::fs::rename(&tmp, target));
+        if let Err(err) = committed {
+            let _ignored = remove_if_exists(&tmp);
+            let _ignored = remove_if_exists(&tmp_meta);
+            return Err(Error::Io(err));
         }
-
-        // Atomic rename. Cross-platform: `std::fs::rename` is
-        // atomic on the same filesystem on every supported
-        // platform. If the target already exists, Windows requires
-        // it to be removed first; do that with a best-effort
-        // remove so callers can overwrite older backups.
-        if target.exists() {
-            std::fs::remove_file(target)?;
-        }
-        if let Err(err) = std::fs::rename(&tmp_path, target) {
-            // Best-effort cleanup if the rename failed.
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(Error::from(err));
-        }
-
-        Ok(())
+        sync_dir(target)
     }
 
-    /// Write a fresh fsys journal at `path` carrying every record
-    /// from `snapshots`. Also writes the matching `<path>.meta`
-    /// sidecar so the resulting file pair is a self-contained,
-    /// openable database. Used by compaction (renames the result
-    /// over the live database) and by [`Self::backup_to`] (the
-    /// result is the backup).
-    ///
-    /// Encrypted databases preserve their encryption metadata
-    /// (salt + verification block) verbatim from `header_template`
-    /// so the rewritten file decrypts under the same key.
-    fn write_compacted_file(
-        &self,
-        path: &std::path::Path,
-        header_template: &MetaHeader,
-        snapshots: &[(u32, String, Vec<RecordSnapshot>)],
-    ) -> Result<()> {
-        // Open a fresh fsys journal at `path`. Removing any stale
-        // file at `path` first so we always start with an empty
-        // journal — fsys's `journal()` is "open or create" but a
-        // pre-existing journal would be appended to, not
-        // overwritten.
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(meta::meta_path_for(path));
-
-        // Build one fsys handle and reuse it for both the meta
-        // sidecar write and the journal open. Builder init pays
-        // the hardware-capability probe; doing it once instead
-        // of twice halves the steady-state compaction overhead.
-        let fs = fsys::builder()
-            .tune_for(fsys::Workload::Database)
-            .build()
-            .map_err(|err| Error::Io(std::io::Error::other(format!("fsys init: {err}"))))?;
-
-        // Write the meta sidecar first. The reader on the
-        // recovery scan does not need the sidecar to walk the
-        // journal, but `Store::open` does, and a missing sidecar
-        // would cause `open` to synthesise a fresh one with
-        // default flags — destroying any encryption metadata.
-        meta::write_with(&fs, path, header_template)?;
-
-        let journal_opts =
-            fsys::JournalOptions::new().write_lifetime_hint(Some(fsys::WriteLifetimeHint::Long));
-        let journal = fs
-            .journal_with(path, journal_opts)
-            .map_err(|err| Error::Io(std::io::Error::other(format!("fsys journal: {err}"))))?;
-
-        // Pre-encode every record up-front, then submit them as
-        // a single vectored `append_batch`: one LSN reservation,
-        // one heap allocation for the concatenated frames, one
-        // platform `pwrite`. Materially faster than calling
-        // `append` in a tight loop, especially on bulk-load
-        // workloads (which is the dominant compaction shape).
-        let mut payloads: Vec<Vec<u8>> = Vec::new();
-
-        // First emit name-binding records for every non-default
-        // namespace so a reopen of the compacted file restores
-        // the `name → id` map before it walks the data records.
-        for (ns_id, name, _) in snapshots {
-            if *ns_id == DEFAULT_NAMESPACE_ID || name.is_empty() {
+    /// Sorted live offsets of every namespace in `namespaces`. The
+    /// caller holds the write gate exclusively.
+    fn live_offsets(&self, namespaces: &[(u32, String)]) -> Result<Vec<LiveNamespace>> {
+        let guard = self.namespaces.read();
+        let mut out = Vec::with_capacity(namespaces.len());
+        for (ns_id, name) in namespaces {
+            let Some(ns) = guard.get(ns_id) else {
                 continue;
-            }
-            payloads.push(self.encode_namespace_name_payload(*ns_id, name.as_bytes())?);
+            };
+            let mut offsets = ns.index.collect_offsets()?;
+            offsets.sort_unstable();
+            out.push(LiveNamespace {
+                ns_id: *ns_id,
+                name: name.clone(),
+                offsets,
+            });
         }
+        Ok(out)
+    }
 
-        // Then emit the data (insert) records for every namespace.
-        for (ns_id, _, records) in snapshots {
-            for (key, value, expires_at) in records {
-                payloads.push(self.encode_insert_payload(*ns_id, key, value, *expires_at)?);
+    /// Copy every record in `live` from `source` into `rewrite` in
+    /// batches of about [`REWRITE_CHUNK_BYTES`]. Namespace-name
+    /// records go first so a reopen binds every name before it sees
+    /// the namespace's records. Payloads are copied verbatim (an
+    /// encrypted record stays encrypted under the same key).
+    ///
+    /// With `build_index`, also builds a fresh runtime per namespace
+    /// whose index points at the records' offsets in the new file.
+    fn write_live(
+        &self,
+        rewrite: &Rewrite,
+        source: &mut SourceReader,
+        live: &[LiveNamespace],
+        build_index: bool,
+    ) -> Result<HashMap<u32, Arc<NamespaceRuntime>>> {
+        let mut names = Vec::new();
+        for ns in live {
+            if ns.ns_id != DEFAULT_NAMESPACE_ID && !ns.name.is_empty() {
+                names.push(self.encode_namespace_name_payload(ns.ns_id, ns.name.as_bytes())?);
             }
         }
+        let name_refs: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+        let _name_offsets = rewrite.append_batch(&name_refs)?;
 
-        if !payloads.is_empty() {
-            let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
-            let _ = journal.append_batch(&refs).map_err(|err| {
-                Error::Io(std::io::Error::other(format!("fsys append_batch: {err}")))
+        // Resolves hash collisions while the new index is built; reads
+        // the temporary file, where the new offsets point.
+        let mut written = if build_index {
+            Some(SourceReader::open(rewrite.path())?)
+        } else {
+            None
+        };
+        let mut built = HashMap::with_capacity(live.len());
+        let mut chunk: Vec<u8> = Vec::new();
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        for ns in live {
+            let runtime = NamespaceRuntime::new(self.range_scans_enabled);
+            let target = build_index.then_some(&runtime);
+            for &offset in &ns.offsets {
+                ranges.push(source.append_payload(offset, &mut chunk)?);
+                if chunk.len() >= REWRITE_CHUNK_BYTES {
+                    self.write_chunk(rewrite, &chunk, &ranges, target, written.as_mut())?;
+                    chunk.clear();
+                    ranges.clear();
+                }
+            }
+            if !ranges.is_empty() {
+                self.write_chunk(rewrite, &chunk, &ranges, target, written.as_mut())?;
+                chunk.clear();
+                ranges.clear();
+            }
+            if build_index {
+                let _previous = built.insert(ns.ns_id, Arc::new(runtime));
+            }
+        }
+        Ok(built)
+    }
+
+    /// Append one batch of payloads to `rewrite` and, when `runtime`
+    /// is given, index them at their new offsets.
+    fn write_chunk(
+        &self,
+        rewrite: &Rewrite,
+        chunk: &[u8],
+        ranges: &[std::ops::Range<usize>],
+        runtime: Option<&NamespaceRuntime>,
+        written: Option<&mut SourceReader>,
+    ) -> Result<()> {
+        let payloads: Vec<&[u8]> = ranges.iter().map(|r| &chunk[r.clone()]).collect();
+        let starts = rewrite.append_batch(&payloads)?;
+        let (Some(runtime), Some(written)) = (runtime, written) else {
+            return Ok(());
+        };
+        for (payload, start) in payloads.iter().zip(starts) {
+            let key = self.key_from_payload(payload)?.ok_or(Error::Corrupted {
+                offset: start,
+                reason: "live index entry does not hold an insert record",
             })?;
+            let key_hash = Index::hash_key(&key);
+            let prev = runtime.index.replace(key_hash, &key, start, |off| {
+                let payload = written.payload(off)?;
+                self.key_from_payload(payload)
+            })?;
+            if prev.is_none() {
+                let _ = runtime.record_count.fetch_add(1, Ordering::AcqRel);
+            }
+            if let Some(range_map) = runtime.range_index.as_ref() {
+                let _ = range_map.insert(key, start);
+            }
         }
-
-        // Force-sync everything we just wrote. fsys's
-        // `sync_through(next_lsn)` lands the whole journal on
-        // stable storage in one syscall (or one NVMe passthrough
-        // flush where supported).
-        let target = journal.next_lsn();
-        journal
-            .sync_through(target)
-            .map_err(|err| Error::Io(std::io::Error::other(format!("fsys sync: {err}"))))?;
         Ok(())
     }
 
     /// Encode a `[tag][body]` payload for a namespace-name binding
     /// record. Encrypted databases route the body through the
     /// AEAD path; the resulting payload is `[tag | 0x80][nonce][ct]`.
+    /// An empty `name` encodes the record `drop_namespace` writes.
     fn encode_namespace_name_payload(&self, ns_id: u32, name: &[u8]) -> Result<Vec<u8>> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
@@ -1378,42 +1600,142 @@ impl Engine {
         Ok(payload)
     }
 
-    /// Encode a `[tag][body]` payload for an insert record.
-    fn encode_insert_payload(
-        &self,
-        ns_id: u32,
-        key: &[u8],
-        value: &[u8],
-        expires_at: u64,
-    ) -> Result<Vec<u8>> {
+    /// Encode a `[tag][body]` payload for a remove (tombstone) record.
+    fn encode_remove_payload(&self, ns_id: u32, key: &[u8]) -> Result<Vec<u8>> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
-            return ctx.seal_record(format::TAG_INSERT, |body| {
-                format::encode_insert_body(body, ns_id, key, value, expires_at);
+            return ctx.seal_record(format::TAG_REMOVE, |body| {
+                format::encode_remove_body(body, ns_id, key);
             });
         }
 
-        let mut payload = Vec::with_capacity(1 + 20 + key.len() + value.len());
-        payload.push(format::TAG_INSERT);
-        format::encode_insert_body(&mut payload, ns_id, key, value, expires_at);
+        let mut payload = Vec::with_capacity(1 + 8 + key.len());
+        payload.push(format::TAG_REMOVE);
+        format::encode_remove_body(&mut payload, ns_id, key);
         Ok(payload)
     }
 
-    /// On-disk path of the database file.
-    pub(crate) fn path(&self) -> &std::path::Path {
-        self.store.path()
+    /// Clear every record in `ns_id`.
+    ///
+    /// Appends a remove (tombstone) record for every live key, in
+    /// bounded batches, and drops each batch's keys from the index as
+    /// it lands, so the clear survives a reopen under the same flush
+    /// policy as any other remove. Holds the write gate exclusively,
+    /// so no insert interleaves with it. Disk space is reclaimed by
+    /// the next compaction.
+    pub(crate) fn clear_namespace(&self, ns_id: u32) -> Result<()> {
+        let _gate = self.write_gate.write();
+        let ns = self.namespace(ns_id)?;
+        self.tombstone_all(ns_id, &ns)
     }
 
-    /// Clear every record in `ns_id`. Implemented as an index-only
-    /// drop plus a flush; the on-disk records remain until compaction.
-    pub(crate) fn clear_namespace(&self, ns_id: u32) -> Result<()> {
-        let ns = self.namespace(ns_id)?;
-        ns.index.clear()?;
-        ns.record_count.store(0, Ordering::Release);
-        if let Some(range_map) = ns.range_index.as_ref() {
-            clear_skipmap(range_map);
+    /// Tombstone every live key of `ns`. Caller holds the write gate
+    /// exclusively.
+    fn tombstone_all(&self, ns_id: u32, ns: &NamespaceRuntime) -> Result<()> {
+        let mut offsets = ns.index.collect_offsets()?;
+        offsets.sort_unstable();
+        let mut source = SourceReader::open(self.store.path())?;
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut batch_bytes = 0_usize;
+        for offset in offsets {
+            let payload = source.payload(offset)?;
+            let key = self.key_from_payload(payload)?.ok_or(Error::Corrupted {
+                offset,
+                reason: "live index entry does not hold an insert record",
+            })?;
+            batch_bytes += key.len() + TOMBSTONE_OVERHEAD;
+            keys.push(key);
+            if batch_bytes >= REWRITE_CHUNK_BYTES {
+                self.tombstone_batch(ns_id, ns, &keys)?;
+                keys.clear();
+                batch_bytes = 0;
+            }
+        }
+        self.tombstone_batch(ns_id, ns, &keys)
+    }
+
+    /// Append tombstones for `keys` as one batch, then drop the keys
+    /// from `ns`'s indexes.
+    fn tombstone_batch(&self, ns_id: u32, ns: &NamespaceRuntime, keys: &[Vec<u8>]) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let payloads = keys
+            .iter()
+            .map(|key| self.encode_remove_payload(ns_id, key))
+            .collect::<Result<Vec<_>>>()?;
+        let _offsets = self
+            .store
+            .append_batch(payloads.iter().map(Vec::as_slice))?;
+        for key in keys {
+            let key_hash = Index::hash_key(key);
+            if ns.index.remove(key_hash, key)?.is_some() {
+                let _ = ns.record_count.fetch_sub(1, Ordering::AcqRel);
+            }
+            if let Some(range_map) = ns.range_index.as_ref() {
+                let _ = range_map.remove(key.as_slice());
+            }
         }
         Ok(())
+    }
+
+    /// Remove the default-namespace keys whose records had expired
+    /// when the database was opened. Mirrors the eager sweep earlier
+    /// releases ran at open, without materialising every record:
+    /// plaintext journals report the expired keys from the recovery
+    /// scan itself; encrypted journals are re-read one record at a
+    /// time.
+    ///
+    /// Best effort, like the sweep it replaces: expiry is enforced on
+    /// every read regardless, the sweep only keeps `len()` exact and
+    /// frees index slots, and failing the open over it would make an
+    /// otherwise readable database (for example on a full disk)
+    /// impossible to open.
+    #[cfg(feature = "ttl")]
+    fn sweep_expired_on_open(&self, expired: OpenExpired) {
+        let keys = match expired {
+            Some(keys) => keys,
+            None => match self.expired_keys_by_reading(DEFAULT_NAMESPACE_ID) {
+                Ok(keys) => keys,
+                Err(_) => return,
+            },
+        };
+        if keys.is_empty() {
+            return;
+        }
+        let _gate = self.write_gate.write();
+        let Ok(ns) = self.namespace(DEFAULT_NAMESPACE_ID) else {
+            return;
+        };
+        for batch in keys.chunks(TOMBSTONE_BATCH_KEYS) {
+            if self
+                .tombstone_batch(DEFAULT_NAMESPACE_ID, &ns, batch)
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Keys of the live records in `ns_id` that have expired, found
+    /// by reading each record from the file (bounded memory).
+    #[cfg(feature = "ttl")]
+    fn expired_keys_by_reading(&self, ns_id: u32) -> Result<Vec<Vec<u8>>> {
+        let now = crate::ttl::now_unix_millis();
+        let ns = self.namespace(ns_id)?;
+        let mut offsets = ns.index.collect_offsets()?;
+        offsets.sort_unstable();
+        let mut source = SourceReader::open(self.store.path())?;
+        let mut out = Vec::new();
+        for offset in offsets {
+            let payload = source.payload(offset)?;
+            if let Some((key, _value, expires_at)) = self.decode_triple(payload)? {
+                if expires_at != 0 && expires_at <= now {
+                    out.push(key);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Range-scan a namespace's secondary index. Returns `(key, value)`
@@ -1428,71 +1750,119 @@ impl Engine {
     where
         R: RangeBounds<Vec<u8>>,
     {
-        let ns = self.namespace(ns_id)?;
-        let range_map = ns.range_index.as_ref().ok_or(Error::InvalidConfig(
-            "range scans not enabled; pass `EmdbBuilder::enable_range_scans(true)` at open time",
-        ))?;
+        let (pairs, view) = self.snapshot_range_offsets(ns_id, range)?;
 
-        // Snapshot (key, offset) pairs via the lock-free SkipMap
-        // iterator. No global lock is held; concurrent inserts
-        // continue to advance against the same skiplist while we
-        // scan.
-        let pairs: Vec<(Vec<u8>, u64)> = skipmap_range_snapshot(range_map, &range);
-
-        // Now resolve each offset to its value via the mmap. Using
-        // `read_value_at` keeps the encryption-aware decode path.
+        // Now resolve each offset to its value via the pinned mapping.
+        // Using `read_value_in` keeps the encryption-aware decode path.
         let mut out = Vec::with_capacity(pairs.len());
         for (key, offset) in pairs {
-            if let Some((value, _expires)) = self.read_value_at(offset, &key)? {
+            if let Some((value, _expires)) = self.read_value_in(&view, offset, &key)? {
                 out.push((key, value));
             }
         }
         Ok(out)
     }
 
-    /// Snapshot the live record offsets in `ns_id`, sorted ascending.
-    /// Used by lazy iterators (`iter`, `keys`) so they can decode
-    /// records on demand instead of materialising everything up front.
-    pub(crate) fn snapshot_offsets(&self, ns_id: u32) -> Result<Vec<u64>> {
-        let ns = self.namespace(ns_id)?;
-        let mut offsets = ns.index.collect_offsets()?;
-        offsets.sort_unstable();
-        Ok(offsets)
+    /// Snapshot the live record offsets in `ns_id`, sorted ascending,
+    /// together with a mapping that covers all of them. Used by lazy
+    /// iterators (`iter`, `keys`), which decode records on demand with
+    /// [`Self::decode_owned_in`] against the returned [`ReadView`].
+    pub(crate) fn snapshot_offsets(&self, ns_id: u32) -> Result<(Vec<u64>, ReadView)> {
+        self.consistent(|| {
+            let ns = self.namespace(ns_id)?;
+            let mut offsets = ns.index.collect_offsets()?;
+            offsets.sort_unstable();
+            let view = self.store.mmap_covering(self.store.tail())?;
+            Ok((offsets, view))
+        })
     }
 
     /// Snapshot the (key, offset) pairs in a `range` query via the
-    /// lock-free SkipMap iterator. Used by lazy range iterators so
-    /// no lock is held across the caller's iteration. The keys are
-    /// cloned out of the skiplist (cheap relative to value reads);
-    /// offsets are looked up in the mmap on each `next()`.
-    pub(crate) fn snapshot_range_offsets<R>(
-        &self,
-        ns_id: u32,
-        range: R,
-    ) -> Result<Vec<(Vec<u8>, u64)>>
+    /// lock-free SkipMap iterator, together with a mapping that covers
+    /// every offset. Used by lazy range iterators so no lock is held
+    /// across the caller's iteration; values are decoded with
+    /// [`Self::read_value_in`] against the returned [`ReadView`].
+    pub(crate) fn snapshot_range_offsets<R>(&self, ns_id: u32, range: R) -> Result<RangeSnapshot>
     where
         R: RangeBounds<Vec<u8>>,
     {
-        let ns = self.namespace(ns_id)?;
-        let range_map = ns.range_index.as_ref().ok_or(Error::InvalidConfig(
-            "range scans not enabled; pass `EmdbBuilder::enable_range_scans(true)` at open time",
-        ))?;
-
-        Ok(skipmap_range_snapshot(range_map, &range))
+        self.consistent(|| {
+            let ns = self.namespace(ns_id)?;
+            let range_map = ns.range_index.as_ref().ok_or(Error::InvalidConfig(
+                "range scans not enabled; pass `EmdbBuilder::enable_range_scans(true)` at open time",
+            ))?;
+            let pairs = skipmap_range_snapshot(range_map, &range);
+            let view = self.store.mmap_covering(self.store.tail())?;
+            Ok((pairs, view))
+        })
     }
 
-    /// Decode a single record at `offset` into an owned tuple. Used by
-    /// the lazy iterator's `next()`. Returns `Ok(None)` when the
-    /// record is no longer a live `Insert` (overwritten in place,
-    /// tombstoned, or unrelated record kind at the offset).
-    pub(crate) fn decode_owned_at(&self, offset: u64) -> Result<Option<RecordSnapshot>> {
-        let mmap = self.store.mmap_covering(offset + 1)?;
-        let bytes: &[u8] = &mmap;
+    /// Decode the record at `offset` in `view` into an owned tuple.
+    /// Used by the lazy iterator's `next()`. Returns `Ok(None)` when
+    /// the bytes at `offset` are not a complete `Insert` record.
+    pub(crate) fn decode_owned_in(
+        &self,
+        view: &ReadView,
+        offset: u64,
+    ) -> Result<Option<RecordSnapshot>> {
+        let bytes: &[u8] = view;
         let payload = match format::payload_at(bytes, offset as usize) {
             Ok(p) => p,
             Err(_) => return Ok(None),
         };
+        self.decode_triple(payload)
+    }
 
+    /// Materialise every live record in `ns_id` as `(key, value, expires_at)`.
+    #[cfg(feature = "ttl")]
+    pub(crate) fn collect_records(&self, ns_id: u32) -> Result<Vec<RecordSnapshot>> {
+        let (offsets, view) = self.snapshot_offsets(ns_id)?;
+        let mut out = Vec::with_capacity(offsets.len());
+        for offset in offsets {
+            if let Some(triple) = self.decode_owned_in(&view, offset)? {
+                out.push(triple);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Stream every live record in `ns_id` to `sink` in batches of
+    /// about [`REWRITE_CHUNK_BYTES`]. Records are read from a mapping
+    /// pinned at the start, so the batches form one consistent
+    /// snapshot. Unlike [`Self::collect_records`], a live index entry
+    /// that does not decode is an error, not a skipped record.
+    #[cfg(feature = "encrypt")]
+    pub(crate) fn for_each_record_batch<F>(&self, ns_id: u32, mut sink: F) -> Result<()>
+    where
+        F: FnMut(Vec<RecordSnapshot>) -> Result<()>,
+    {
+        let (offsets, view) = self.snapshot_offsets(ns_id)?;
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0_usize;
+        for offset in offsets {
+            let triple = self
+                .decode_owned_in(&view, offset)?
+                .ok_or(Error::Corrupted {
+                    offset,
+                    reason: "live index entry does not hold an insert record",
+                })?;
+            batch_bytes += triple.0.len() + triple.1.len();
+            batch.push(triple);
+            if batch_bytes >= REWRITE_CHUNK_BYTES {
+                sink(std::mem::take(&mut batch))?;
+                batch_bytes = 0;
+            }
+        }
+        if !batch.is_empty() {
+            sink(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Decode an insert payload (`[tag][body]`) into an owned
+    /// `(key, value, expires_at)` triple, decrypting it on encrypted
+    /// databases. `Ok(None)` for other record kinds.
+    fn decode_triple(&self, payload: &[u8]) -> Result<Option<RecordSnapshot>> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
             let ctx = Arc::clone(ctx);
@@ -1513,72 +1883,6 @@ impl Engine {
             });
         }
 
-        Self::decode_plaintext_into_triple(payload)
-    }
-
-    /// Read just the value at `offset`, validating the on-disk key
-    /// matches `expected_key`. Returns `Ok(None)` if the record was
-    /// overwritten by a later record with a different key (hash
-    /// collision repaired) or is no longer an `Insert`. Used by
-    /// lazy range iterators that already know the key from the
-    /// `SkipMap` snapshot.
-    pub(crate) fn read_value_with_meta_at(
-        &self,
-        offset: u64,
-        expected_key: &[u8],
-    ) -> Result<Option<(Vec<u8>, u64)>> {
-        self.read_value_at(offset, expected_key)
-    }
-
-    /// Materialise every live record in `ns_id` as `(key, value, expires_at)`.
-    pub(crate) fn collect_records(&self, ns_id: u32) -> Result<Vec<RecordSnapshot>> {
-        let ns = self.namespace(ns_id)?;
-        let mut offsets = ns.index.collect_offsets()?;
-        offsets.sort_unstable();
-        let mut out = Vec::with_capacity(offsets.len());
-        // collect_records walks every record; pass the journal's
-        // current tail so the mmap covers all of them after a
-        // single (worst-case) refresh.
-        let mmap = self.store.mmap_covering(self.store.tail())?;
-        let bytes: &[u8] = &mmap;
-
-        for offset in offsets {
-            let payload = match format::payload_at(bytes, offset as usize) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            #[cfg(feature = "encrypt")]
-            let triple = if let Some(ctx) = self.encryption.as_ref() {
-                let ctx = Arc::clone(ctx);
-                match format::decode_payload_encrypted(payload, |nonce, ct| {
-                    let mut input = Vec::with_capacity(NONCE_LEN + ct.len());
-                    input.extend_from_slice(nonce);
-                    input.extend_from_slice(ct);
-                    ctx.decrypt(&input)
-                })? {
-                    OwnedRecord::Insert {
-                        key,
-                        value,
-                        expires_at,
-                        ..
-                    } => Some((key, value, expires_at)),
-                    _ => None,
-                }
-            } else {
-                Self::decode_plaintext_into_triple(payload)?
-            };
-            #[cfg(not(feature = "encrypt"))]
-            let triple = Self::decode_plaintext_into_triple(payload)?;
-
-            if let Some(t) = triple {
-                out.push(t);
-            }
-        }
-        Ok(out)
-    }
-
-    fn decode_plaintext_into_triple(payload: &[u8]) -> Result<Option<RecordSnapshot>> {
         Ok(match format::decode_payload(payload)? {
             RecordView::Insert {
                 key,
@@ -1597,6 +1901,7 @@ impl Engine {
                 "namespace name must be non-empty (default namespace is implicit)",
             ));
         }
+        let _gate = self.write_gate();
         // Lookup first.
         {
             let guard = self.namespace_names.read();
@@ -1662,18 +1967,30 @@ impl Engine {
         })
     }
 
-    /// Tombstone a namespace. Records remain on disk until compaction.
+    /// Drop a named namespace.
+    ///
+    /// Appends a remove (tombstone) record for every live key, then a
+    /// namespace-name record with an empty name, which recovery reads
+    /// as "forget this namespace". All of it lands in the journal
+    /// under the current flush policy, so neither the data nor the
+    /// name comes back after a reopen. emdb 1.0.2 and earlier ignore
+    /// the empty-name record; they see the namespace again, empty.
+    /// Disk space is reclaimed by the next compaction.
     pub(crate) fn drop_namespace(&self, name: &str) -> Result<bool> {
         if name.is_empty() {
             return Err(Error::InvalidConfig("default namespace cannot be dropped"));
         }
-        let mut name_guard = self.namespace_names.write();
-        let id = match name_guard.remove(name) {
-            Some(id) => id,
-            None => return Ok(false),
+        let _gate = self.write_gate.write();
+        let Some(id) = self.namespace_names.read().get(name).copied() else {
+            return Ok(false);
         };
-        let mut runtimes = self.namespaces.write();
-        let _ = runtimes.remove(&id);
+        if let Ok(ns) = self.namespace(id) {
+            self.tombstone_all(id, &ns)?;
+        }
+        let unbind = self.encode_namespace_name_payload(id, b"")?;
+        let _offset = self.store.append(&unbind)?;
+        let _name = self.namespace_names.write().remove(name);
+        let _runtime = self.namespaces.write().remove(&id);
         Ok(true)
     }
 
@@ -1713,23 +2030,11 @@ where
         .collect()
 }
 
-/// Drop every entry in `map`. crossbeam-skiplist's `SkipMap` has no
-/// in-place `clear`; we walk the entries and remove them. Callers
-/// must serialise this with concurrent writers themselves — the
-/// engine only invokes it under `clear_namespace` / compaction
-/// reset, both of which already hold the engine's logical
-/// "exclusive" stance.
-fn clear_skipmap(map: &SkipMap<Vec<u8>, u64>) {
-    let keys: Vec<Vec<u8>> = map.iter().map(|entry| entry.key().clone()).collect();
-    for key in keys {
-        let _ = map.remove(&key);
-    }
-}
-
 /// Read-only meta-sidecar peek without opening a full Store.
 /// Used by the engine to extract the encryption salt before
 /// opening the file with the right key.
-fn peek_header(path: &std::path::Path) -> Result<Option<MetaHeader>> {
+#[cfg(feature = "encrypt")]
+fn peek_header(path: &Path) -> Result<Option<MetaHeader>> {
     meta::read(path)
 }
 
@@ -1758,21 +2063,257 @@ fn journal_has_bytes(path: &std::path::Path) -> Result<bool> {
     }
 }
 
-/// Sibling-file path used by [`Engine::compact_in_place`] as the
-/// rewrite target before the atomic rename.
-fn compaction_temp_path(path: &std::path::Path) -> std::path::PathBuf {
-    let mut out = path.to_path_buf();
-    let original_name = path
+/// `<path><suffix>` in the same directory, for any file name
+/// (including names that are not valid UTF-8).
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("emdb");
-    out.set_file_name(format!("{original_name}.compact.tmp"));
-    out
+        .map_or_else(|| std::ffi::OsString::from("emdb"), |n| n.to_os_string());
+    name.push(suffix);
+    path.with_file_name(name)
 }
 
-// Suppress unused warning for the import on builds where neither encrypt
-// branch references Mmap directly.
-#[allow(dead_code)]
-fn _mmap_type_anchor() -> Option<Arc<Mmap>> {
-    None
+/// Sibling-file path used by [`Engine::compact_in_place`] as the
+/// rewrite target before the atomic rename.
+fn compaction_temp_path(path: &Path) -> PathBuf {
+    sibling_path(path, ".compact.tmp")
+}
+
+/// Sibling-file path used by [`Engine::backup_to`] as the rewrite
+/// target before it is renamed onto the backup path.
+fn backup_temp_path(target: &Path) -> PathBuf {
+    sibling_path(target, ".backup.tmp")
+}
+
+/// Encoded size of a tombstone beyond its key: tag, namespace id, key
+/// length, and the fsys frame around it. Used to size batches.
+const TOMBSTONE_OVERHEAD: usize = 1 + 4 + 4 + 12;
+
+/// Keys per tombstone batch when the keys are already in memory.
+#[cfg(feature = "ttl")]
+const TOMBSTONE_BATCH_KEYS: usize = 4096;
+
+/// One namespace's live records, as compaction and backup copy them.
+struct LiveNamespace {
+    ns_id: u32,
+    name: String,
+    /// Payload offsets of the live records, ascending.
+    offsets: Vec<u64>,
+}
+
+/// Positioned reads of record payloads straight from a journal file.
+///
+/// Compaction, backup, `clear` and the encrypted open-time sweep read
+/// every live record once. Reading through the shared mapping would
+/// fault the whole file into the process's resident set; positioned
+/// reads into one reused buffer keep memory bounded by the largest
+/// record.
+struct SourceReader {
+    file: File,
+    buf: Vec<u8>,
+}
+
+impl SourceReader {
+    fn open(path: &Path) -> Result<Self> {
+        Ok(Self {
+            file: File::open(path)?,
+            buf: Vec::new(),
+        })
+    }
+
+    /// Validate the frame header in front of `payload_start` and
+    /// return the payload length.
+    fn payload_len(&mut self, payload_start: u64) -> Result<usize> {
+        let corrupt = |reason| Error::Corrupted {
+            offset: payload_start,
+            reason,
+        };
+        let frame_start = payload_start
+            .checked_sub(FSYS_PRE_PAYLOAD_BYTES)
+            .ok_or_else(|| corrupt("record offset inside the frame header"))?;
+        let mut header = [0_u8; 8];
+        let _pos = self.file.seek(SeekFrom::Start(frame_start))?;
+        self.file.read_exact(&mut header)?;
+        if header[..4] != store::FSYS_FRAME_MAGIC {
+            return Err(corrupt("record offset does not point at a journal frame"));
+        }
+        let len = u64::from(u32::from_le_bytes([
+            header[4], header[5], header[6], header[7],
+        ]));
+        if len > FSYS_MAX_PAYLOAD {
+            return Err(corrupt("journal frame length exceeds the 256 MiB cap"));
+        }
+        usize::try_from(len).map_err(|_| corrupt("journal frame larger than the address space"))
+    }
+
+    /// The payload starting at `payload_start`.
+    fn payload(&mut self, payload_start: u64) -> Result<&[u8]> {
+        let len = self.payload_len(payload_start)?;
+        self.buf.resize(len, 0);
+        self.file.read_exact(&mut self.buf)?;
+        Ok(&self.buf)
+    }
+
+    /// Append the payload starting at `payload_start` to `out` and
+    /// return where it landed.
+    fn append_payload(
+        &mut self,
+        payload_start: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<std::ops::Range<usize>> {
+        let len = self.payload_len(payload_start)?;
+        let start = out.len();
+        out.resize(start + len, 0);
+        self.file.read_exact(&mut out[start..])?;
+        Ok(start..start + len)
+    }
+}
+
+/// A fresh journal written at a temporary path by compaction or
+/// backup.
+struct Rewrite {
+    path: PathBuf,
+    journal: fsys::JournalHandle,
+}
+
+impl Rewrite {
+    /// Create `path` as a new, empty journal. A leftover file from a
+    /// crashed run is removed first and the file is then created with
+    /// `create_new`: fsys opens journals for append, so reusing a
+    /// stale temporary would carry its records (including keys
+    /// removed since) into the rewrite.
+    fn create(fs: &fsys::Handle, path: &Path) -> Result<Self> {
+        remove_if_exists(path)?;
+        // SECURITY-MERGE: create_private_file (owner-only temporary;
+        // Ok(false) must be an error here, like `create_new` below)
+        drop(OpenOptions::new().write(true).create_new(true).open(path)?);
+        match fs.journal_with(path, store::journal_options()) {
+            Ok(journal) => Ok(Self {
+                path: path.to_path_buf(),
+                journal,
+            }),
+            Err(err) => {
+                let _ignored = remove_if_exists(path);
+                Err(from_fsys(err))
+            }
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Append `payloads` as one batch; returns their payload offsets.
+    fn append_batch(&self, payloads: &[&[u8]]) -> Result<Vec<u64>> {
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let end = self.journal.append_batch(payloads).map_err(from_fsys)?;
+        Ok(batch_payload_starts(end.as_u64(), payloads))
+    }
+
+    /// Make everything written so far durable.
+    fn sync(&self) -> Result<()> {
+        self.journal
+            .sync_through(self.journal.next_lsn())
+            .map_err(from_fsys)
+    }
+
+    /// Open a read handle on the rewritten file and map it.
+    fn open_for_reading(&self) -> Result<(File, Mmap)> {
+        let file = File::open(&self.path)?;
+        // SAFETY: read-only mapping of a file this process just wrote
+        // and synced. Nothing truncates it: the database lock keeps
+        // other emdb instances out, and from here on the file only
+        // grows (it becomes the live journal).
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok((file, mmap))
+    }
+
+    /// Hand over the journal handle (it becomes the live journal after
+    /// a compaction, or is closed after a backup).
+    fn into_journal(self) -> fsys::JournalHandle {
+        self.journal
+    }
+
+    /// Give up on the rewrite: close the journal, remove the
+    /// temporary, and return `err`. A failed removal is ignored
+    /// because `err` is what the caller needs, and the next rewrite
+    /// removes the leftover before it starts.
+    fn abandon(self, err: Error) -> Error {
+        let Self { path, journal } = self;
+        drop(journal);
+        let _ignored = remove_if_exists(&path);
+        err
+    }
+}
+
+/// What the recovery scan learned about expired records, for the
+/// open-time sweep: the default-namespace keys whose live record had
+/// already expired, or `None` when the journal holds encrypted records
+/// (their expiry is only readable after decrypting them again).
+#[cfg(feature = "ttl")]
+type OpenExpired = Option<Vec<Vec<u8>>>;
+#[cfg(not(feature = "ttl"))]
+type OpenExpired = ();
+
+/// Tracks, while the recovery scan replays the journal, which
+/// default-namespace keys currently hold an expired record. Reads the
+/// plaintext payload the scan already has in memory, so the open-time
+/// sweep needs no second pass over the file.
+#[cfg(feature = "ttl")]
+struct ExpiryTracker {
+    now: u64,
+    expired: std::collections::HashSet<Vec<u8>>,
+    encrypted: bool,
+}
+
+#[cfg(feature = "ttl")]
+impl ExpiryTracker {
+    fn new(now: u64) -> Self {
+        Self {
+            now,
+            expired: std::collections::HashSet::new(),
+            encrypted: false,
+        }
+    }
+
+    fn observe(&mut self, payload: &[u8]) {
+        if payload
+            .first()
+            .is_some_and(|tag| tag & format::TAG_ENCRYPTED_FLAG != 0)
+        {
+            self.encrypted = true;
+            return;
+        }
+        match format::decode_payload(payload) {
+            Ok(RecordView::Insert {
+                ns_id: DEFAULT_NAMESPACE_ID,
+                key,
+                expires_at,
+                ..
+            }) => {
+                if expires_at != 0 && expires_at <= self.now {
+                    let _new = self.expired.insert(key.to_vec());
+                } else {
+                    let _was = self.expired.remove(key);
+                }
+            }
+            Ok(RecordView::Remove {
+                ns_id: DEFAULT_NAMESPACE_ID,
+                key,
+            }) => {
+                let _was = self.expired.remove(key);
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(self) -> OpenExpired {
+        if self.encrypted {
+            None
+        } else {
+            Some(self.expired.into_iter().collect())
+        }
+    }
 }

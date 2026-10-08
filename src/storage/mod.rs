@@ -6,7 +6,6 @@
 //! This module is the entire on-disk backend; there is no alternate
 //! path. The public `Emdb` handle wraps a single [`Engine`] instance.
 
-#[allow(dead_code)]
 pub(crate) mod engine;
 #[allow(dead_code)]
 pub(crate) mod flush;
@@ -14,10 +13,9 @@ pub(crate) mod flush;
 pub(crate) mod format;
 #[allow(dead_code)]
 pub(crate) mod index;
-#[allow(dead_code)]
+pub(crate) mod integrity;
 pub(crate) mod meta;
-#[allow(dead_code)]
 pub(crate) mod store;
 
-pub(crate) use engine::{Engine, EngineConfig, DEFAULT_NAMESPACE_ID};
+pub(crate) use engine::{Engine, EngineConfig, ReadView, DEFAULT_NAMESPACE_ID};
 pub use flush::FlushPolicy;

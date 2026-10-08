@@ -3,11 +3,12 @@
 //! Sidecar metadata file (`<path>.meta`).
 //!
 //! Pre-`v0.9` emdb databases carried metadata in a 4 KiB header at
-//! offset 0 of the data file. With the v0.9 fsys-journal substrate
-//! the data file's bytes 0..N are owned by fsys's frame format —
-//! we no longer have a place to put a header inside the data file.
-//! Metadata moves to a sibling `<path>.meta` file written via
-//! `fsys::Handle::write` for atomic-replace updates.
+//! offset 0 of the data file. Since v0.9 the data file holds nothing
+//! but fsys journal frames (there is no header in it at all), so the
+//! metadata lives in a sibling `<path>.meta` file. The sidecar body
+//! is checksummed with CRC-32 (IEEE); the journal frames use CRC-32C.
+//! The sidecar is written via `fsys::Handle::write` for
+//! atomic-replace updates.
 //!
 //! ## Wire format
 //!
@@ -15,12 +16,12 @@
 //!   bytes  field             notes
 //!   -----  -----             -----
 //!    0..16 magic             b"EMDB-META\0\0\0\0\0\0\0"
-//!   16..20 format_ver        u32 LE — currently 1
-//!   20..24 flags             u32 LE — feature bits (encryption, etc.)
-//!   24..32 created_at_ms     u64 LE — Unix milliseconds at first open
+//!   16..20 format_ver        u32 LE, currently 1
+//!   20..24 flags             u32 LE, feature bits (encryption, etc.)
+//!   24..32 created_at_ms     u64 LE, Unix milliseconds at first open
 //!   32..48 encryption_salt   16-byte Argon2id salt; zeroed when not in use
 //!   48..108 encryption_verify 60-byte AEAD verification block; zeroed when not in use
-//!  108..112 body_crc          u32 LE — CRC32 of bytes 0..108
+//!  108..112 body_crc          u32 LE, CRC-32 (IEEE) of bytes 0..108
 //! ```
 //!
 //! Total: **112 bytes**. Fixed-size, single-version v1. Future
@@ -30,10 +31,11 @@
 //! Atomicity comes from the writer: every save uses
 //! [`fsys::Handle::write`] which takes a temp-file + atomic rename
 //! path. A torn write either leaves the previous body intact or
-//! produces a complete new body — never a partial one.
+//! produces a complete new body, never a partial one.
 
 use std::path::Path;
 
+use crate::error::from_fsys;
 use crate::{Error, Result};
 
 /// Magic prefix identifying the sidecar as an emdb meta file.
@@ -56,6 +58,7 @@ pub(crate) const META_BODY_LEN: usize = 112;
 /// Header flag bit indicating the database is encrypted at rest.
 pub(crate) const FLAG_ENCRYPTED: u32 = 1 << 0;
 /// Header flag bit selecting ChaCha20-Poly1305 (vs AES-256-GCM).
+#[cfg(any(feature = "encrypt", test))]
 pub(crate) const FLAG_CIPHER_CHACHA20: u32 = 1 << 1;
 
 /// Decoded metadata header.
@@ -166,33 +169,21 @@ pub(crate) fn read(db_path: &Path) -> Result<Option<MetaHeader>> {
     }
 }
 
-/// Write the sidecar metadata file atomically using a fresh
-/// `fsys::Handle`. Routes through [`fsys::Handle::write`]'s
-/// temp-file + atomic-rename path so torn writes either leave
-/// the previous body intact or produce the complete new body.
+/// Write the sidecar metadata file for `db_path` through `fs`.
 ///
-/// Prefer [`write_with`] when the caller already owns a cached
-/// handle — building one here pays the full builder-init cost
-/// (hardware probe, capability detection) on every meta write.
-pub(crate) fn write(db_path: &Path, header: &MetaHeader) -> Result<()> {
-    let fs = fsys::builder()
-        .tune_for(fsys::Workload::Database)
-        .build()
-        .map_err(|err| Error::Io(std::io::Error::other(format!("fsys init: {err}"))))?;
-    write_with(&fs, db_path, header)
+/// Routes through [`fsys::Handle::write`]'s temp-file + atomic-rename
+/// path (which also syncs the parent directory), so a torn write
+/// either leaves the previous body intact or produces the complete
+/// new body.
+pub(crate) fn write_with(fs: &fsys::Handle, db_path: &Path, header: &MetaHeader) -> Result<()> {
+    write_to(fs, &meta_path_for(db_path), header)
 }
 
-/// Write the sidecar metadata file via a caller-supplied
-/// `fsys::Handle`. The atomic-replace contract is identical to
-/// [`write`]; this variant exists so that the engine's cached
-/// handle can be threaded through without re-paying the
-/// builder-init cost on every meta-sidecar persist.
-pub(crate) fn write_with(fs: &fsys::Handle, db_path: &Path, header: &MetaHeader) -> Result<()> {
-    let path = meta_path_for(db_path);
+/// Write a meta body to an explicit sidecar path (used by backup,
+/// which writes the sidecar under a temporary name first).
+pub(crate) fn write_to(fs: &fsys::Handle, meta_path: &Path, header: &MetaHeader) -> Result<()> {
     let body = header.encode();
-    fs.write(&path, &body)
-        .map_err(|err| Error::Io(std::io::Error::other(format!("fsys write meta: {err}"))))?;
-    Ok(())
+    fs.write(meta_path, &body).map_err(from_fsys)
 }
 
 #[inline]

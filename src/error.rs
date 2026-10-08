@@ -39,11 +39,20 @@ pub enum Error {
     ///
     /// Callers should inspect the wrapped `std::io::ErrorKind` and decide
     /// whether retry, fallback, or surface-to-user behavior is appropriate.
+    /// The kind and OS error code of failures reported by the storage
+    /// substrate are preserved. A record larger than the 256 MiB journal
+    /// frame cap is reported here with `ErrorKind::InvalidInput`. A write
+    /// or sync failure poisons the journal: every later write, `flush`
+    /// and `checkpoint` on the same handle fails, and the database must
+    /// be reopened.
     Io(std::io::Error),
 
     /// The file exists but does not contain the emdb magic header.
     ///
-    /// This usually means a non-emdb file was opened by mistake.
+    /// This usually means a non-emdb file was opened by mistake. The
+    /// file is left untouched. Also returned for a database written by
+    /// emdb before 0.9, whose single-file format this version does not
+    /// read.
     MagicMismatch,
 
     /// The on-disk format version does not match this build.
@@ -67,6 +76,14 @@ pub enum Error {
     },
 
     /// Corrupted or truncated data was detected while parsing storage records.
+    ///
+    /// When returned by an open, the journal holds valid records after a
+    /// damaged region, so the damage is not a torn tail left by a crash.
+    /// emdb refuses to open such a file instead of discarding the records
+    /// that follow the damage; the file is left untouched. Restore from a
+    /// backup, or keep a copy and truncate the file at `offset` to accept
+    /// the loss of everything from that point on (see the "Recovery"
+    /// section of `docs/ARCHITECTURE.md`).
     Corrupted {
         /// Byte offset where corruption was detected.
         offset: u64,
@@ -117,7 +134,7 @@ impl fmt::Display for Error {
             Self::InvalidPath => f.write_str("emdb: invalid nested path"),
             #[cfg(feature = "ttl")]
             Self::TtlOverflow => f.write_str("emdb: ttl overflow"),
-            Self::Io(err) => write!(f, "emdb: io error ({})", err.kind()),
+            Self::Io(err) => write!(f, "emdb: io error ({}): {err}", err.kind()),
             Self::MagicMismatch => f.write_str("emdb: file magic mismatch"),
             Self::VersionMismatch { found, expected } => {
                 write!(f, "emdb: format version mismatch (found {}, expected {})", found, expected)
@@ -137,7 +154,7 @@ impl fmt::Display for Error {
                 write!(f, "emdb: lock busy ({})", path.display())
             }
             Self::LockfileError(err) => {
-                write!(f, "emdb: lockfile error ({})", err.kind())
+                write!(f, "emdb: lockfile error ({}): {err}", err.kind())
             }
             #[cfg(feature = "encrypt")]
             Self::Encryption(msg) => write!(f, "emdb: encryption error ({msg})"),
@@ -149,11 +166,32 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) | Self::LockfileError(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+/// Map an `fsys` error into [`Error::Io`].
+///
+/// `fsys::Error::Io` is passed through unchanged so the caller keeps
+/// the `ErrorKind` and the OS error code (`ENOSPC`, `EFBIG`, ...). Any
+/// other `fsys` error is wrapped in an `ErrorKind::Other` I/O error
+/// (reachable through `std::io::Error::get_ref`), whose `Display` is the
+/// fsys message.
+pub(crate) fn from_fsys(err: fsys::Error) -> Error {
+    match err {
+        fsys::Error::Io(io) => Error::Io(io),
+        other => Error::Io(std::io::Error::other(other)),
     }
 }
 
@@ -168,14 +206,50 @@ mod tests {
     }
 
     #[test]
-    fn test_io_error_display_does_not_leak_payload() {
+    fn test_io_error_display_includes_kind_and_message() {
         let err = Error::Io(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "secret",
+            "open /data/db.emdb",
         ));
         let msg = format!("{}", err);
         assert!(msg.contains("permission denied") || msg.contains("PermissionDenied"));
-        assert!(!msg.contains("secret"));
+        assert!(msg.contains("open /data/db.emdb"));
+    }
+
+    #[test]
+    fn test_source_exposes_wrapped_io_error() {
+        use std::error::Error as _;
+        let err = Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
+        let source = err.source().expect("io source");
+        assert_eq!(source.to_string(), "gone");
+        let lock = Error::LockfileError(std::io::Error::other("held"));
+        assert!(lock.source().is_some());
+        assert!(Error::MagicMismatch.source().is_none());
+    }
+
+    #[test]
+    fn test_from_fsys_io_preserves_kind_and_os_code() {
+        let raw = std::io::Error::from_raw_os_error(2);
+        let kind = raw.kind();
+        match from_fsys(fsys::Error::Io(raw)) {
+            Error::Io(io) => {
+                assert_eq!(io.kind(), kind);
+                assert_eq!(io.raw_os_error(), Some(2));
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_from_fsys_other_keeps_inner_error() {
+        match from_fsys(fsys::Error::QueueFull) {
+            Error::Io(io) => {
+                assert_eq!(io.kind(), std::io::ErrorKind::Other);
+                let inner = io.get_ref().expect("wrapped fsys error");
+                assert!(inner.downcast_ref::<fsys::Error>().is_some());
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
     }
 
     #[test]

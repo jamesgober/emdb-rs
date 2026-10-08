@@ -90,9 +90,12 @@ println!("{} records", db.len()?);
 
 ### `Emdb::open_in_memory() -> Emdb`
 
-Open a non-persistent database that lives entirely in RAM. No
-file is created, no lock is taken. Drops cleanly when the last
-handle is dropped.
+Open a disposable database. Despite the name it is not held in
+RAM only: it is an ordinary database in a uniquely named file
+under the system temp directory, with the usual journal, sidecar
+and lock. The files are removed (best effort) when the last
+handle is dropped; a killed process leaves them behind. Do not use
+it for data that must never touch the disk.
 
 Use cases: unit tests, ephemeral caches, doctests.
 
@@ -783,15 +786,17 @@ db.flush()?;  // durable on disk
 
 ### `checkpoint() -> Result<()>`
 
-Update the sidecar metadata file so the next reopen can fast-skip
-records already validated. Without a checkpoint, reopen scans the
-entire journal end-to-end. With one, reopen starts from the last
-checkpointed LSN.
+Sync the journal (like `flush()`) and rewrite the `.meta` sidecar.
+It does **not** speed up the next open: every open replays the
+whole journal. Earlier documentation claimed a fast-reopen effect
+that never existed. `checkpoint()` fails when an earlier write or
+sync failure poisoned the journal.
 
 Idiom:
 - Call `flush()` after every important write (durability).
-- Call `checkpoint()` periodically at quiescent points (every N
-  writes, every M seconds, on graceful shutdown).
+- Call `checkpoint()` (or `flush()`) before shutdown when you need
+  to know the data reached disk: dropping the last handle flushes
+  as a best effort but cannot report an error.
 
 ```rust,no_run
 use emdb::Emdb;
@@ -801,7 +806,7 @@ for i in 0..1000 {
     db.insert(format!("k{i}"), "v")?;
 }
 db.flush()?;
-db.checkpoint()?;  // future reopens skip the 1000 records above
+db.checkpoint()?;  // journal synced, sidecar rewritten
 # Ok::<(), emdb::Error>(())
 ```
 
@@ -830,12 +835,17 @@ println!("logical size: {} bytes", stats.logical_size_bytes);
 
 ### `backup_to(target) -> Result<()>`
 
-Atomic snapshot to a sibling file. Writes to `<target>.backup.tmp`,
-fsyncs, renames into place. Failure at any step leaves `target`
-untouched.
+Atomic snapshot to a sibling file. Writes the records to
+`<target>.backup.tmp` and the sidecar to `<target>.backup.tmp.meta`,
+fsyncs both, renames them over `<target>.meta` and `<target>`
+(replacing an existing backup atomically) and fsyncs the
+directory. Failure before the renames leaves `target` untouched.
 
-The result is a normal openable database — no proprietary dump
-format.
+The result is a normal openable database (no proprietary dump
+format) with its own sidecar: an encrypted source produces a
+backup that opens with the same key or passphrase. Writers pause
+only while the live set is captured; the copy runs concurrently
+with them.
 
 ```rust,no_run
 use emdb::Emdb;
@@ -860,7 +870,11 @@ contexts. Refuses self-target (target == source).
 
 Rewrite the database file with only live records, reclaiming
 space from removed and replaced entries. Atomic via the same
-temp-file + rename pattern as `backup_to`.
+temp-file + rename pattern as `backup_to`. Writers wait for the
+whole compaction; readers, open iterators and `ValueRef`s are not
+disturbed. Memory use is bounded (a few MiB of batches plus one
+offset per live record). If the final rename fails, the database
+keeps using the original file.
 
 ```rust,no_run
 use emdb::Emdb;
@@ -1430,12 +1444,12 @@ handle in production code:
 
 | Variant | When | Recovery |
 |---|---|---|
-| `Io(io::Error)` | Filesystem error (disk full, permission denied, etc.). | Inspect the inner `io::Error`. |
+| `Io(io::Error)` | Filesystem error (disk full, permission denied, a record over the 256 MiB frame cap, etc.). The OS error kind and code are preserved, `Display` includes the message, and `source()` returns the `io::Error`. | Inspect the inner `io::Error`. After a write or sync failure the journal is poisoned: reopen the database. |
 | `LockBusy { path }` | `Emdb::open` saw a held lock. | See [Lockfile recovery](#lockfile-recovery). |
 | `LockfileError(io::Error)` | The lock file could not be opened or locked for another reason. | Inspect the inner `io::Error`. |
-| `MagicMismatch` | File at the path is not an emdb v0.9+/v1.x database. | Confirm the path. v0.7/v0.8 files are not compatible with v0.9+/v1.x. |
-| `VersionMismatch { found, expected }` | File version doesn't match this emdb release. | Migrate via the previous emdb release. |
-| `Corrupted { offset, reason }` | A record failed validation: a malformed body, a record that references an unbound namespace id, a plaintext record in an encrypted database, or (in an encrypted database whose key verified) a record whose AEAD tag fails. | Restore from backup. This fires on hardware-level corruption or on modification of the file. |
+| `MagicMismatch` | File at the path is not an emdb v0.9+/v1.x journal. The file is left untouched. | Confirm the path. v0.7/v0.8 files are not compatible with v0.9+/v1.x. |
+| `VersionMismatch { found, expected }` | Sidecar format version doesn't match this emdb release. | Migrate via the previous emdb release. |
+| `Corrupted { offset, reason }` | Damaged bytes followed by valid records (an open refuses rather than discarding them), or a record that fails validation: a malformed body, a record that references an unbound namespace id, a plaintext record in an encrypted database, or (in an encrypted database whose key verified) a record whose AEAD tag fails. The file is left untouched. | Restore from backup, or truncate at `offset` to keep everything before it (see ARCHITECTURE.md, "Recovering from `Error::Corrupted`"). This fires on hardware-level corruption or on modification of the file. |
 | `InvalidConfig(reason)` | Builder configuration was inconsistent, or the file does not match the open mode (for example a keyed open of an existing plaintext database, or a plain open of an encrypted one). | Fix the builder call site; convert with `Emdb::enable_encryption` / `disable_encryption`. |
 | `FeatureMismatch { file_flags, build_flags }` | The file needs a feature this build lacks. | Rebuild with the feature. |
 | `InvalidPath` | A nested-key API got an empty prefix (`nested` feature). | Pass a non-empty prefix. |
