@@ -354,13 +354,15 @@ impl Namespace {
 pub struct NamespaceIter {
     inner: Arc<Inner>,
     offsets: std::vec::IntoIter<u64>,
+    view: crate::storage::ReadView,
 }
 
 impl NamespaceIter {
-    fn new(inner: Arc<Inner>, offsets: Vec<u64>) -> Self {
+    fn new(inner: Arc<Inner>, (offsets, view): (Vec<u64>, crate::storage::ReadView)) -> Self {
         Self {
             inner,
             offsets: offsets.into_iter(),
+            view,
         }
     }
 }
@@ -370,7 +372,7 @@ impl Iterator for NamespaceIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         for offset in self.offsets.by_ref() {
-            match self.inner.engine.decode_owned_at(offset) {
+            match self.inner.engine.decode_owned_in(&self.view, offset) {
                 Ok(Some((key, value, _))) => return Some((key, value)),
                 Ok(None) => continue,
                 Err(_) => continue,
@@ -384,13 +386,15 @@ impl Iterator for NamespaceIter {
 pub struct NamespaceKeyIter {
     inner: Arc<Inner>,
     offsets: std::vec::IntoIter<u64>,
+    view: crate::storage::ReadView,
 }
 
 impl NamespaceKeyIter {
-    fn new(inner: Arc<Inner>, offsets: Vec<u64>) -> Self {
+    fn new(inner: Arc<Inner>, (offsets, view): (Vec<u64>, crate::storage::ReadView)) -> Self {
         Self {
             inner,
             offsets: offsets.into_iter(),
+            view,
         }
     }
 }
@@ -400,7 +404,7 @@ impl Iterator for NamespaceKeyIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         for offset in self.offsets.by_ref() {
-            match self.inner.engine.decode_owned_at(offset) {
+            match self.inner.engine.decode_owned_in(&self.view, offset) {
                 Ok(Some((key, _value, _))) => return Some(key),
                 Ok(None) => continue,
                 Err(_) => continue,
@@ -415,13 +419,18 @@ impl Iterator for NamespaceKeyIter {
 pub struct NamespaceRangeIter {
     inner: Arc<Inner>,
     pairs: std::vec::IntoIter<(Vec<u8>, u64)>,
+    view: crate::storage::ReadView,
 }
 
 impl NamespaceRangeIter {
-    fn new(inner: Arc<Inner>, pairs: Vec<(Vec<u8>, u64)>) -> Self {
+    fn new(
+        inner: Arc<Inner>,
+        (pairs, view): (Vec<(Vec<u8>, u64)>, crate::storage::ReadView),
+    ) -> Self {
         Self {
             inner,
             pairs: pairs.into_iter(),
+            view,
         }
     }
 }
@@ -431,7 +440,7 @@ impl Iterator for NamespaceRangeIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         for (key, offset) in self.pairs.by_ref() {
-            match self.inner.engine.read_value_with_meta_at(offset, &key) {
+            match self.inner.engine.read_value_in(&self.view, offset, &key) {
                 Ok(Some((value, _expires))) => return Some((key, value)),
                 Ok(None) => continue,
                 Err(_) => continue,

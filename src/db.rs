@@ -55,10 +55,15 @@ pub(crate) struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         if self.ephemeral {
+            // Best-effort cleanup of the temp files backing an
+            // `open_in_memory` handle: `Drop` cannot report failures,
+            // and a leftover file in the temp directory is harmless.
             let path = &self.path;
-            let display = path.display().to_string();
             let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_file(format!("{display}.lock"));
+            let _ = std::fs::remove_file(crate::storage::meta::meta_path_for(path));
+            let mut lock = path.as_os_str().to_owned();
+            lock.push(".lock");
+            let _ = std::fs::remove_file(lock);
         }
     }
 }
@@ -83,11 +88,16 @@ impl Emdb {
         EmdbBuilder::new().path(path.as_ref().to_path_buf()).build()
     }
 
-    /// Open an ephemeral database. The handle is backed by a unique
-    /// temp-file path that is removed when the last clone drops. Useful
-    /// for tests, REPLs, and anywhere a disposable in-memory-shaped
-    /// store is wanted; behaviour is identical to [`Emdb::open`] except
-    /// for the ephemeral cleanup.
+    /// Open an ephemeral database.
+    ///
+    /// Despite the name, the database is not held in memory only: it is
+    /// an ordinary emdb database in a uniquely named file under
+    /// [`std::env::temp_dir`], written through the same journal as
+    /// [`Emdb::open`]. The file and its `.meta` and `.lock` sidecars are
+    /// removed when the last clone drops (best effort; a process that
+    /// is killed leaves them behind). Useful for tests, REPLs, and
+    /// anywhere a disposable store is wanted; do not use it for data
+    /// that must not touch the disk.
     ///
     /// Panics if the temp directory is unwritable — this method is for
     /// tests/dev convenience and is not appropriate for production
@@ -193,11 +203,7 @@ impl Emdb {
             }),
         };
 
-        #[cfg(feature = "ttl")]
-        {
-            let _evicted = db.sweep_expired();
-        }
-
+        // The open-time expiry sweep now runs inside `Engine::open`.
         Ok(db)
     }
 
@@ -394,6 +400,12 @@ impl Emdb {
     }
 
     /// Drop every record from the default namespace.
+    ///
+    /// Writes a remove record for every live key, so the clear
+    /// survives a reopen on the same terms as [`Self::remove`] (durable
+    /// after the next [`Self::flush`], or on return under
+    /// `FlushPolicy::WriteThrough`). Writers on other threads wait
+    /// while it runs. The space is reclaimed by [`Self::compact`].
     pub fn clear(&self) -> Result<()> {
         self.inner.engine.clear_namespace(DEFAULT_NAMESPACE_ID)
     }
@@ -442,27 +454,24 @@ impl Emdb {
         self.inner.engine.stats()
     }
 
-    /// Persist a fast-reopen checkpoint: rewrites the file header with
-    /// the current tail offset and `fdatasync`s.
+    /// Sync the journal (like [`Self::flush`]) and rewrite the `.meta`
+    /// sidecar through an atomic replace.
     ///
-    /// `flush` only syncs record bytes; it deliberately does not
-    /// rewrite the header on every call because that would dominate
-    /// per-record fsync latency on Windows. The recovery scan is
-    /// always correct without an up-to-date header — it just costs a
-    /// linear walk of the data region from the last persisted hint.
-    /// `checkpoint` updates the hint so the next [`Self::open`] starts
-    /// its scan past the bulk of the log.
+    /// The sidecar holds no recovery position: every [`Self::open`]
+    /// scans the whole journal to rebuild the index, with or without
+    /// a checkpoint, so this does not make the next open faster.
+    /// Earlier documentation claimed otherwise. The sidecar is already
+    /// written whenever its contents change, so `checkpoint` is mainly
+    /// a durability barrier that also reports a poisoned journal.
     ///
-    /// Call this at quiescent points (after a bulk load, before a
-    /// long idle period, on graceful shutdown). The [`Drop`] of the
-    /// last handle attempts a checkpoint as a backstop, but its
-    /// success is not guaranteed (`Drop` cannot return errors), so
-    /// callers that depend on a fast next-open should call this
-    /// explicitly.
+    /// Dropping the last handle flushes as a best effort, but cannot
+    /// report a failure; call this or [`Self::flush`] before shutdown
+    /// when the outcome matters.
     ///
     /// # Errors
     ///
-    /// Returns I/O errors from the header write or the `fdatasync`.
+    /// Returns I/O errors from the sync or the sidecar write. Fails
+    /// when an earlier write or sync failure poisoned the journal.
     pub fn checkpoint(&self) -> Result<()> {
         self.inner.engine.checkpoint()
     }
@@ -470,11 +479,13 @@ impl Emdb {
     /// Iterator over `(key, value)` pairs in the default namespace.
     ///
     /// The iterator captures a snapshot of live record offsets at
-    /// the time of this call and decodes each record lazily on
-    /// `next()`. Memory use is `O(N)` for `N` record offsets — it
-    /// does *not* eagerly materialise every value. Records inserted
-    /// after the snapshot is taken are not visible; records removed
-    /// after the snapshot are skipped on decode.
+    /// the time of this call, pins the file mapping they point into,
+    /// and decodes each record lazily on `next()`. Memory use is
+    /// `O(N)` for `N` record offsets; values are not materialised up
+    /// front. The iterator yields the database as it was at this call:
+    /// later inserts, removes and compactions do not change what it
+    /// returns (a compaction leaves the pinned mapping of the old file
+    /// readable until the iterator drops).
     pub fn iter(&self) -> Result<EmdbIter> {
         let offsets = self.inner.engine.snapshot_offsets(DEFAULT_NAMESPACE_ID)?;
         Ok(EmdbIter::new(Arc::clone(&self.inner), offsets))
@@ -752,12 +763,18 @@ impl Emdb {
     /// database that can be opened with [`Self::open`] — it is not a
     /// dump format, archive, or proprietary blob.
     ///
-    /// Implementation: writes to `<target>.backup.tmp`, `fdatasync`s,
-    /// then `rename`s into place. Failure at any step leaves `target`
-    /// untouched and the temp file is best-effort cleaned up.
+    /// Implementation: the set of live records is captured with writers
+    /// paused for the index walk only; the records are then copied to
+    /// `<target>.backup.tmp`, its sidecar written to
+    /// `<target>.backup.tmp.meta`, both synced, and both renamed over
+    /// `<target>.meta` and `target` (an atomic replace, never a delete
+    /// followed by a rename). Failure before the renames leaves
+    /// `target` untouched and the temporaries are removed. The backup
+    /// keeps the source's encryption salt and verification block, so
+    /// it opens with the same key or passphrase.
     ///
     /// `target` must differ from the live database's own path. If
-    /// `target` already exists, it is overwritten — emdb does not
+    /// `target` already exists, it is overwritten; emdb does not
     /// keep historical backups for you; callers wanting timestamped
     /// snapshots should incorporate the timestamp into `target`.
     ///
@@ -808,15 +825,17 @@ impl Emdb {
     /// until the next compaction. This call walks every namespace's
     /// live index, writes the surviving records into a sibling file
     /// (`<path>.compact.tmp`), syncs it, and atomically renames it
-    /// over the original. Existing readers holding `Arc<Mmap>`
-    /// snapshots from before the compaction continue to read from the
-    /// old inode until they release; new reads see the compacted
-    /// layout.
+    /// over the original. Writers on other threads wait for the whole
+    /// compaction; readers keep running against the old file and switch
+    /// to the new one atomically. Iterators and `ValueRef`s created
+    /// before the compaction keep reading the snapshot they were
+    /// created from. Peak memory is bounded by a few MiB of batch
+    /// buffers plus one offset per live record, not by the file size.
     ///
-    /// This is a heavier operation than [`Self::flush`] — call it on
+    /// This is a heavier operation than [`Self::flush`]: call it in
     /// maintenance windows, not on every write. After compaction the
-    /// file size shrinks to the size of the live records plus the
-    /// 4 KiB header.
+    /// file holds only the live records (each in a 12-byte journal
+    /// frame); there is no file header.
     ///
     /// # Errors
     ///
@@ -876,7 +895,15 @@ impl Emdb {
         ))
     }
 
-    /// Tombstone a named namespace.
+    /// Drop a named namespace and every record in it.
+    ///
+    /// Writes a remove record for every key plus a record that unbinds
+    /// the name, so neither the data nor the name comes back after a
+    /// reopen (durable on the same terms as [`Self::remove`]). Returns
+    /// `false` when no namespace has that name. A later
+    /// [`Self::namespace`] call with the same name creates a new,
+    /// empty namespace. emdb 1.0.2 and earlier, opening a file written
+    /// after a drop, list the name again with no records in it.
     pub fn drop_namespace(&self, name: impl AsRef<str>) -> Result<bool> {
         self.inner.engine.drop_namespace(name.as_ref())
     }
@@ -985,13 +1012,15 @@ impl Inner {
 pub struct EmdbIter {
     inner: Arc<Inner>,
     offsets: std::vec::IntoIter<u64>,
+    view: crate::storage::ReadView,
 }
 
 impl EmdbIter {
-    fn new(inner: Arc<Inner>, offsets: Vec<u64>) -> Self {
+    fn new(inner: Arc<Inner>, (offsets, view): (Vec<u64>, crate::storage::ReadView)) -> Self {
         Self {
             inner,
             offsets: offsets.into_iter(),
+            view,
         }
     }
 }
@@ -1001,7 +1030,7 @@ impl Iterator for EmdbIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         for offset in self.offsets.by_ref() {
-            match self.inner.engine.decode_owned_at(offset) {
+            match self.inner.engine.decode_owned_in(&self.view, offset) {
                 Ok(Some((key, value, _))) => return Some((key, value)),
                 Ok(None) => continue,
                 Err(_) => continue,
@@ -1018,13 +1047,15 @@ impl Iterator for EmdbIter {
 pub struct EmdbKeyIter {
     inner: Arc<Inner>,
     offsets: std::vec::IntoIter<u64>,
+    view: crate::storage::ReadView,
 }
 
 impl EmdbKeyIter {
-    fn new(inner: Arc<Inner>, offsets: Vec<u64>) -> Self {
+    fn new(inner: Arc<Inner>, (offsets, view): (Vec<u64>, crate::storage::ReadView)) -> Self {
         Self {
             inner,
             offsets: offsets.into_iter(),
+            view,
         }
     }
 }
@@ -1034,7 +1065,7 @@ impl Iterator for EmdbKeyIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         for offset in self.offsets.by_ref() {
-            match self.inner.engine.decode_owned_at(offset) {
+            match self.inner.engine.decode_owned_in(&self.view, offset) {
                 Ok(Some((key, _value, _))) => return Some(key),
                 Ok(None) => continue,
                 Err(_) => continue,
@@ -1057,13 +1088,18 @@ impl Iterator for EmdbKeyIter {
 pub struct EmdbRangeIter {
     inner: Arc<Inner>,
     pairs: std::vec::IntoIter<(Vec<u8>, u64)>,
+    view: crate::storage::ReadView,
 }
 
 impl EmdbRangeIter {
-    fn new(inner: Arc<Inner>, pairs: Vec<(Vec<u8>, u64)>) -> Self {
+    fn new(
+        inner: Arc<Inner>,
+        (pairs, view): (Vec<(Vec<u8>, u64)>, crate::storage::ReadView),
+    ) -> Self {
         Self {
             inner,
             pairs: pairs.into_iter(),
+            view,
         }
     }
 }
@@ -1073,7 +1109,7 @@ impl Iterator for EmdbRangeIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         for (key, offset) in self.pairs.by_ref() {
-            match self.inner.engine.read_value_with_meta_at(offset, &key) {
+            match self.inner.engine.read_value_in(&self.view, offset, &key) {
                 Ok(Some((value, _expires))) => return Some((key, value)),
                 Ok(None) => continue,
                 Err(_) => continue,
