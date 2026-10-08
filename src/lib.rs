@@ -272,6 +272,7 @@ mod lockfile;
 mod namespace;
 #[cfg(feature = "nested")]
 mod nested;
+mod private_fs;
 mod stats;
 mod storage;
 mod transaction;
