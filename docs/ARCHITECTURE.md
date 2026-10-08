@@ -51,7 +51,7 @@ the dead records.
                                    │
                 ┌──────────────────▼───────────────────┐
                 │   engine: storage::engine            │
-                │   - decode_owned_at / decode_zerocopy│
+                │   - point reads, iterators, cursors  │
                 │   - append / append_batch            │
                 │   - per-namespace index registry     │
                 └────────┬─────────────┬───────────────┘
