@@ -498,6 +498,25 @@ fn test_lockfile_unlock_then_unlink_race_leaves_one_holder() {
     cleanup(&path);
 }
 
+/// A second open of a database that is already open in this process
+/// reports `LockBusy` on every platform (Windows used to surface
+/// ERROR_LOCK_VIOLATION as `LockfileError`).
+#[test]
+fn test_second_open_in_same_process_returns_lock_busy() {
+    let path = tmp_path("lock-same-process");
+    cleanup(&path);
+    let first = Emdb::open(&path).expect("first open");
+    let second = Emdb::open(&path);
+    assert!(
+        matches!(second, Err(Error::LockBusy { .. })),
+        "second open: {:?}",
+        second.as_ref().map(|_| ())
+    );
+    drop(first);
+    drop(Emdb::open(&path).expect("open after the first handle dropped"));
+    cleanup(&path);
+}
+
 /// Opening the same database through a symbolic link used to derive a
 /// different lock path, so the link and the real path could both be
 /// opened at once.

@@ -83,15 +83,7 @@ fn test_admin_refused_while_database_open() -> Result<()> {
     let held = Emdb::builder().path(&path).encryption_key(OLD).build()?;
     let result =
         Emdb::rotate_encryption_key(&path, EncryptionInput::Key(OLD), EncryptionInput::Key(NEW));
-    // Windows reports a lock held by this same process as
-    // ERROR_LOCK_VIOLATION, which the lockfile surfaces as LockfileError.
-    assert!(
-        matches!(
-            result,
-            Err(Error::LockBusy { .. } | Error::LockfileError(_))
-        ),
-        "{result:?}"
-    );
+    assert!(matches!(result, Err(Error::LockBusy { .. })), "{result:?}");
     drop(held);
     Emdb::rotate_encryption_key(&path, EncryptionInput::Key(OLD), EncryptionInput::Key(NEW))?;
     let db = Emdb::builder().path(&path).encryption_key(NEW).build()?;
