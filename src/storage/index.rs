@@ -738,7 +738,7 @@ impl Shard {
     /// the unit tests reset an index: the engine builds a new one
     /// instead (compaction) or removes keys through tombstones
     /// (`clear`, `drop_namespace`).
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     fn clear(&self) {
         let mut state = self.write.writer.lock();
         let guard = epoch::pin();
@@ -903,7 +903,7 @@ impl Index {
     /// # Errors
     ///
     /// Never fails; `Result`-typed for call-site uniformity.
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn clear(&self) -> Result<()> {
         for shard in self.shards.iter() {
             shard.clear();
