@@ -265,7 +265,7 @@ exhaustive match arms over `Error`; use:
 ```rust,ignore
 match err {
     Error::Io(io_err) => ...,
-    Error::AlreadyLocked => ...,
+    Error::LockBusy { .. } => ...,
     // ... known variants ...
     _ => panic!("unexpected emdb error: {err}"),
 }

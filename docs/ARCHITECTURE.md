@@ -94,7 +94,7 @@ A database is one journal file plus two sidecar files:
 | File | Purpose |
 |---|---|
 | `<path>` | The journal — append-only sequence of frames. |
-| `<path>.lock` | OS-level advisory lockfile (one process at a time). |
+| `<path>.lock` | OS-level advisory lockfile (one process at a time). Created owner-only; left in place on close. |
 | `<path>.meta` | Atomically-replaced metadata sidecar (checkpoint info, encryption header, etc.). |
 
 The journal is **never modified in place** during normal
@@ -132,7 +132,7 @@ emdb encodes one of three payload types (constants live in
 
 | Tag | Constant | Type | Contents |
 |---|---|---|---|
-| `0x00` | `TAG_INSERT` | Insert | `(ns_id, key, value, optional_expires_at)` |
+| `0x00` | `TAG_INSERT` | Insert | `(ns_id, key, value, expires_at)` (`expires_at = 0` means no TTL) |
 | `0x01` | `TAG_REMOVE` | Remove (tombstone) | `(ns_id, key)` |
 | `0x02` | `TAG_NAMESPACE_NAME` | Namespace metadata | `(ns_id, name)` |
 
@@ -144,13 +144,22 @@ encrypted Insert is `0x80`, an encrypted Remove is `0x81`, etc.
 has `ns_id = 0`; named namespaces are assigned dense IDs in the
 order they're first created.
 
-### Length-prefix encoding
+### Field encoding
 
-Keys and values are `(varint_length || bytes)`. Varints use the
-SQLite-style 1–9 byte encoding — short lengths stay 1 byte, the
-worst case is a 9-byte length for a `u64::MAX`-byte payload.
-Most application keys and values fit in 1–2 byte length
-prefixes.
+All integers are little-endian and fixed-width. Bodies are:
+
+- Insert: `[ns_id u32][key_len u32][key][value_len u32][value][expires_at u64]`
+- Remove: `[ns_id u32][key_len u32][key]`
+- NamespaceName: `[ns_id u32][name_len u32][name]`
+
+Decoding is strict: the fields must account for the whole body (no
+trailing bytes), and all offset arithmetic is overflow-checked. A
+record that breaks either rule is `Error::Corrupted`. Recovery also
+requires every Insert/Remove to target the default namespace or an
+id bound earlier in the log by a NamespaceName record, and rejects a
+NamespaceName that binds id 0, id `u32::MAX`, an empty name, or an id
+already bound to a different name. emdb's own writers always satisfy
+these rules.
 
 ---
 
@@ -517,10 +526,47 @@ it periodically (e.g. every minute on a tokio interval).
 
 Gated behind the `encrypt` feature. When configured via
 `EmdbBuilder::encryption_key([u8; 32])` or
-`encryption_passphrase(s)`, every value byte stored in the
-journal is encrypted at-rest with the chosen AEAD cipher
-(AES-256-GCM by default; ChaCha20-Poly1305 via
-`cipher(Cipher::ChaCha20Poly1305)`).
+`encryption_passphrase(s)`, the body of every record in the journal
+(key, value, TTL, namespace id, namespace name) is encrypted at rest
+with the chosen AEAD cipher (AES-256-GCM by default;
+ChaCha20-Poly1305 via `cipher(Cipher::ChaCha20Poly1305)`).
+
+### Threat model
+
+The target is an adversary who obtains a copy of the database file
+(stolen disk, leaked backup, container image) and never observes the
+running process.
+
+What the encryption layer provides:
+
+- **Confidentiality** of record bodies under a 256-bit key.
+- **Per-record authenticity.** Each record body carries its own
+  128-bit AEAD tag. A database opened with a key rejects any record
+  without the encrypted flag, and a record whose tag fails after the
+  key was verified is reported as `Error::Corrupted`.
+
+What it does not provide:
+
+- **Log integrity.** Records are authenticated one at a time, not as
+  a sequence. Someone who can write the file can delete frames,
+  reorder them, replay an older record (rolling a key back to a
+  previous value), truncate the log, or restore an older copy of the
+  whole file. None of this is detected.
+- **Authentication of the record kind.** The tag byte (insert /
+  remove / namespace name) sits outside the AEAD ciphertext in the
+  1.0 format. Since 1.0.3, strict body-length decoding and the
+  namespace-binding checks in recovery reject every kind swap but
+  one narrow case: a remove of a key whose bytes equal the name of
+  its own namespace can be relabelled as a repeat of that
+  namespace binding, which drops the remove. Binding the tag, a
+  database identifier and the record position into the AEAD
+  associated data needs a format revision (planned for 1.1).
+- **Metadata privacy.** Record sizes, record count, record order and
+  kind, the meta sidecar fields (flags, cipher choice, creation
+  time, Argon2 salt), and the PID, start time and crate version of
+  the lock holder in `<path>.lock-meta` are stored in the clear.
+- **Protection of process memory.** Decrypted values, mmap pages and
+  in-flight writes are outside the scope of the storage layer.
 
 ### Cipher
 
@@ -532,42 +578,67 @@ journal is encrypted at-rest with the chosen AEAD cipher
 
 ### Nonce
 
-A 12-byte nonce is generated per record from
-`rand_core::OsRng`. The nonce is stored in the frame payload
-alongside the ciphertext. Nonce reuse is not possible by
-construction — each insert generates a fresh nonce.
+A 12-byte nonce is drawn from the OS RNG (`rand_core::OsRng`) for
+every record and stored in front of the ciphertext. Random nonces
+make reuse improbable, not impossible: the chance of any collision
+among `n` nonces under one key is about `n^2 / 2^97`. NIST SP
+800-38D limits random-nonce AES-GCM to 2^32 encryptions per key.
+Every insert, remove, namespace creation, compaction rewrite and
+backup counts, so rotate the key with `Emdb::rotate_encryption_key`
+well before 2^32 total writes. An RNG failure is reported as
+`Error::Encryption` rather than a panic.
 
 ### Key derivation (passphrase mode)
 
 `encryption_passphrase(s)` runs the passphrase through Argon2id
-with a per-database salt stored in `<path>.meta`. The salt is
-generated on first open and persists across reopens. Default
-Argon2id parameters are `m_cost=64MiB, t_cost=3, p_cost=4`.
+(version 0x13) with a 16-byte per-database salt stored in
+`<path>.meta`. The salt is generated on first open and persists
+across reopens. The parameters are `m_cost = 19 MiB (19_456 KiB),
+t_cost = 2, p_cost = 1`, 32-byte output. They are fixed in code and
+not recorded in the sidecar, so they cannot be raised for an
+existing database yet; a passphrase is only as strong as its
+entropy. Prefer a random 32-byte key from a KMS or secret store.
+
+### Key verification
+
+`<path>.meta` holds a 60-byte verification block at offsets 48..108
+(nonce, encrypted 32-byte magic, tag) and the salt at 32..48. On
+open the block is decrypted; a failure is
+`Error::EncryptionKeyMismatch` before any record is read. A keyed
+open initialises encryption only for a database with no records:
+a keyed open of an existing plaintext database is refused with
+`Error::InvalidConfig` (convert it with `Emdb::enable_encryption`),
+and a plain open of a database with encryption metadata is refused
+the same way.
 
 ### Key rotation
 
-Three static methods rotate / enable / disable encryption
-without rewriting the journal payload itself — they update the
-key-wrapping layer in `<path>.meta` and re-encrypt only the
-data-encryption key (DEK):
+There is no data-encryption-key / key-encryption-key split: the
+supplied (or derived) key encrypts every record directly. The three
+offline admin methods therefore rewrite every record into a new
+file and swap it in:
 
 | Method | Effect |
 |---|---|
 | `Emdb::enable_encryption(path, target)` | Plaintext → encrypted. |
 | `Emdb::disable_encryption(path, current)` | Encrypted → plaintext. |
-| `Emdb::rotate_encryption_key(path, current, new)` | Rewrap the DEK under a new KEK. |
+| `Emdb::rotate_encryption_key(path, current, new)` | Re-encrypt every record under a new key. |
 
-The DEK never leaves memory and never leaves
-`zeroize::Zeroizing` ownership. Argon2id-derived keys and raw
-keys are both wrapped the same way.
+The previous file is kept as `<path>.encbak` (plaintext after
+`enable_encryption`, old-key ciphertext after a rotation); delete it
+once the new file is verified.
 
 ### Memory zeroing
 
-Raw key material flows through `zeroize::Zeroizing<[u8; 32]>`
-wrappers. When the wrapper drops, the underlying bytes are
-written with `0x00` before deallocation. This defends against
-heap-residue attacks on swap files or compromised process
-memory.
+Raw keys and derived keys are held in `zeroize::Zeroizing<[u8; 32]>`
+and passphrases in `Zeroizing<String>`, so the copies emdb holds are
+wiped on drop. The expanded cipher state (AES key schedule,
+GHASH/POLYVAL key, ChaCha20 and Poly1305 state) and the Argon2
+working memory are built with the `zeroize` features of their crates
+and wiped on drop as well. Plaintext record bodies are encoded into,
+and decrypted into, scratch buffers that are wiped before they are
+freed. Values returned to the caller, and the keys, passphrases and
+`EncryptionInput` values the caller holds, are the caller to wipe.
 
 ---
 
@@ -624,7 +695,7 @@ The rules:
 ### Recovery sequence
 
 1. Acquire the lockfile (`Emdb::open` errors with
-   `Error::AlreadyLocked` if held by another process).
+   `Error::LockBusy` if held by another process).
 2. Load the metadata sidecar (`<path>.meta`) — checkpoint LSN,
    encryption header, schema version.
 3. Memory-map the journal file.
@@ -719,11 +790,13 @@ becomes the cap.
 | **Disk full** | fsys's `pwrite` returns `ENOSPC` / `ERROR_DISK_FULL` | `Error::Io`; in-memory state unchanged, journal unchanged. |
 | **Disk corruption** | CRC fail on frame decode | Recovery stops at first bad frame; all data after the bad frame is lost. |
 | **Process kill mid-write** | First decode on next open hits a torn frame | Torn frame is treated as corruption — recovery stops there; pre-flush records are lost. |
-| **Wrong encryption key** | AEAD `decrypt_in_place` fails | `Error::EncryptionError`; no partial reads. |
+| **Wrong encryption key** | AEAD check of the verification block in `<path>.meta` fails | `Error::EncryptionKeyMismatch`; no records are read. |
+| **Encrypted record modified** | AEAD check of the record fails after the key verified | `Error::Corrupted`. |
+| **Plaintext record in an encrypted database** | Tag byte lacks the encrypted flag | `Error::Corrupted`. |
 | **Wrong path / not an emdb file** | Magic mismatch on first frame | `Error::MagicMismatch`. |
 | **Version mismatch** | Schema version in metadata sidecar doesn't match | `Error::VersionMismatch`. |
-| **Lockfile held by dead process** | `Error::AlreadyLocked` | Use `Emdb::lock_holder` to diagnose; `Emdb::break_lock` if the holder is confirmed dead. |
-| **Concurrent open by another process** | OS advisory lock acquisition fails | `Error::AlreadyLocked`. |
+| **Lockfile held by dead process** | `Error::LockBusy` | Use `Emdb::lock_holder` to diagnose; `Emdb::break_lock` if the holder is confirmed dead. |
+| **Concurrent open by another process** | OS advisory lock acquisition fails | `Error::LockBusy`. |
 | **Out of memory** | Allocator failure | Panics (Rust's default `alloc_error_handler`). |
 | **Hash collision** | OVERFLOW state in index; verify-key on decode | Handled transparently; cost is one extra raw-key compare per affected slot. |
 
