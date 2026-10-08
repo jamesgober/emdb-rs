@@ -543,9 +543,7 @@ impl Shard {
                     break;
                 }
                 STATE_TOMBSTONE => {
-                    if reusable.is_none() {
-                        reusable = Some(idx);
-                    }
+                    let _ = reusable.get_or_insert(idx);
                 }
                 STATE_OCCUPIED if snap.hash == hash => {
                     return match resolve(snap.offset, key)? {

@@ -4,6 +4,124 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3](https://github.com/jamesgober/emdb-rs/compare/v1.0.2...v1.0.3) - 2026-10-08
+
+> **Upgrade immediately if you call `compact()`.** In emdb 1.0.0 through
+> 1.0.2, every write made after `compact()` was silently lost (it went to
+> the replaced file), and writes made while a compaction was running could
+> be lost too. Those versions are yanked from crates.io. 1.0.3 also fixes
+> security issues in encrypted databases and several other data-integrity
+> bugs found in a full audit.
+
+No public API change (`cargo semver-checks` against 1.0.2: no update
+required); the on-disk format is unchanged and every 1.0.x database opens.
+
+### Fixed: data integrity
+
+- **Writes after `compact()` were lost.** The engine kept appending to the
+  journal of the replaced file. The journal that wrote the compacted file
+  now becomes the live journal.
+- **Writes and reads during compaction.** Compaction now holds a write gate
+  for its whole run, builds the new index off to the side and swaps it in
+  at once; point reads retry across the swap, and iterators keep reading
+  the mapping they started on.
+- **`clear()` and `drop_namespace()` came back after reopen.** Both now
+  write tombstones (and `drop_namespace` an unbind record) to the journal.
+- **Opening a file that is not an emdb database emptied it.** Such files are
+  now refused with `MagicMismatch` and left untouched.
+- **A corrupted record in the middle of the journal silently discarded every
+  later record.** Damage that is not a torn final write is now refused with
+  `Error::Corrupted` and the file is left untouched (manual recovery is
+  documented). Torn final writes are still recovered automatically.
+- **Same-key writes from several threads** could leave memory and the journal
+  disagreeing, so a restart changed values; two concurrent `remove`s could
+  both return the old value. Writes to a key are now linearizable (striped
+  key locks).
+- **Index races** could store one key twice or let a removed key reappear;
+  `remove` could tombstone a different key with the same hash.
+- **`backup_to`**: passphrase-encrypted backups could not be opened, a
+  wrong-key open damaged the backup's metadata, and replacing an existing
+  backup was not atomic.
+- **Encryption admin** (`enable_encryption`, `rotate_encryption_key`,
+  `disable_encryption`): a crash mid-operation could lose the database, and
+  the rewrite dropped TTLs, revived expired records and swallowed decode
+  errors. The operation now holds the lock throughout, records an intent
+  marker that the next open completes, preserves expiry and stops on errors.
+- **Linux**: large records could read as missing while being written.
+- A failed compaction rename left the handle reading the temporary file.
+- **Expired records** were returned by `iter`, `keys`, range scans, `group`
+  and some namespace getters; `persist` could revive an expired key;
+  `sweep_expired` could delete a fresh re-insert; `len()` could drift and
+  wrap.
+- **Seqlock memory ordering** was unsound under the Rust memory model (real
+  on ARM such as Apple Silicon and Graviton); fixed with the required
+  fences and checked with a loom model.
+- Idle async streams no longer occupy blocking-pool threads.
+- `checkpoint()` now fails on a poisoned journal; graceful drop flushes.
+
+### Security
+
+- **Encrypted databases accepted plaintext records**, so anyone able to write
+  the file could delete keys or alias a namespace without the key. They are
+  now rejected. A keyed open of an existing plaintext database is refused
+  instead of making it unreadable.
+- **Record kinds could be swapped without the key** (an encrypted insert
+  turned into a valid remove). Decoding is now strict. Full binding of
+  records to their position needs a format revision planned for 1.1; the
+  threat model is documented.
+- **Keys and passphrases appeared in `Debug` output** of `EmdbBuilder` and
+  `EncryptionInput`; they are now redacted.
+- Key material is wiped from memory on drop (AES and GHASH state, Argon2
+  memory, passphrases); `aes-gcm` requires `>= 0.10.3` (RUSTSEC-2023-0096).
+- A 21 KB crafted file could make open allocate gigabytes, and a crafted
+  record could redirect a new namespace onto the default one; both are
+  rejected now.
+- The index hash is keyed per process, so colliding keys can no longer be
+  precomputed.
+- On Unix, files emdb creates are owner-only (0600) and its directories 0700;
+  `open_in_memory` uses a private directory removed on drop.
+- Lock file races that allowed two writers, and opening through a symlink to
+  bypass the lock, are fixed.
+- `app_name` / `database_name` reject components that escape the data root
+  on Windows (`C:foo`, device names, dot names).
+
+### Changed
+
+- Opening a journal with valid records after a damaged one fails with
+  `Error::Corrupted` instead of silently truncating.
+- Writers wait while a compaction runs.
+- `checkpoint()` also syncs the journal.
+- `Error` `Display` includes the underlying I/O message, and
+  `Error::source()` returns it.
+- Iterators are point-in-time snapshots that survive compaction; range
+  iterators are lazy cursors (weakly consistent).
+- `persist` returns `false` for an expired key.
+- Appends are serialised on Windows (NTFS zero-fills gaps left by
+  out-of-order extending writes).
+- The lock file stays on disk after close; `.encbak` copies left by the
+  encryption admin functions are documented (after `enable_encryption` it
+  is a plaintext copy).
+- emdb 1.0.2 reading a file written after `drop_namespace` lists the dropped
+  namespace again, empty.
+
+### Performance
+
+| | 1.0.2 | 1.0.3 |
+|---|---|---|
+| Open, 827 MB database (peak RSS) | 1.64 GB | 18.8 MB |
+| Compact, same database (peak RSS) | 3.26 GB | 41.9 MB |
+| `get`, 8 threads (Linux) | 9.9 M/s | 57 to 131 M/s |
+| Index probes at 1M keys (avg hit) | 38 | 1.5 |
+| Windows, 2 concurrent writers | 22 K/s | 289 to 369 K/s |
+| `iter_from(..).take(10)` over 1M keys | 53 to 124 ms | about 1.5 µs |
+
+### Documentation
+
+- Corrected: `checkpoint` behaviour, transaction guarantees (no isolation;
+  real isolation is planned for 1.1), `open_in_memory`, the encryption
+  threat model and Argon2 parameters, error variant names, record size cap
+  (256 MiB), and `.corrupt-*` sidecar files.
+
 ## [1.0.2](https://github.com/jamesgober/emdb-rs/compare/v1.0.1...v1.0.2) - 2026-10-08
 
 **Documentation build fix.** No code change.

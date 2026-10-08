@@ -160,7 +160,9 @@ tuning notes.
 
 ## Status
 
-**v1.0.0.** First stable release. The 1.x line is
+**v1.0.3.** Use 1.0.3 or later: 1.0.0 through 1.0.2 lose writes made
+after `compact()` and are yanked (see the [CHANGELOG](CHANGELOG.md)).
+The 1.x line is
 API-stable and on-disk-format-stable per
 [`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md). The storage substrate is a
 [`fsys`](https://crates.io/crates/fsys) journal — lock-free LSN
