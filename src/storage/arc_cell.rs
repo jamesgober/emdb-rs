@@ -194,9 +194,14 @@ impl<T: Send + Sync + 'static> Drop for ArcCell<T> {
         // SAFETY: `ptr` is the cell's `into_raw` pointer and owns one
         // strong count. `&mut self` means no `CellRef` is alive.
         drop(unsafe { Arc::from_raw(ptr) });
-        // Retired values are released with `self.retired` when the
-        // last strong reference (this one) drops; pending epoch
-        // closures hold only `Weak` references.
+        // Release the retired values here, on this thread. Pending
+        // epoch closures hold only `Weak` references to the list, but
+        // one that is running on another thread right now has upgraded
+        // its reference, and dropping our `Arc` alone would then leave
+        // the list (and every mapping in it) alive until that closure
+        // returns. Clearing under the lock waits for such a closure
+        // and releases everything before `drop` returns.
+        self.retired.lock().clear();
     }
 }
 
