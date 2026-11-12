@@ -466,7 +466,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "emdb"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -550,9 +550,9 @@ dependencies = [
 
 [[package]]
 name = "fsys"
-version = "1.1.3"
+version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4595de57d7119190039a15b63ede88467fb4c83c6f2443bfc5afb7956ee71d14"
+checksum = "faa3632a575a29fe6805329abe31cd1cd8d420b6b93ee7f88e41940175689db8"
 dependencies = [
  "crc32c",
  "crossbeam-channel",
@@ -1321,7 +1321,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -11,8 +11,9 @@
 //! ## Architecture
 //!
 //! emdb is an **fsys-journal-backed append-only KV** with a sharded
-//! in-memory hash index. Writes go through `fsys::JournalHandle`'s
-//! lock-free LSN reservation + group-commit fsync; reads slice
+//! in-memory hash index. Writes take a per-key lock and go through
+//! `fsys::JournalHandle`'s atomic LSN reservation + group-commit
+//! fsync; reads take no lock and slice
 //! directly into a kernel-managed memory map of the same file
 //! (zero-copy). Crash safety is delegated to fsys's CRC-32C frame
 //! validation and five-state tail-truncation taxonomy.
@@ -20,8 +21,8 @@
 //! This is the Bitcask family of storage engines (one append-only
 //! log + an in-memory index), built on top of fsys for the
 //! filesystem substrate. fsys handles platform-specific durability
-//! (NVMe passthrough flush on Linux + Windows, io_uring on Linux,
-//! `WRITE_THROUGH` where appropriate); emdb handles the
+//! (NVMe passthrough flush on Linux + Windows, io_uring on Linux);
+//! emdb handles the
 //! engine-level concerns (per-namespace sharded indices,
 //! encryption, range scans, TTL).
 //!

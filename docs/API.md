@@ -381,7 +381,7 @@ was called, even if it is overwritten or removed while you iterate.
 Keys inserted after `iter()` returns are not yielded. With the
 `ttl` feature, records whose TTL has passed when `next()` reaches
 them are skipped. Records that fail to decode are skipped silently
-(a `try_iter` that surfaces errors is planned for 1.1).
+(a `try_iter` that surfaces errors is planned for a later release).
 
 ```rust
 use emdb::Emdb;
@@ -867,11 +867,20 @@ println!("logical size: {} bytes", stats.logical_size_bytes);
 
 ### `backup_to(target) -> Result<()>`
 
-Atomic snapshot to a sibling file. Writes the records to
+Consistent snapshot to a sibling file. Writes the records to
 `<target>.backup.tmp` and the sidecar to `<target>.backup.tmp.meta`,
-fsyncs both, renames them over `<target>.meta` and `<target>`
-(replacing an existing backup atomically) and fsyncs the
-directory. Failure before the renames leaves `target` untouched.
+fsyncs both, renames them over `<target>.meta` and then `<target>`
+(each rename replaces atomically) and fsyncs the directory. Failure
+before the renames leaves `target` untouched. The commit is two
+renames: a crash between them over an existing backup leaves the
+new `<target>.meta` next to the old `<target>`, which for an
+encrypted database with a different salt does not open. Back up to
+a fresh path when that matters.
+
+Refused with `Error::InvalidConfig` when `target` or
+`<target>.meta` is the database itself or one of the files emdb
+keeps next to it (`.meta`, `.lock`, `.lock-meta`, `.compact.tmp`,
+`.enc.tmp`, `.encbak`, their `.meta` files, `.encadmin`).
 
 The result is a normal openable database (no proprietary dump
 format) with its own sidecar: an encrypted source produces a
@@ -1099,6 +1108,7 @@ returns `self` so calls chain.
 | `enable_range_scans(b)` | Maintain a parallel lock-free `SkipMap` for range queries. Memory cost. |
 | `flush_policy(p)` | `OnEachFlush` (default), `Group`, or `WriteThrough`. |
 | `iouring_sqpoll(idle_ms)` | Opt-in Linux io_uring `SQPOLL` kernel-side submission polling. No-op on macOS/Windows. |
+| `salvage(b)` | Open a journal damaged before its end by keeping the records in front of the damage and moving the rest into `<path>.corrupt-<offset>`, instead of failing with `Error::Corrupted`. Off by default. Since 1.1.0. |
 | `encryption_key(k)` | Raw 32-byte key (`encrypt` feature). |
 | `encryption_passphrase(s)` | Argon2id-derived key (`encrypt` feature). |
 | `cipher(c)` | AES-GCM (default) or ChaCha20-Poly1305 (`encrypt` feature). |
@@ -1328,11 +1338,12 @@ pub enum FlushPolicy {
 - `Group` — concurrent `flush()` calls coalesce into one fsync
   via fsys's group-commit coordinator. Right for N-producer
   workloads with per-record durability.
-- `WriteThrough` — open the file with platform-native
-  synchronous-write flags (`FILE_FLAG_WRITE_THROUGH` on Windows,
-  `O_SYNC` on Linux/BSD). Every `pwrite` is durable on return;
-  `flush()` is near-free. Right when `OnEachFlush`'s
-  `FlushFileBuffers` cost dominates the workload.
+- `WriteThrough`: every write is followed by a sync of the journal
+  up to the new record (fsys `sync_through`; concurrent writers share
+  the sync through group commit), so it is durable on return and
+  `flush()` is near-free. The file is opened like any other journal,
+  without `FILE_FLAG_WRITE_THROUGH` or `O_SYNC`. Right when the
+  caller needs per-record durability without calling `flush()`.
 
 ### `Ttl`
 
@@ -1484,7 +1495,7 @@ handle in production code:
 | `LockfileError(io::Error)` | The lock file could not be opened or locked for another reason. | Inspect the inner `io::Error`. |
 | `MagicMismatch` | File at the path is not an emdb v0.9+/v1.x journal. The file is left untouched. | Confirm the path. v0.7/v0.8 files are not compatible with v0.9+/v1.x. |
 | `VersionMismatch { found, expected }` | Sidecar format version doesn't match this emdb release. | Migrate via the previous emdb release. |
-| `Corrupted { offset, reason }` | Damaged bytes followed by valid records (an open refuses rather than discarding them), or a record that fails validation: a malformed body, a record that references an unbound namespace id, a plaintext record in an encrypted database, or (in an encrypted database whose key verified) a record whose AEAD tag fails. The file is left untouched. | Restore from backup, or truncate at `offset` to keep everything before it (see ARCHITECTURE.md, "Recovering from `Error::Corrupted`"). This fires on hardware-level corruption or on modification of the file. |
+| `Corrupted { offset, reason }` | Damaged bytes followed by valid records (an open refuses rather than discarding them), or a record that fails validation: a malformed body, a record that references an unbound namespace id, a plaintext record in an encrypted database, or (in an encrypted database whose key verified) a record whose AEAD tag fails. The file is left untouched. | Restore from backup, or reopen with `EmdbBuilder::salvage(true)` (or truncate at `offset`) to keep everything before it (see ARCHITECTURE.md, "Recovering from `Error::Corrupted`"). This fires on hardware-level corruption, on modification of the file, on a crafted file too costly to classify, and on a meta sidecar longer than its 112-byte body. |
 | `InvalidConfig(reason)` | Builder configuration was inconsistent, or the file does not match the open mode (for example a keyed open of an existing plaintext database, or a plain open of an encrypted one). | Fix the builder call site; convert with `Emdb::enable_encryption` / `disable_encryption`. |
 | `FeatureMismatch { file_flags, build_flags }` | The file needs a feature this build lacks. | Rebuild with the feature. |
 | `InvalidPath` | A nested-key API got an empty prefix (`nested` feature). | Pass a non-empty prefix. |

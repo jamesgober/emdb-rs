@@ -14,7 +14,7 @@
 // The racy tests repeat their scenario many times per run; set
 // `EMDB_RACE_ROUNDS` to scale them up for soak runs.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -464,13 +464,32 @@ fn test_range_iter_is_lazy_and_sees_keys_ahead_of_the_cursor() -> Result<()> {
 // ---------------------------------------------------------------------
 
 /// Wait for `workers` completion messages, failing (instead of hanging
-/// the test run) when one does not arrive in time.
-fn wait_all(done: &std::sync::mpsc::Receiver<&'static str>, workers: usize, what: &str) {
-    let deadline = std::time::Duration::from_secs(120);
-    for _ in 0..workers {
-        match done.recv_timeout(deadline) {
-            Ok(_) => {}
-            Err(err) => panic!("{what}: a worker did not finish ({err:?}); deadlock?"),
+/// the test run) when the workers stop making progress. Workers bump
+/// `progress` as they go, so a slow run on a loaded host keeps
+/// waiting while a deadlock (no progress at all for `STALL`) fails.
+fn wait_all(
+    done: &std::sync::mpsc::Receiver<&'static str>,
+    workers: usize,
+    progress: &AtomicU64,
+    what: &str,
+) {
+    const STALL: std::time::Duration = std::time::Duration::from_secs(120);
+    let mut finished = 0;
+    let mut last = progress.load(Ordering::Relaxed);
+    let mut last_change = std::time::Instant::now();
+    while finished < workers {
+        match done.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(_) => finished += 1,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let now = progress.load(Ordering::Relaxed);
+                if now != last {
+                    last = now;
+                    last_change = std::time::Instant::now();
+                } else if last_change.elapsed() > STALL {
+                    panic!("{what}: no progress for {STALL:?}; deadlock?");
+                }
+            }
+            Err(err) => panic!("{what}: a worker did not finish ({err:?})"),
         }
     }
 }
@@ -486,14 +505,17 @@ fn test_batches_and_transactions_racing_compaction_do_not_deadlock() -> Result<(
     cleanup(&path);
     let db = Arc::new(Emdb::open(&path)?);
     let stop = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(AtomicU64::new(0));
     let (done_tx, done_rx) = std::sync::mpsc::channel::<&'static str>();
     let rounds = rounds(300) as u32;
 
     let compactor = {
         let (db, stop, done) = (Arc::clone(&db), Arc::clone(&stop), done_tx.clone());
+        let progress = Arc::clone(&progress);
         thread::spawn(move || -> Result<()> {
             while !stop.load(Ordering::Relaxed) {
                 db.compact()?;
+                let _ = progress.fetch_add(1, Ordering::Relaxed);
             }
             let _ = done.send("compactor");
             Ok(())
@@ -502,8 +524,10 @@ fn test_batches_and_transactions_racing_compaction_do_not_deadlock() -> Result<(
     let workers: Vec<_> = (0..3_u32)
         .map(|t| {
             let (db, done) = (Arc::clone(&db), done_tx.clone());
+            let progress = Arc::clone(&progress);
             thread::spawn(move || -> Result<()> {
                 for i in 0..rounds {
+                    let _ = progress.fetch_add(1, Ordering::Relaxed);
                     db.insert_many((0..32_u32).map(|j| (format!("t{t}:b{j}"), format!("{i}"))))?;
                     db.transaction(|tx| {
                         tx.insert(format!("t{t}:tx"), format!("{i}"))?;
@@ -518,9 +542,14 @@ fn test_batches_and_transactions_racing_compaction_do_not_deadlock() -> Result<(
             })
         })
         .collect();
-    wait_all(&done_rx, workers.len(), "writers racing compaction");
+    wait_all(
+        &done_rx,
+        workers.len(),
+        &progress,
+        "writers racing compaction",
+    );
     stop.store(true, Ordering::Relaxed);
-    wait_all(&done_rx, 1, "compactor");
+    wait_all(&done_rx, 1, &progress, "compactor");
     join(compactor)?;
     for worker in workers {
         join(worker)?;

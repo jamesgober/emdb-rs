@@ -175,10 +175,11 @@ let db = Emdb::builder()
     .build()?;
 ```
 
-Every `append` goes through with the OS's write-through flag
-set. No explicit `flush` calls needed; durability is per-append.
-On Windows this maps to `FILE_FLAG_WRITE_THROUGH`; on Linux to
-`O_DSYNC`-equivalent (`RWF_DSYNC` per-write).
+Every `append` is followed by a sync of the journal up to the new
+record (fsys `sync_through`; concurrent writers share the sync
+through group commit). No explicit `flush` calls needed;
+durability is per-append. The file is opened in buffered mode like
+under the other policies; no write-through flag is set.
 
 Use when: every record must be durable immediately and the
 application can't batch. Don't use when: throughput matters

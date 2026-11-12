@@ -165,6 +165,7 @@ impl Emdb {
             enable_range_scans: builder.enable_range_scans,
             flush_policy: builder.flush_policy,
             iouring_sqpoll_idle_ms: builder.iouring_sqpoll_idle_ms,
+            salvage: builder.salvage,
             #[cfg(feature = "encrypt")]
             encryption_key: builder.encryption_key,
             #[cfg(feature = "encrypt")]
@@ -769,8 +770,8 @@ impl Emdb {
         crate::lockfile::LockFile::break_lock(path.as_ref())
     }
 
-    /// Atomically snapshot the live record set into a self-contained
-    /// backup file at `target`. The resulting file is a normal emdb
+    /// Snapshot the live record set into a self-contained backup file
+    /// at `target`. The resulting file is a normal emdb
     /// database that can be opened with [`Self::open`] — it is not a
     /// dump format, archive, or proprietary blob.
     ///
@@ -778,14 +779,24 @@ impl Emdb {
     /// paused for the index walk only; the records are then copied to
     /// `<target>.backup.tmp`, its sidecar written to
     /// `<target>.backup.tmp.meta`, both synced, and both renamed over
-    /// `<target>.meta` and `target` (an atomic replace, never a delete
-    /// followed by a rename). Failure before the renames leaves
-    /// `target` untouched and the temporaries are removed. The backup
+    /// `<target>.meta` and `target`, sidecar first (each rename is an
+    /// atomic replace, never a delete followed by a rename). The
+    /// snapshot is consistent, but the commit is two renames, not one:
+    /// failure before the renames leaves `target` untouched and the
+    /// temporaries are removed, while a crash between them, when
+    /// `target` already existed, leaves the new `<target>.meta` next
+    /// to the old `target` (for an encrypted database with a different
+    /// salt, a pair that does not open). Back up to a fresh path and
+    /// rename it into place yourself when that matters. The backup
     /// keeps the source's encryption salt and verification block, so
     /// it opens with the same key or passphrase.
     ///
-    /// `target` must differ from the live database's own path. If
-    /// `target` already exists, it is overwritten; emdb does not
+    /// `target` must differ from the live database's own path and
+    /// from the files emdb keeps next to it (`.meta`, `.lock`,
+    /// `.lock-meta`, `.compact.tmp`, `.enc.tmp`, `.encbak`, their
+    /// `.meta` files and `.encadmin`), and `<target>.meta` must not be
+    /// one of them either. If `target` already exists, it is
+    /// overwritten; emdb does not
     /// keep historical backups for you; callers wanting timestamped
     /// snapshots should incorporate the timestamp into `target`.
     ///
@@ -821,9 +832,10 @@ impl Emdb {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::InvalidConfig`] if `target` equals the
-    /// live database's path. Returns I/O errors from the rewrite,
-    /// sync, or rename phases.
+    /// Returns [`crate::Error::InvalidConfig`] if `target` (or
+    /// `<target>.meta`) is the live database's path or one of its
+    /// sidecar files. Returns I/O errors from the rewrite, sync, or
+    /// rename phases.
     pub fn backup_to(&self, target: impl AsRef<Path>) -> Result<()> {
         self.inner.engine.backup_to(target.as_ref())
     }

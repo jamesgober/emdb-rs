@@ -32,6 +32,9 @@ pub struct EmdbBuilder {
     /// idling itself after `idle_ms` of no submissions. Linux-only;
     /// silently ignored on other platforms.
     pub(crate) iouring_sqpoll_idle_ms: Option<u32>,
+    /// Open a journal damaged before its end by cutting it at the
+    /// damage (see [`EmdbBuilder::salvage`]). Off by default.
+    pub(crate) salvage: bool,
     #[cfg(feature = "encrypt")]
     pub(crate) encryption_key: Option<crate::encryption::KeyBytes>,
     #[cfg(feature = "encrypt")]
@@ -54,7 +57,8 @@ impl std::fmt::Debug for EmdbBuilder {
             .field("database_name", &self.database_name)
             .field("enable_range_scans", &self.enable_range_scans)
             .field("flush_policy", &self.flush_policy)
-            .field("iouring_sqpoll_idle_ms", &self.iouring_sqpoll_idle_ms);
+            .field("iouring_sqpoll_idle_ms", &self.iouring_sqpoll_idle_ms)
+            .field("salvage", &self.salvage);
         #[cfg(feature = "encrypt")]
         {
             let _ = s
@@ -189,6 +193,37 @@ impl EmdbBuilder {
     #[must_use]
     pub fn flush_policy(mut self, policy: crate::FlushPolicy) -> Self {
         self.flush_policy = policy;
+        self
+    }
+
+    /// Open a journal that is damaged before its end by cutting it at
+    /// the damage. Off by default.
+    ///
+    /// By default, damage that has valid records after it (a bit flip,
+    /// a sector that reads back as zeros, a crafted file) makes the
+    /// open fail with [`crate::Error::Corrupted`] and leaves every
+    /// file untouched, so no acknowledged record is dropped without
+    /// the caller knowing. A torn final record, which is what a crash
+    /// leaves, is recovered either way.
+    ///
+    /// With `salvage(true)` such an open succeeds instead: the
+    /// database keeps every record in front of the damage, and every
+    /// byte from the damaged record to the end of the file is moved
+    /// into a `<path>.corrupt-<offset>` file next to the database
+    /// (nothing is deleted; zero bytes are not copied). Records after
+    /// the damage are not in the opened database. Restoring a backup
+    /// is usually the better recovery; use this when there is none,
+    /// after copying the damaged file somewhere safe.
+    ///
+    /// Salvage does not change what is refused for other reasons: a
+    /// file that is not an emdb database still fails with
+    /// [`crate::Error::MagicMismatch`], a wrong encryption key is
+    /// still rejected, and a damaged record
+    /// that the scan already read past (a valid frame whose contents
+    /// do not decode) with [`crate::Error::Corrupted`].
+    #[must_use]
+    pub fn salvage(mut self, enabled: bool) -> Self {
+        self.salvage = enabled;
         self
     }
 

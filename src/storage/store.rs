@@ -460,15 +460,15 @@ impl Store {
         Ok(payload_start)
     }
 
-    /// Closure-style append. Allocates a small `Vec<u8>` per
-    /// call, hands it to `fill_payload` so the caller can encode
-    /// the tag byte + body in place, then routes through
-    /// [`Self::append`].
-    pub(crate) fn append_with<F>(&self, fill_payload: F) -> Result<u64>
+    /// Closure-style append. Allocates a `Vec<u8>` of `capacity`
+    /// bytes (the payload's exact length) per call, hands it to
+    /// `fill_payload` so the caller can encode the tag byte + body in
+    /// place, then routes through [`Self::append`].
+    pub(crate) fn append_with<F>(&self, capacity: usize, fill_payload: F) -> Result<u64>
     where
         F: FnOnce(&mut Vec<u8>) -> Result<()>,
     {
-        let mut buf = Vec::with_capacity(64);
+        let mut buf = Vec::with_capacity(capacity);
         fill_payload(&mut buf)?;
         self.append(&buf)
     }
@@ -648,24 +648,30 @@ pub(crate) fn batch_payload_starts(end_lsn: u64, payloads: &[&[u8]]) -> Vec<u64>
 /// Returns `true` when this call created it.
 ///
 /// A non-empty file must begin with the fsys frame magic. A leading
-/// zero byte is accepted too: a crash while the very first appends
-/// were in flight can leave an unwritten (zero) reservation at
-/// offset 0, which the recovery scan classifies. Anything else is
-/// refused before fsys gets a chance to treat it as a corrupt tail
-/// and cut it, which would empty a file that was never a database.
+/// zero byte is accepted only in the shapes a crash can leave while
+/// the very first appends were in flight: a file of nothing but zero
+/// bytes, or a zero run (an unwritten reservation) that ends where a
+/// frame header starts. A file whose `.meta` sidecar exists is an
+/// emdb database and goes on to the recovery scan, which classifies
+/// any damage. Anything else is refused with [`Error::MagicMismatch`]
+/// before fsys gets a chance to treat it as a corrupt tail and cut
+/// it, which would empty a file that was never a database.
 fn prepare_data_file(path: &Path) -> Result<bool> {
     match std::fs::metadata(path) {
-        Ok(meta) if meta.is_dir() => Err(Error::InvalidConfig(
+        Ok(info) if info.is_dir() => Err(Error::InvalidConfig(
             "database path names a directory, not a file",
         )),
-        Ok(meta) if meta.len() == 0 => Ok(false),
-        Ok(meta) => {
+        Ok(info) if info.len() == 0 => Ok(false),
+        Ok(info) => {
             let mut head = [0_u8; 4];
-            let want = usize::try_from(meta.len().min(4)).unwrap_or(4);
+            let want = usize::try_from(info.len().min(4)).unwrap_or(4);
             let mut file = File::open(path)?;
             file.read_exact(&mut head[..want])?;
             let head = &head[..want];
-            if head[0] == 0 || head == &FSYS_FRAME_MAGIC[..want] {
+            let journal = head == &FSYS_FRAME_MAGIC[..want]
+                || (head[0] == 0
+                    && (meta::meta_path_for(path).exists() || zero_head_is_a_journal(&mut file)?));
+            if journal {
                 Ok(false)
             } else {
                 Err(Error::MagicMismatch)
@@ -678,6 +684,51 @@ fn prepare_data_file(path: &Path) -> Result<bool> {
             Ok(true)
         }
         Err(err) => Err(Error::Io(err)),
+    }
+}
+
+/// For a file that starts with a zero byte: `true` when every byte is
+/// zero, or when the first non-zero byte starts a frame header with a
+/// plausible length (an unwritten reservation in front of a frame).
+fn zero_head_is_a_journal(file: &mut File) -> Result<bool> {
+    use std::io::{Seek, SeekFrom};
+
+    let _start = file.seek(SeekFrom::Start(0))?;
+    let mut buf = vec![0_u8; 64 * 1024];
+    let mut offset = 0_u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            // Only zeros: no write reached the file.
+            return Ok(true);
+        }
+        if let Some(i) = buf[..n].iter().position(|&b| b != 0) {
+            let first = offset + i as u64;
+            let mut header = [0_u8; 8];
+            let _at = file.seek(SeekFrom::Start(first))?;
+            let mut filled = 0;
+            while filled < header.len() {
+                let got = file.read(&mut header[filled..])?;
+                if got == 0 {
+                    break;
+                }
+                filled += got;
+            }
+            let header = &header[..filled];
+            let magic = header.len().min(4);
+            if header[..magic] != FSYS_FRAME_MAGIC[..magic] {
+                return Ok(false);
+            }
+            if header.len() < 8 {
+                // A header cut short by the end of the file.
+                return Ok(true);
+            }
+            let len = u64::from(u32::from_le_bytes([
+                header[4], header[5], header[6], header[7],
+            ]));
+            return Ok(len <= FSYS_MAX_PAYLOAD);
+        }
+        offset += n as u64;
     }
 }
 

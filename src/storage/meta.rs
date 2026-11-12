@@ -160,13 +160,33 @@ pub(crate) fn meta_path_for(db_path: &Path) -> std::path::PathBuf {
 /// sidecar does not exist (fresh database). Returns
 /// `Ok(Some(_))` for a well-formed body. Errors on malformed
 /// magic / version / CRC.
+///
+/// Reads at most [`META_BODY_LEN`] + 1 bytes, so a damaged or
+/// replaced sidecar of any size costs one small read. A v1 body is
+/// exactly [`META_BODY_LEN`] bytes: a longer file with a v1 header is
+/// reported as [`Error::Corrupted`]; one with another magic or
+/// version keeps the error [`MetaHeader::decode`] gives it.
 pub(crate) fn read(db_path: &Path) -> Result<Option<MetaHeader>> {
+    use std::io::Read;
+
     let path = meta_path_for(db_path);
-    match std::fs::read(&path) {
-        Ok(bytes) => Ok(Some(MetaHeader::decode(&bytes)?)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(Error::from(err)),
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(Error::from(err)),
+    };
+    let mut bytes = Vec::with_capacity(META_BODY_LEN + 1);
+    let _n = file
+        .take(META_BODY_LEN as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let header = MetaHeader::decode(&bytes)?;
+    if bytes.len() > META_BODY_LEN {
+        return Err(Error::Corrupted {
+            offset: META_BODY_LEN as u64,
+            reason: "meta sidecar longer than the v1 body",
+        });
     }
+    Ok(Some(header))
 }
 
 /// Write the sidecar metadata file for `db_path` through `fs`.
@@ -259,6 +279,37 @@ mod tests {
             MetaHeader::decode(&buf),
             Err(Error::VersionMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn read_is_bounded_and_rejects_trailing_bytes() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_u128, |d| d.as_nanos());
+        let mut db = std::env::temp_dir();
+        db.push(format!("emdb-meta-read-{}-{nanos}", std::process::id()));
+        let meta = meta_path_for(&db);
+        std::fs::write(&meta, MetaHeader::fresh(0).encode()).expect("write");
+        assert!(matches!(read(&db), Ok(Some(_))));
+        // A sidecar grown to 1 GiB (sparse, so cheap to create) is
+        // refused after one small read instead of being loaded.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&meta)
+            .expect("open");
+        file.set_len(1 << 30).expect("grow");
+        drop(file);
+        assert!(matches!(
+            read(&db),
+            Err(Error::Corrupted { offset: 112, .. })
+        ));
+        // Another layout keeps its own error.
+        let mut other = MetaHeader::fresh(0).encode().to_vec();
+        other[16] = 2;
+        other.extend_from_slice(&[0_u8; 64]);
+        std::fs::write(&meta, &other).expect("write");
+        assert!(matches!(read(&db), Err(Error::VersionMismatch { .. })));
+        let _ = std::fs::remove_file(&meta);
     }
 
     #[test]
