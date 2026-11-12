@@ -482,7 +482,7 @@ fn test_data_dir_names_that_escape_or_alias_are_rejected() {
     // Ordinary names keep working.
     let db = Emdb::builder()
         .data_root(&root)
-        .app_name("hive-kv")
+        .app_name("myapp-kv")
         .database_name("core.v2.emdb")
         .build()
         .expect("plain names");

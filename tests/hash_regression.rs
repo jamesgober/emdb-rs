@@ -26,8 +26,6 @@
 // deterministic property of the function. A single-threaded
 // insert+verify catches a regressed hash function without needing
 // CI-flake-prone multi-threaded reproduction.
-//
-// See `.dev/release/v0.9.6.md` for the full diagnosis trail.
 
 use emdb::Emdb;
 

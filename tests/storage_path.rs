@@ -22,7 +22,7 @@ fn explicit_data_root_with_named_app_and_db_round_trips() -> Result<()> {
     {
         let db = EmdbBuilder::new()
             .data_root(root.clone())
-            .app_name("hive")
+            .app_name("myapp")
             .database_name("sessions.emdb")
             .build()?;
         db.insert(b"k", b"v")?;
@@ -30,7 +30,7 @@ fn explicit_data_root_with_named_app_and_db_round_trips() -> Result<()> {
     }
 
     // The file landed exactly where the resolver promised it would.
-    let expected = root.join("hive").join("sessions.emdb");
+    let expected = root.join("myapp").join("sessions.emdb");
     assert!(
         expected.exists(),
         "database file should exist at {expected:?}"
@@ -41,7 +41,7 @@ fn explicit_data_root_with_named_app_and_db_round_trips() -> Result<()> {
     {
         let reopened = EmdbBuilder::new()
             .data_root(root.clone())
-            .app_name("hive")
+            .app_name("myapp")
             .database_name("sessions.emdb")
             .build()?;
         assert_eq!(reopened.get(b"k")?.as_deref(), Some(b"v".as_slice()));
@@ -63,14 +63,14 @@ fn dash_joined_app_name_round_trips() -> Result<()> {
     {
         let db = EmdbBuilder::new()
             .data_root(root.clone())
-            .app_name("hivedb-kv")
+            .app_name("myapp-kv")
             .database_name("sessions.emdb")
             .build()?;
         db.insert(b"session-1", b"alpha")?;
         db.flush()?;
     }
 
-    let expected = root.join("hivedb-kv").join("sessions.emdb");
+    let expected = root.join("myapp-kv").join("sessions.emdb");
     assert!(
         expected.exists(),
         "dash-joined app folder should land at {expected:?}"
@@ -78,7 +78,7 @@ fn dash_joined_app_name_round_trips() -> Result<()> {
 
     let reopened = EmdbBuilder::new()
         .data_root(root.clone())
-        .app_name("hivedb-kv")
+        .app_name("myapp-kv")
         .database_name("sessions.emdb")
         .build()?;
     assert_eq!(
@@ -98,7 +98,7 @@ fn explicit_data_root_round_trips_through_v07() -> Result<()> {
     {
         let db = EmdbBuilder::new()
             .data_root(root.clone())
-            .app_name("hive")
+            .app_name("myapp")
             .database_name("events.emdb")
             .build()?;
         db.insert(b"alpha", b"one")?;
@@ -106,12 +106,12 @@ fn explicit_data_root_round_trips_through_v07() -> Result<()> {
         db.flush()?;
     }
 
-    let expected = root.join("hive").join("events.emdb");
+    let expected = root.join("myapp").join("events.emdb");
     assert!(expected.exists(), "v0.7 db should land at {expected:?}");
 
     let reopened = EmdbBuilder::new()
         .data_root(root.clone())
-        .app_name("hive")
+        .app_name("myapp")
         .database_name("events.emdb")
         .build()?;
     assert_eq!(reopened.get(b"alpha")?.as_deref(), Some(b"one".as_slice()));
@@ -143,7 +143,7 @@ fn defaults_apply_when_only_data_root_is_set() -> Result<()> {
 fn explicit_path_with_os_resolution_methods_is_rejected() {
     let result = EmdbBuilder::new()
         .path("/tmp/should-not-be-used.emdb")
-        .app_name("hive")
+        .app_name("myapp")
         .build();
     assert!(matches!(result, Err(Error::InvalidConfig(_))));
 
@@ -165,7 +165,7 @@ fn path_separator_in_app_name_is_rejected() {
     // Both `/` and `\` are rejected — `app_name` is intentionally a
     // single folder name to avoid platform-translation complexity.
     let root = temp_root("sep-app");
-    for bad in ["hive/inner", "hive\\inner", "..", "data/.."] {
+    for bad in ["myapp/inner", "myapp\\inner", "..", "data/.."] {
         let result = EmdbBuilder::new()
             .data_root(root.clone())
             .app_name(bad)

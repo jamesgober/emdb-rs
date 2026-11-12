@@ -663,8 +663,6 @@ pinned to the exact v0.9.6 stress pattern (`stress-key-{idx:08}`
 
 If the hash function ever regresses to a FxHash-class mixer,
 these fail loudly with thousands of missing-record assertions.
-See the [v0.9.6 release notes](.dev/release/v0.9.6.md) for the
-original diagnosis trail.
 
 **[`tests/transaction_rollback.rs`](tests/transaction_rollback.rs)** — 12 tests:
 
@@ -2190,8 +2188,8 @@ syscall.
 
 `Emdb::builder()` now resolves a platform-appropriate database file path
 when the caller opts in via `app_name` / `database_name` / `data_root`.
-This closes the embedder-ergonomics gap that previously forced HiveDB and
-every other consumer to know each platform's data-directory convention.
+This closes the embedder-ergonomics gap that previously forced every
+consumer to know each platform's data-directory convention.
 
 - **`src/data_dir.rs`.** Cross-platform resolver: Linux/BSD use
   `$XDG_DATA_HOME` (or `$HOME/.local/share`), macOS uses

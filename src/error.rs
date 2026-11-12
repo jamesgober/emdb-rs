@@ -5,7 +5,7 @@
 //! All fallible operations return [`Result<T>`] — an alias for
 //! `core::result::Result<T, Error>`. The [`Error`] type enumerates every
 //! failure mode the crate can produce. Error codes are reserved under the
-//! `EM-XXXXX` prefix in the wider Hive error registry.
+//! `EM-XXXXX` prefix in the wider error registry.
 
 use core::fmt;
 use std::path::PathBuf;
