@@ -47,7 +47,7 @@
 //! from a prefix of the insert body). The engine's recovery scan adds
 //! the namespace-binding checks that catch the remaining swaps.
 //! Binding the tag into the AEAD associated data needs an on-disk
-//! format revision and is planned for 1.1.
+//! format revision and is planned for a later release.
 
 use crate::{Error, Result};
 
@@ -193,6 +193,21 @@ fn require_exact_end(body: &[u8], end: usize, reason: &'static str) -> Result<()
 // ─────────────────────────────────────────────────────────────────
 // Body encoders (used by Engine to produce payloads for `Store::append`).
 // ─────────────────────────────────────────────────────────────────
+
+/// Length of the body [`encode_insert_body`] writes.
+pub(crate) const fn insert_body_len(key_len: usize, value_len: usize) -> usize {
+    4 + 4 + key_len + 4 + value_len + 8
+}
+
+/// Length of the body [`encode_remove_body`] writes.
+pub(crate) const fn remove_body_len(key_len: usize) -> usize {
+    4 + 4 + key_len
+}
+
+/// Length of the body [`encode_namespace_name_body`] writes.
+pub(crate) const fn namespace_name_body_len(name_len: usize) -> usize {
+    4 + 4 + name_len
+}
 
 /// Encode an `Insert` record body (plaintext payload, no tag byte
 /// or framing). Caller prepends the tag byte before passing the

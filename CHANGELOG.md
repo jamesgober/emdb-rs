@@ -4,6 +4,110 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0](https://github.com/jamesgober/emdb-rs/compare/v1.0.3...v1.1.0) - 2026-11-12
+
+> **Upgrade recommended.** In 1.0.3 a record whose checksum field, or one
+> 512-byte sector of it, reads back as zeros was taken for the remains of a
+> crash: the open succeeded and every later record, flushed or not, was
+> moved out of the database into a `.corrupt-<offset>` file. 1.1.0 refuses
+> such a journal with `Error::Corrupted` and leaves it untouched, and adds
+> an explicit opt-in to salvage it.
+
+One addition to the public API (`EmdbBuilder::salvage`), hence the minor
+version. The on-disk format is unchanged: 1.1.0 opens every 1.0.x database
+and 1.0.x opens every database 1.1.0 writes. MSRV stays at Rust 1.75 and
+there are no new dependencies.
+
+### Added
+
+- **`EmdbBuilder::salvage(bool)`.** Opens a journal that is damaged before
+  its end by keeping every record in front of the damage and moving every
+  byte from the damaged record on into `<path>.corrupt-<offset>` (nothing is
+  deleted). Off by default: without it such an open fails with
+  `Error::Corrupted` and modifies nothing. Foreign files and wrong keys are
+  still refused.
+
+### Fixed
+
+- **Zeroed bytes in a written record no longer cut the journal.** The open
+  told a torn write from damage by looking for zeros, and accepted any record
+  with an all-zero checksum field or an all-zero 512-byte sector as torn, even
+  with valid records after it. A write interrupted by a crash stops at a
+  sector boundary, so a record now counts as torn only when it is zero from a
+  512-byte-aligned offset inside it to its end; and the valid records after
+  such a gap must fit in 64 MiB, the most one crash can leave unsynced.
+  Everything else with valid records after it is refused with
+  `Error::Corrupted`. Torn final records, unwritten reservations and writes
+  cut at a sector boundary are still recovered automatically.
+- **A crafted journal could make the open quadratic** in the file size
+  (a 256 KiB file took about 15 seconds, 1 MiB several minutes). The search
+  for valid records after damage now checksums at most 16 MiB plus twice the
+  size of the damaged region and refuses the open with `Error::Corrupted`
+  once that is spent; it also reads each byte of the damaged region about
+  once instead of once per candidate.
+- **A foreign file starting with a zero byte was emptied.** Files such as
+  MP4, ICO or TrueType, opened by mistake, were accepted as an empty
+  database and their bytes moved to a `.corrupt-0` file. A leading zero byte
+  is now accepted only for what a crash during the first writes leaves (a
+  file of zeros, or a zero run that ends at a record header) or when the
+  file's `.meta` sidecar exists; anything else is refused with
+  `Error::MagicMismatch` and left untouched.
+- **`backup_to` accepted the database's own sidecar files as the target.**
+  `backup_to("<db>.meta")` renamed a journal over the live sidecar, and a
+  passphrase database then lost its salt and could not be opened again.
+  `backup_to` now refuses (`Error::InvalidConfig`) a target, or a target
+  whose `.meta` file, is the database or any file emdb keeps next to it
+  (`.meta`, `.lock`, `.lock-meta`, `.compact.tmp`, `.enc.tmp`, `.encbak`,
+  their `.meta` files, `.encadmin`).
+
+### Security
+
+- **Plaintext left in freed memory by encrypted writes.** The scratch buffer
+  holding a record's plaintext body (key, value, namespace name) started at
+  64 bytes and grew by reallocation; only the final buffer was wiped, so the
+  blocks freed on the way still held the key or the value. The buffer is now
+  allocated once at the body's exact size, for single writes, batches,
+  transactions and namespace records.
+- **Unbounded meta sidecar read.** The open read the whole `<path>.meta`
+  file into memory before decoding its 112-byte body, so a huge or sparse
+  sidecar could exhaust memory. At most 113 bytes are read now; a v1 sidecar
+  longer than its body is refused with `Error::Corrupted`.
+
+### Changed
+
+- The `Error::Corrupted` reason for mid-file damage now points at
+  `EmdbBuilder::salvage(true)`; a second reason reports a damaged region too
+  costly to classify.
+- Plaintext record payloads are allocated at their exact size (they used to
+  start at 64 bytes and grow).
+
+### Documentation
+
+- Corrected: writes are not lock-free (they take a per-key lock and the
+  engine's write gate, and appends are serialised on Windows); reads are.
+- Corrected: `FlushPolicy::WriteThrough` syncs the journal after each append;
+  the file is not opened with `FILE_FLAG_WRITE_THROUGH` or `O_SYNC`.
+- Corrected: `backup_to` takes a consistent snapshot but commits with two
+  renames; the docs no longer call it atomic and describe the crash window.
+- The README comparison table is marked as historical (measured on v0.9.0,
+  not re-measured for 1.x).
+- The record-binding format revision, transaction isolation and the other
+  items earlier notes planned for 1.1 are not part of this release; the
+  docs now say "a later release".
+
+### Tests
+
+- New regression tests for every fix above, including a counting allocator
+  that checks freed blocks for plaintext and a classifier test that bounds
+  the work done on a crafted journal by counting checksummed bytes.
+- The compaction race test fails on lack of progress instead of on a fixed
+  120 s deadline, so a slow, loaded host no longer reports a deadlock.
+
+### Dependencies
+
+- Lock file: tokio 1.53.3 (RUSTSEC-2026-0386), libz-sys 1.1.31 and zstd-sys
+  2.1.2 (benchmark-only dependencies).
+
 ## [1.0.3](https://github.com/jamesgober/emdb-rs/compare/v1.0.2...v1.0.3) - 2026-10-08
 
 > **Upgrade immediately if you call `compact()`.** In emdb 1.0.0 through

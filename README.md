@@ -23,22 +23,30 @@
 ## Why emdb
 
 Bitcask-style architecture on top of [`fsys`](https://crates.io/crates/fsys):
-one fsys-journal-backed append-only log, sharded in-memory hash
-index, lock-free reads + lock-free writes via fsys's atomic LSN
-reservation. fsys handles the platform-specific durability layer
-(NVMe passthrough flush, io_uring on Linux, `WRITE_THROUGH` on
-Windows where appropriate); emdb handles the engine-level concerns.
+one fsys-journal-backed append-only log and a sharded in-memory hash
+index. Reads take no lock. Writes take a per-key lock (so writes to
+one key are linearizable) and append through fsys's atomic LSN
+reservation; writes to different keys run in parallel, except that
+on Windows the append itself is serialised to keep file growth in
+offset order. fsys handles the platform-specific durability layer
+(NVMe passthrough flush, io_uring on Linux); emdb handles the
+engine-level concerns.
 
 ### Performance vs. peers
 
-5 M records, 24-byte random keys, 150-byte random values — same
-workload shape as redb's published bench. Numbers below are
-wall-time milliseconds (lower is better) captured **2026-05-04
-on emdb v0.9.0** against redb 2.6 + sled 0.34, on a Windows 11
-consumer NVMe machine (4-core class CPU, 32 GB RAM, TLC NVMe
-SSD). No source-logic changes have shifted the read/write hot
-paths in 0.9.1 – 0.9.10, so the numbers stand for the current
-release. Reproduce with:
+**Historical numbers.** The table below was captured
+**2026-05-04 on emdb v0.9.0** and has not been re-measured for
+1.x. The 1.0 line changed both hot paths since then: reads go
+through epoch-published mappings and a keyed hash, and every write
+takes a per-key lock and the engine's write gate. Treat the table
+as the shape of the v0.9.0 comparison, not as 1.x numbers, and run
+the bench on your own hardware before sizing anything from it.
+
+5 M records, 24-byte random keys, 150-byte random values (same
+workload shape as redb's published bench), wall-time milliseconds
+(lower is better), against redb 2.6 + sled 0.34 on a Windows 11
+consumer NVMe machine (4-core class CPU, 32 GB RAM, TLC NVMe SSD).
+Reproduce with:
 
 ```powershell
 $env:EMDB_BENCH_RECORDS = "5000000"
@@ -64,13 +72,13 @@ numbers.
 | compacted size              |  **508 MiB**  |    1.64 GiB |       N/A  |     3.3× smaller  |
 | random range reads          |      opt-in   |    2,376 ms |   6,133 ms | see note 1        |
 
-emdb now wins every column. The single-thread `individual writes`
-phase — where v0.8.x was 39× behind redb because each `db.flush()`
-hit one Windows `FlushFileBuffers` per record — is now
-**1.3× faster than redb** and **1.06× faster than sled** thanks
-to the fsys journal substrate (lock-free LSN reservation,
-group-commit fsync, NVMe passthrough flush where supported). One
-note on the column where the table doesn't tell the whole story:
+In that v0.9.0 run emdb won every column. The single-thread
+`individual writes` phase, where v0.8.x was 39× behind redb because
+each `db.flush()` hit one Windows `FlushFileBuffers` per record,
+came out 1.3× faster than redb and 1.06× faster than sled after the
+move to the fsys journal substrate (LSN reservation, group-commit
+fsync, NVMe passthrough flush where supported). One note on the
+column where the table doesn't tell the whole story:
 
 1. **Range reads are opt-in, not unsupported.** emdb's primary
    index is hash-keyed, so the default open does not pay the memory
@@ -84,12 +92,12 @@ note on the column where the table doesn't tell the whole story:
 
 ### Read scaling under fan-out
 
-The MT random-read columns above show emdb scaling to **~9.78 M
-reads/sec aggregate at 8 threads** (5 M reads / 511 ms) on a
-4-core consumer box, while redb stalls near 384 K/sec past one
-thread (5 M reads / 13,026 ms). The lock-free `Arc<Mmap>` read
-path plus the 64-shard hash index keep the hot path contention-
-free; past core count, shared memory bandwidth is the cap.
+In the v0.9.0 run above, the MT random-read columns showed emdb
+scaling to about 9.78 M reads/sec aggregate at 8 threads (5 M reads
+/ 511 ms) on a 4-core consumer box, while redb stalled near
+384 K/sec past one thread (5 M reads / 13,026 ms). Reads take no
+lock (an epoch-pinned mapping plus the 64-shard hash index), so
+past core count shared memory bandwidth is the cap.
 
 For more thread-count granularity, run
 `cargo bench --bench concurrent_reads`.
@@ -126,19 +134,18 @@ let db = Emdb::builder()
 
 ### `FlushPolicy::WriteThrough`: opt-in per-pwrite durability
 
-For workloads where `OnEachFlush`'s per-`flush()` cost is dominated
-by `FlushFileBuffers` latency (the canonical Windows
-single-thread-per-record-durability pain), v0.8.5 adds
-`FlushPolicy::WriteThrough` as a third policy. The file is opened
-with `FILE_FLAG_WRITE_THROUGH` (Windows) / `O_SYNC` (Unix) so every
-`pwrite` is durable on return; `flush()` becomes near-free.
+`FlushPolicy::WriteThrough` makes every write durable before it
+returns. Each append is followed by a sync of the journal up to the
+new record (fsys `sync_through`, an `fdatasync` / `FlushFileBuffers`
+that concurrent writers share through group commit), so `flush()`
+has nothing left to do. The file is opened like any other journal;
+there is no `FILE_FLAG_WRITE_THROUGH` or `O_SYNC` flag involved.
 
-The trade-off is real: bulk loads under `WriteThrough` are slower
-because every individual `pwrite` waits for disk instead of
-benefiting from the OS write-back cache. Whether `WriteThrough`
-beats `OnEachFlush` depends on the workload, the file's existing
-size, and the OS's `FlushFileBuffers` cost on that file. Benchmark
-on your actual data to decide.
+The trade-off is real: every write pays for a sync, so bulk loads
+under `WriteThrough` are much slower than under `OnEachFlush`, which
+syncs once per `flush()` call. Concurrent writers soften the cost
+because their syncs coalesce. Benchmark on your actual data to
+decide.
 
 Reproduce on your machine:
 
@@ -160,14 +167,15 @@ tuning notes.
 
 ## Status
 
-**v1.0.3.** Use 1.0.3 or later: 1.0.0 through 1.0.2 lose writes made
-after `compact()` and are yanked (see the [CHANGELOG](CHANGELOG.md)).
+**v1.1.0.** Use 1.1.0 or later: 1.0.0 through 1.0.2 lose writes made
+after `compact()` and are yanked, and 1.0.3 could drop records after a
+zeroed sector in the journal (see the [CHANGELOG](CHANGELOG.md)).
 The 1.x line is
 API-stable and on-disk-format-stable per
 [`docs/STABILITY-1.0.md`](docs/STABILITY-1.0.md). The storage substrate is a
-[`fsys`](https://crates.io/crates/fsys) journal — lock-free LSN
+[`fsys`](https://crates.io/crates/fsys) journal (atomic LSN
 reservation, group-commit fsync, NVMe passthrough flush,
-io_uring on Linux — with `tune_for(Workload::Database)` preset
+io_uring on Linux) with the `tune_for(Workload::Database)` preset
 applied, `WriteLifetimeHint::Long` on the journal, and vectored
 `append_batch` routing for `insert_many` / transactions /
 compaction. emdb's read path keeps its own `Arc<Mmap>` over the
@@ -219,8 +227,8 @@ passphrase); optional sorted-iteration secondary index via
 `EmdbBuilder::enable_range_scans(true)`; three flush-policy
 variants (`OnEachFlush`, `Group`, `WriteThrough`); streaming
 `iter` / `keys` / `range`; cursor-style `iter_from` /
-`iter_after`; zero-copy `get_zerocopy`; atomic
-`backup_to(path)`; point-in-time `stats()`; stale-lockfile
+`iter_after`; zero-copy `get_zerocopy`; consistent-snapshot
+`backup_to(path)` (committed with two renames, see its docs); point-in-time `stats()`; stale-lockfile
 recovery (`lock_holder` + `break_lock`); namespaces with full
 TTL parity to the top-level handle; transactions with
 read-your-writes + rollback-on-Err semantics. The `async`
@@ -244,10 +252,10 @@ SemVer + MSRV + deprecation policy.
 
 ```toml
 [dependencies]
-emdb = "1.0"
+emdb = "1.1"
 
 # All optional features
-emdb = { version = "1.0", features = ["ttl", "nested", "encrypt", "async"] }
+emdb = { version = "1.1", features = ["ttl", "nested", "encrypt", "async"] }
 ```
 
 MSRV: Rust 1.75.

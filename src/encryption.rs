@@ -35,7 +35,7 @@
 //!   bytes equal its own namespace's name). Binding the tag, the
 //!   database identity and the record position into the AEAD
 //!   associated data requires an on-disk format revision and is
-//!   planned for 1.1.
+//!   planned for a later release.
 //! - **Visible metadata.** Record sizes, record count, record order
 //!   and kind (insert / remove / namespace name), the meta sidecar
 //!   fields (flags, cipher choice, creation time, Argon2 salt) and
@@ -253,21 +253,28 @@ impl EncryptionContext {
     /// Build a complete encrypted record payload,
     /// `[kind | TAG_ENCRYPTED_FLAG][nonce][ciphertext + tag]`.
     ///
-    /// `encode` writes the plaintext record body into a scratch buffer
-    /// that is wiped before this call returns, so the plaintext body
-    /// (key, value, namespace name) does not linger in freed heap
-    /// memory. `kind` is one of the `format::TAG_*` kind values
-    /// without the encrypted flag.
+    /// `encode` writes the plaintext record body, exactly `body_len`
+    /// bytes, into a scratch buffer that is wiped before this call
+    /// returns. The buffer is allocated at `body_len` up front and
+    /// never grows: a reallocation would free the smaller block with
+    /// the start of the body still in it, which `Zeroizing` cannot
+    /// reach. So the plaintext body (key, value, namespace name) does
+    /// not linger in freed heap memory. `kind` is one of the
+    /// `format::TAG_*` kind values without the encrypted flag.
     ///
     /// # Errors
     ///
     /// Same as [`Self::encrypt`].
-    pub(crate) fn seal_record<F>(&self, kind: u8, encode: F) -> Result<Vec<u8>>
+    pub(crate) fn seal_record<F>(&self, kind: u8, body_len: usize, encode: F) -> Result<Vec<u8>>
     where
         F: FnOnce(&mut Vec<u8>),
     {
-        let mut plain: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(64));
+        let mut plain: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(body_len));
         encode(&mut plain);
+        debug_assert!(
+            plain.len() <= body_len,
+            "record body outgrew its scratch buffer"
+        );
         let nonce_then_ct = self.encrypt(&plain)?;
         let mut payload = Vec::with_capacity(1 + nonce_then_ct.len());
         payload.push(kind | TAG_ENCRYPTED_FLAG);
@@ -546,7 +553,7 @@ mod tests {
     fn test_seal_record_sets_flag_and_round_trips() {
         let ctx = EncryptionContext::from_key(&key_a());
         let payload = ctx
-            .seal_record(TAG_INSERT, |buf| buf.extend_from_slice(b"body-bytes"))
+            .seal_record(TAG_INSERT, 10, |buf| buf.extend_from_slice(b"body-bytes"))
             .unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(payload[0], TAG_INSERT | TAG_ENCRYPTED_FLAG);
         let plain = ctx

@@ -4,15 +4,18 @@
 //!
 //! v0.9 inherits the durability machinery from `fsys::JournalHandle`:
 //!
-//! - **Lock-free LSN reservation**: many threads can append
-//!   concurrently with no mutex on the hot path.
+//! - **Atomic LSN reservation**: each append reserves its offset
+//!   with one atomic add, so appends to different keys do not wait
+//!   for each other (on Windows emdb serialises the append itself to
+//!   keep file growth in offset order).
 //! - **Group-commit fsync**: concurrent `sync_through` calls
 //!   coalesce into a single `fdatasync` (or NVMe passthrough
 //!   flush, where the hardware permits).
 //! - **Hardware-aware durability**: fsys's `Method::Auto` picks
-//!   the best primitive for the host platform — io_uring on
-//!   Linux ≥ 5.1, `WRITE_THROUGH` on Windows, plain `fdatasync`
-//!   elsewhere.
+//!   the sync primitive for the host platform (io_uring on
+//!   Linux, `FlushFileBuffers` on Windows, `fdatasync` elsewhere).
+//!   The journal is opened in buffered mode under every policy;
+//!   no policy opens it with `FILE_FLAG_WRITE_THROUGH` or `O_SYNC`.
 //!
 //! The previous `FlushPolicy::Group { max_wait, max_batch }`
 //! tuning knobs are gone. fsys's coordinator runs on a different
@@ -47,9 +50,11 @@ pub enum FlushPolicy {
     /// `max_batch` parameters are not exposed in v0.9 because
     /// fsys's coordinator runs without them.
     Group,
-    /// Every `db.insert()` syncs before returning, so the
-    /// record is durable on stable storage by the time the
-    /// caller sees `Ok(())`. Use this for single-thread
+    /// Every write syncs before returning, so the record is
+    /// durable on stable storage by the time the caller sees
+    /// `Ok(())`. Each append is followed by a `sync_through` of the
+    /// journal up to the new record; concurrent writers share the
+    /// sync through group commit. Use this for single-thread
     /// per-record-durability workloads where the caller cannot
     /// or will not call `flush()` after every record.
     ///

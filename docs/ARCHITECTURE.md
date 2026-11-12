@@ -73,7 +73,6 @@ the dead records.
                 │   - LSN reservation                 │
                 │   - group-commit fsync              │
                 │   - io_uring (Linux)                │
-                │   - WRITE_THROUGH (Windows)         │
                 │   - NVMe passthrough flush          │
                 └─────────────────────────────────────┘
 ```
@@ -99,7 +98,11 @@ A database is one journal file plus two sidecar files:
 
 There is no header inside the journal: byte 0 is the magic of the
 first frame. A non-empty file that does not start with the frame
-magic is refused with `Error::MagicMismatch` and left untouched.
+magic is refused with `Error::MagicMismatch` and left untouched. A
+file that starts with a zero byte is accepted only in the shapes a
+crash during the first appends can leave (all zero bytes, or a zero
+run that ends at a frame header), or when its `.meta` sidecar
+exists.
 
 Other files that can appear next to the database:
 
@@ -223,9 +226,10 @@ The substrate split makes a few things tractable:
 - **Group commit.** N concurrent `flush()` callers coalesce to
   one `fdatasync` — fsys's leader/follower coordinator handles
   the rendezvous.
-- **Platform durability.** Windows gets `FILE_FLAG_WRITE_THROUGH`
-  where appropriate, Linux gets io_uring + `RWF_DSYNC`, macOS
-  gets `F_FULLFSYNC`. emdb doesn't have to know about any of
+- **Platform durability.** fsys picks the sync primitive per
+  platform (`FlushFileBuffers` on Windows, io_uring or `fdatasync`
+  on Linux, `F_FULLFSYNC` on macOS); the journal is opened in
+  buffered mode, without write-through flags. emdb doesn't have to know about any of
   these — it just calls `journal.flush()`.
 
 ---
@@ -620,7 +624,7 @@ What it does not provide:
   its own namespace can be relabelled as a repeat of that
   namespace binding, which drops the remove. Binding the tag, a
   database identifier and the record position into the AEAD
-  associated data needs a format revision (planned for 1.1).
+  associated data needs a format revision (planned for a later release).
 - **Metadata privacy.** Record sizes, record count, record order and
   kind, the meta sidecar fields (flags, cipher choice, creation
   time, Argon2 salt), and the PID, start time and crate version of
@@ -760,8 +764,10 @@ The rules:
    marker is present.
 3. Create a missing data file (empty, owner-only), check that the
    data file is empty or starts with the frame magic
-   (`Error::MagicMismatch` otherwise), and load the
-   metadata sidecar. A missing sidecar is recreated, but only
+   (`Error::MagicMismatch` otherwise; see above for files that start
+   with a zero byte), and load the metadata sidecar (at most 113
+   bytes are read; a sidecar longer than the 112-byte body is
+   `Error::Corrupted`). A missing sidecar is recreated, but only
    after step 5 succeeds, so a failed open writes nothing.
 4. Verify the encryption key against the sidecar's verification
    block (encrypted databases).
@@ -770,17 +776,28 @@ The rules:
    stops before the end of the file, classify what follows:
    - **Nothing valid follows** (a torn final frame or trailing
      garbage): accepted.
-   - **Only unwritten space precedes a valid frame** (zero bytes,
-     or a partly written frame whose CRC field or a whole 512-byte
-     sector is still zero): accepted. Concurrent appends write at
-     reserved offsets, so a crash can leave such a gap in front of
-     a frame another thread finished; no successful `flush` ever
-     covered anything at or after the gap.
+   - **Only what an interrupted write leaves precedes a valid
+     frame**: zero bytes (a reservation never written), or a frame
+     that is zero from a 512-byte-aligned offset inside it to its
+     end (a write that stopped at a sector boundary), and the valid
+     frames after the gap span at most 64 MiB: accepted. Concurrent
+     appends write at reserved offsets, so a crash can leave such a
+     gap in front of a frame another thread finished; no successful
+     `flush` ever covered anything at or after the gap.
    - **Anything else followed by valid frames** (a bit flip in a
-     complete frame, foreign bytes): the open fails with
-     `Error::Corrupted { offset, .. }` and **nothing is modified**.
-     Earlier releases cut the file here and silently dropped every
-     record after the damage.
+     complete frame, a zeroed CRC field, a zeroed sector with
+     written bytes after it in the same frame, foreign bytes): the
+     open fails with `Error::Corrupted { offset, .. }` and
+     **nothing is modified**. Releases before 1.0.3 cut the file
+     here for every kind of damage; 1.0.3 still cut it for zeroed
+     CRC fields and zeroed sectors.
+   - The search for valid frames after the damage checksums at most
+     16 MiB plus twice the size of the damaged region. A file that
+     needs more (only a crafted one does) is refused with
+     `Error::Corrupted`, so the open stays linear in the file size.
+   - With `EmdbBuilder::salvage(true)` the classification is
+     skipped and every case is accepted: the records before the
+     damage are kept and step 6 cuts the rest.
 6. Hand the file to fsys, which cuts an accepted torn tail. A tail
    that is not all zero is first copied to
    `<path>.corrupt-<offset>`.
@@ -808,9 +825,20 @@ from the damage on (the loss earlier releases imposed silently):
    `fsutil file seteof db.emdb <offset>` on Windows.
 3. Open the database again.
 
+`EmdbBuilder::salvage(true)` does the same in one step: the open
+keeps every record before the damage and moves the bytes from the
+offset on into `<path>.corrupt-<offset>`, then opens normally.
+
+```rust,no_run
+let db = emdb::Emdb::builder()
+    .path("db.emdb")
+    .salvage(true)
+    .build()?;
+# Ok::<(), emdb::Error>(())
+```
+
 Restoring from a `backup_to` copy is the alternative when the
-records after the damage matter. A builder option that performs
-the truncation (after saving the cut bytes) is planned for 1.1.
+records after the damage matter.
 
 ### Checkpoints
 
@@ -916,12 +944,12 @@ Linux 16.8 M / 72.7 M / 131.7 M per second (1.0.2: 10.5 M / 10.9 M /
 |---|---|---|
 | **Disk full** | fsys's `pwrite` returns `ENOSPC` / `ERROR_DISK_FULL` | `Error::Io`; in-memory state unchanged, journal unchanged. |
 | **Write or sync failure** | fsys returns the I/O error | `Error::Io` with the OS error kind; the journal is poisoned, so later writes, `flush` and `checkpoint` fail until the database is reopened. |
-| **Disk corruption** | CRC fail on frame decode, valid frames after it | Open refused with `Error::Corrupted`; the file is not modified. See [Recovering from `Error::Corrupted`](#recovering-from-errorcorrupted). |
-| **Process kill mid-write** | Torn final frame (or unwritten gap) on next open | Cut by the open; records that were not flushed may be lost, flushed ones are not. |
+| **Disk corruption** | CRC fail on frame decode (a bit flip, a zeroed CRC field or sector), valid frames after it | Open refused with `Error::Corrupted`; the file is not modified. See [Recovering from `Error::Corrupted`](#recovering-from-errorcorrupted). |
+| **Process kill mid-write** | Torn final frame, or an unwritten gap or a write cut at a sector boundary, on next open | Cut by the open; records that were not flushed may be lost, flushed ones are not. |
 | **Wrong encryption key** | Verification block fails to decrypt | `Error::EncryptionKeyMismatch`; no partial reads, nothing written. |
 | **Encrypted record modified** | AEAD check of the record fails after the key verified | `Error::Corrupted`. |
 | **Plaintext record in an encrypted database** | Tag byte lacks the encrypted flag | `Error::Corrupted`. |
-| **Wrong path / not an emdb file** | First bytes are not the frame magic | `Error::MagicMismatch`; the file is not modified. |
+| **Wrong path / not an emdb file** | First bytes are not the frame magic (or a leading zero run that does not end at a frame header) | `Error::MagicMismatch`; the file is not modified. |
 | **Version mismatch** | Sidecar format version doesn't match | `Error::VersionMismatch`. |
 | **Lockfile held by dead process** | `Error::LockBusy` | Use `Emdb::lock_holder` to diagnose; `Emdb::break_lock` if the holder is confirmed dead. |
 | **Concurrent open by another process** | OS advisory lock acquisition fails | `Error::LockBusy`. |

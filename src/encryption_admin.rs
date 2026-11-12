@@ -32,7 +32,7 @@
 //! the **old** key. Delete `<path>.encbak` and `<path>.encbak.meta`
 //! once you have verified the new database, or the protection the
 //! operation was meant to add does not exist on that disk. An option
-//! to skip keeping the copy is planned for 1.1.
+//! to skip keeping the copy is planned for a later release.
 //!
 //! These primitives are exposed publicly as [`crate::Emdb::enable_encryption`],
 //! [`crate::Emdb::disable_encryption`], and [`crate::Emdb::rotate_encryption_key`].

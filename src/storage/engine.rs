@@ -7,9 +7,9 @@
 //!
 //! # Hot paths
 //!
-//! - **Insert**: encode record into the writer's reusable buffer,
-//!   `pwrite` once, update the in-memory index. ~250-400ns/insert
-//!   under no contention.
+//! - **Insert**: encode the record into a buffer allocated at its
+//!   exact size, append it to the journal (one `pwrite`), update the
+//!   in-memory index.
 //! - **Get**: hash key, probe the namespace's sharded index, slice
 //!   into the mmap, decode the record body. ~80-200ns/get under no
 //!   contention.
@@ -363,6 +363,10 @@ pub(crate) struct EngineConfig {
     /// `Some(idle_ms)` opts the journal's per-handle ring into
     /// kernel-side polling. Linux-only; ignored elsewhere.
     pub(crate) iouring_sqpoll_idle_ms: Option<u32>,
+    /// Accept damage before the end of the journal: keep the records
+    /// in front of it and let the journal open cut the rest into a
+    /// `.corrupt-<offset>` sidecar, instead of refusing the open.
+    pub(crate) salvage: bool,
     /// Optional 32-byte AES-256 key (post-KDF). `None` for
     /// unencrypted. Stored in a [`zeroize::Zeroizing`] wrapper so
     /// the bytes clear when the config is dropped.
@@ -390,7 +394,8 @@ impl std::fmt::Debug for EngineConfig {
             .field("flags", &self.flags)
             .field("enable_range_scans", &self.enable_range_scans)
             .field("flush_policy", &self.flush_policy)
-            .field("iouring_sqpoll_idle_ms", &self.iouring_sqpoll_idle_ms);
+            .field("iouring_sqpoll_idle_ms", &self.iouring_sqpoll_idle_ms)
+            .field("salvage", &self.salvage);
         #[cfg(feature = "encrypt")]
         {
             let _ = s
@@ -416,6 +421,7 @@ impl Default for EngineConfig {
             enable_range_scans: false,
             flush_policy: FlushPolicy::default(),
             iouring_sqpoll_idle_ms: None,
+            salvage: false,
             #[cfg(feature = "encrypt")]
             encryption_key: None,
             #[cfg(feature = "encrypt")]
@@ -593,9 +599,9 @@ impl Engine {
         // indexes, and refuse the open if valid records follow damage
         // (mid-file corruption) instead of letting fsys cut them.
         #[cfg(feature = "ttl")]
-        let expired = engine.recovery_scan()?;
+        let expired = engine.recovery_scan(config.salvage)?;
         #[cfg(not(feature = "ttl"))]
-        engine.recovery_scan()?;
+        engine.recovery_scan(config.salvage)?;
 
         // Only now hand the file to fsys (which cuts a torn tail) and
         // persist a meta sidecar that was held back: a failed open
@@ -820,7 +826,9 @@ impl Engine {
     /// [`integrity::check_damage`]: a torn tail is accepted (fsys cuts
     /// it when the journal opens), damage followed by valid records
     /// fails the open with [`Error::Corrupted`] before anything is
-    /// cut.
+    /// cut. With `salvage` the classification is skipped: the records
+    /// read so far are kept and fsys cuts everything after them (see
+    /// [`crate::EmdbBuilder::salvage`]).
     ///
     /// `JournalReader::lsn` is the byte offset of the frame's first
     /// byte (the magic). emdb's index stores the `payload_start`,
@@ -829,7 +837,7 @@ impl Engine {
     /// With the `ttl` feature, also returns the default-namespace
     /// keys whose live record had already expired (see
     /// [`OpenExpired`]).
-    fn recovery_scan(&self) -> Result<OpenExpired> {
+    fn recovery_scan(&self, salvage: bool) -> Result<OpenExpired> {
         let mut reader = self.store.open_reader()?;
         // Advisory read-ahead hint: a platform that rejects it reads
         // the same bytes with its default read-ahead window.
@@ -844,7 +852,7 @@ impl Engine {
             #[cfg(feature = "ttl")]
             expiry.observe(&record.payload);
         }
-        if reader.tail_state() != fsys::JournalTailState::CleanEnd {
+        if !salvage && reader.tail_state() != fsys::JournalTailState::CleanEnd {
             integrity::check_damage(
                 self.store.path(),
                 reader.position().as_u64(),
@@ -1443,33 +1451,43 @@ impl Engine {
     fn append_insert(&self, ns_id: u32, key: &[u8], value: &[u8], expires_at: u64) -> Result<u64> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
-            let payload = ctx.seal_record(format::TAG_INSERT, |body| {
-                format::encode_insert_body(body, ns_id, key, value, expires_at);
-            })?;
+            let payload = ctx.seal_record(
+                format::TAG_INSERT,
+                format::insert_body_len(key.len(), value.len()),
+                |body| {
+                    format::encode_insert_body(body, ns_id, key, value, expires_at);
+                },
+            )?;
             return self.store.append(&payload);
         }
 
-        self.store.append_with(|buf| {
-            buf.push(format::TAG_INSERT);
-            format::encode_insert_body(buf, ns_id, key, value, expires_at);
-            Ok(())
-        })
+        self.store
+            .append_with(1 + format::insert_body_len(key.len(), value.len()), |buf| {
+                buf.push(format::TAG_INSERT);
+                format::encode_insert_body(buf, ns_id, key, value, expires_at);
+                Ok(())
+            })
     }
 
     fn append_remove(&self, ns_id: u32, key: &[u8]) -> Result<u64> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
-            let payload = ctx.seal_record(format::TAG_REMOVE, |body| {
-                format::encode_remove_body(body, ns_id, key);
-            })?;
+            let payload = ctx.seal_record(
+                format::TAG_REMOVE,
+                format::remove_body_len(key.len()),
+                |body| {
+                    format::encode_remove_body(body, ns_id, key);
+                },
+            )?;
             return self.store.append(&payload);
         }
 
-        self.store.append_with(|buf| {
-            buf.push(format::TAG_REMOVE);
-            format::encode_remove_body(buf, ns_id, key);
-            Ok(())
-        })
+        self.store
+            .append_with(1 + format::remove_body_len(key.len()), |buf| {
+                buf.push(format::TAG_REMOVE);
+                format::encode_remove_body(buf, ns_id, key);
+                Ok(())
+            })
     }
 
     /// Run `read` until it completes without a compaction swap
@@ -1841,29 +1859,11 @@ impl Engine {
     /// keep their salt and verification block, so the backup opens
     /// with the same key or passphrase.
     ///
-    /// Refuses to write to the database's own path.
+    /// Refuses a target that is the database itself or one of the
+    /// files kept next to it (see [`check_backup_target`]).
     pub(crate) fn backup_to(&self, target: &Path) -> Result<()> {
         let source_path = self.store.path().to_path_buf();
-        let target_canonical = match target.canonicalize() {
-            Ok(p) => p,
-            // If the target doesn't exist yet (the common case for a
-            // backup), canonicalize fails; in that case compare the
-            // raw path against the source. We only canonicalise the
-            // source side so symlink shenanigans can't trick the
-            // check.
-            Err(_) => target.to_path_buf(),
-        };
-        if let Ok(source_canonical) = source_path.canonicalize() {
-            if target_canonical == source_canonical || target == source_path {
-                return Err(Error::InvalidConfig(
-                    "backup target must differ from the source database path",
-                ));
-            }
-        } else if target == source_path {
-            return Err(Error::InvalidConfig(
-                "backup target must differ from the source database path",
-            ));
-        }
+        check_backup_target(&source_path, target)?;
 
         let (live, mut source, header) = {
             let _gate = self.write_gate.write();
@@ -2026,12 +2026,16 @@ impl Engine {
     fn encode_namespace_name_payload(&self, ns_id: u32, name: &[u8]) -> Result<Vec<u8>> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
-            return ctx.seal_record(format::TAG_NAMESPACE_NAME, |body| {
-                format::encode_namespace_name_body(body, ns_id, name);
-            });
+            return ctx.seal_record(
+                format::TAG_NAMESPACE_NAME,
+                format::namespace_name_body_len(name.len()),
+                |body| {
+                    format::encode_namespace_name_body(body, ns_id, name);
+                },
+            );
         }
 
-        let mut payload = Vec::with_capacity(1 + 8 + name.len());
+        let mut payload = Vec::with_capacity(1 + format::namespace_name_body_len(name.len()));
         payload.push(format::TAG_NAMESPACE_NAME);
         format::encode_namespace_name_body(&mut payload, ns_id, name);
         Ok(payload)
@@ -2048,12 +2052,16 @@ impl Engine {
     ) -> Result<Vec<u8>> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
-            return ctx.seal_record(format::TAG_INSERT, |body| {
-                format::encode_insert_body(body, ns_id, key, value, expires_at);
-            });
+            return ctx.seal_record(
+                format::TAG_INSERT,
+                format::insert_body_len(key.len(), value.len()),
+                |body| {
+                    format::encode_insert_body(body, ns_id, key, value, expires_at);
+                },
+            );
         }
 
-        let mut payload = Vec::with_capacity(1 + 20 + key.len() + value.len());
+        let mut payload = Vec::with_capacity(1 + format::insert_body_len(key.len(), value.len()));
         payload.push(format::TAG_INSERT);
         format::encode_insert_body(&mut payload, ns_id, key, value, expires_at);
         Ok(payload)
@@ -2063,12 +2071,16 @@ impl Engine {
     fn encode_remove_payload(&self, ns_id: u32, key: &[u8]) -> Result<Vec<u8>> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
-            return ctx.seal_record(format::TAG_REMOVE, |body| {
-                format::encode_remove_body(body, ns_id, key);
-            });
+            return ctx.seal_record(
+                format::TAG_REMOVE,
+                format::remove_body_len(key.len()),
+                |body| {
+                    format::encode_remove_body(body, ns_id, key);
+                },
+            );
         }
 
-        let mut payload = Vec::with_capacity(1 + 8 + key.len());
+        let mut payload = Vec::with_capacity(1 + format::remove_body_len(key.len()));
         payload.push(format::TAG_REMOVE);
         format::encode_remove_body(&mut payload, ns_id, key);
         Ok(payload)
@@ -2522,17 +2534,22 @@ impl Engine {
     fn append_namespace_name(&self, ns_id: u32, name: &str) -> Result<u64> {
         #[cfg(feature = "encrypt")]
         if let Some(ctx) = self.encryption.as_ref() {
-            let payload = ctx.seal_record(format::TAG_NAMESPACE_NAME, |body| {
-                format::encode_namespace_name_body(body, ns_id, name.as_bytes());
-            })?;
+            let payload = ctx.seal_record(
+                format::TAG_NAMESPACE_NAME,
+                format::namespace_name_body_len(name.len()),
+                |body| {
+                    format::encode_namespace_name_body(body, ns_id, name.as_bytes());
+                },
+            )?;
             return self.store.append(&payload);
         }
 
-        self.store.append_with(|buf| {
-            buf.push(format::TAG_NAMESPACE_NAME);
-            format::encode_namespace_name_body(buf, ns_id, name.as_bytes());
-            Ok(())
-        })
+        self.store
+            .append_with(1 + format::namespace_name_body_len(name.len()), |buf| {
+                buf.push(format::TAG_NAMESPACE_NAME);
+                format::encode_namespace_name_body(buf, ns_id, name.as_bytes());
+                Ok(())
+            })
     }
 
     /// Drop a named namespace.
@@ -2616,6 +2633,83 @@ fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
         .map_or_else(|| std::ffi::OsString::from("emdb"), |n| n.to_os_string());
     name.push(suffix);
     path.with_file_name(name)
+}
+
+/// Suffixes of the files emdb keeps next to a database: its meta
+/// sidecar, lock files, compaction and encryption-admin temporaries,
+/// the pre-admin copy and the admin intent marker.
+const DATABASE_SIDECARS: [&str; 10] = [
+    ".meta",
+    ".lock",
+    ".lock-meta",
+    ".compact.tmp",
+    ".compact.tmp.meta",
+    ".enc.tmp",
+    ".enc.tmp.meta",
+    ".encbak",
+    ".encbak.meta",
+    ".encadmin",
+];
+
+/// Refuse a backup target when any file the backup writes (`target`,
+/// `<target>.meta` and their `.backup.tmp` temporaries) is the
+/// database at `source` or one of its [`DATABASE_SIDECARS`]: renaming
+/// a journal over the live `.meta` would lose the database's salt.
+///
+/// Paths are compared after resolving the directory (and the file
+/// itself, when it exists) to its canonical form, so `.` components
+/// and symbolic links do not hide a match. On Windows and macOS,
+/// whose default file systems ignore case, names are compared without
+/// case.
+fn check_backup_target(source: &Path, target: &Path) -> Result<()> {
+    const REFUSED: Error =
+        Error::InvalidConfig("backup target must differ from the database and its sidecar files");
+    let tmp = backup_temp_path(target);
+    let written = [
+        resolve_for_compare(target),
+        resolve_for_compare(&meta::meta_path_for(target)),
+        resolve_for_compare(&tmp),
+        resolve_for_compare(&meta::meta_path_for(&tmp)),
+    ];
+    let mut protected = Vec::with_capacity(1 + DATABASE_SIDECARS.len());
+    protected.push(resolve_for_compare(source));
+    for suffix in DATABASE_SIDECARS {
+        protected.push(resolve_for_compare(&sibling_path(source, suffix)));
+    }
+    if written
+        .iter()
+        .any(|w| protected.iter().any(|p| same_path(w, p)))
+    {
+        return Err(REFUSED);
+    }
+    Ok(())
+}
+
+/// `path` with its directory (and the file itself, when it exists)
+/// canonicalized. Falls back to the path as given when the directory
+/// cannot be resolved.
+fn resolve_for_compare(path: &Path) -> PathBuf {
+    if let Ok(full) = path.canonicalize() {
+        return full;
+    }
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    match (parent.canonicalize(), path.file_name()) {
+        (Ok(dir), Some(name)) => dir.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Path equality as the platform's default file system sees it.
+fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(any(windows, target_os = "macos")) {
+        a.as_os_str().to_string_lossy().to_lowercase()
+            == b.as_os_str().to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
 }
 
 /// Sibling-file path used by [`Engine::compact_in_place`] as the
