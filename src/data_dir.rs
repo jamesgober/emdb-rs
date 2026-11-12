@@ -4,7 +4,7 @@
 //!
 //! The library does not, by default, choose a path on disk for the user —
 //! [`crate::Emdb::open`] and [`crate::EmdbBuilder::path`] both take an
-//! explicit path. But for embedded callers (HiveDB, any application using
+//! explicit path. But for embedded callers (any application using
 //! emdb as its KV layer) the right path is OS-dependent and easy to get
 //! wrong: macOS uses `~/Library/Application Support`, Linux uses
 //! `$XDG_DATA_HOME`, Windows uses `%LOCALAPPDATA%`. Picking the wrong
@@ -235,14 +235,14 @@ fn is_windows_reserved_name(name: &str) -> bool {
 ///
 /// Callers that want nested folders should pre-compose them with
 /// [`crate::EmdbBuilder::data_root`] (their own platform-side join
-/// logic), or pick a single dash-joined name like `"hivedb-kv"`.
+/// logic), or pick a single dash-joined name like `"myapp-kv"`.
 fn validate_path_component(value: &str, field: &'static str) -> Result<()> {
     if value.contains('/') || value.contains('\\') {
         return Err(Error::InvalidConfig(match field {
             "app_name" => {
                 "app_name must not contain path separators \
                            (/ or \\); use a single dash-joined name like \
-                           \"hivedb-kv\", or compose nested paths with \
+                           \"myapp-kv\", or compose nested paths with \
                            data_root() yourself"
             }
             "database_name" => "database_name must not contain path separators (/ or \\)",
@@ -464,13 +464,13 @@ mod tests {
     #[test]
     fn resolve_uses_explicit_root_and_creates_subdir() {
         let root = temp_root();
-        let path = match resolve_database_path(Some(root.clone()), Some("hive"), Some("core.emdb"))
+        let path = match resolve_database_path(Some(root.clone()), Some("myapp"), Some("core.emdb"))
         {
             Ok(p) => p,
             Err(err) => panic!("resolve should succeed: {err}"),
         };
 
-        assert_eq!(path, root.join("hive").join("core.emdb"));
+        assert_eq!(path, root.join("myapp").join("core.emdb"));
         // The app subdirectory was created.
         assert!(path.parent().map(std::path::Path::is_dir).unwrap_or(false));
 
@@ -510,8 +510,8 @@ mod tests {
         // Single-segment-only by design: forward slashes and backslashes
         // are both rejected so behaviour is identical on every platform
         // and so users cannot accidentally escape the data root.
-        assert!(validate_path_component("hive/inner", "app_name").is_err());
-        assert!(validate_path_component("hive\\inner", "app_name").is_err());
+        assert!(validate_path_component("myapp/inner", "app_name").is_err());
+        assert!(validate_path_component("myapp\\inner", "app_name").is_err());
         assert!(validate_path_component("inner/file.emdb", "database_name").is_err());
     }
 
@@ -554,7 +554,7 @@ mod tests {
     fn test_validate_accepts_plain_names() {
         for good in [
             "emdb",
-            "hive-kv",
+            "myapp-kv",
             "core.emdb",
             "v1.2.emdb",
             ".hidden",

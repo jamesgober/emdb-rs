@@ -325,11 +325,11 @@ under the platform data root.
 use emdb::Emdb;
 
 // Resolves to:
-//   Linux:   $XDG_DATA_HOME/hivedb-kv/sessions.emdb
-//   macOS:   ~/Library/Application Support/hivedb-kv/sessions.emdb
-//   Windows: %LOCALAPPDATA%\hivedb-kv\sessions.emdb
+//   Linux:   $XDG_DATA_HOME/myapp-kv/sessions.emdb
+//   macOS:   ~/Library/Application Support/myapp-kv/sessions.emdb
+//   Windows: %LOCALAPPDATA%\myapp-kv\sessions.emdb
 let db = Emdb::builder()
-    .app_name("hivedb-kv")
+    .app_name("myapp-kv")
     .database_name("sessions.emdb")
     .build()?;
 # Ok::<(), emdb::Error>(())
